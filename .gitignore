@@ -1,0 +1,9 @@
+*.pth
+*.pt
+*.tar.gz
+*.png
+__pycache__/
+.ipynb_checkpoints/
+data_original/
+results_*/
+docker_test/
