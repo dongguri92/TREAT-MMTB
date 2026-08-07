@@ -62,6 +62,13 @@ def main():
                         choices=['small', 'base'])
     parser.add_argument('--crop_frac', type=float, default=0.15,
                         help="하부 crop 비율 (0.15=기존, 0.20=더 자름, 0=crop 없음)")
+    parser.add_argument('--roi', action='store_true',
+                        help="ROI 2단계 학습 (datasets_roi 사용, 양성 성분별 crop)")
+    parser.add_argument('--roi_context', type=float, default=1.5)
+    parser.add_argument('--roi_jitter', type=float, default=0.15,
+                        help="ROI 중심 이동 최대 비율")
+    parser.add_argument('--size_weighted', action='store_true',
+                        help="cavity 크기별 가중 샘플링 (small 3x, medium 2x)")
     args = parser.parse_args()
 
     cfg['lambda_cls'] = args.lambda_cls
@@ -88,22 +95,29 @@ def main():
           f"crop={args.crop_frac} | ")
 
     # 채널 수에 따라 dataloader 모듈 선택
-    if args.channels == 3:
+    if args.roi:
+        from datasets_roi import dataloader
+        train_loader, val_loader = dataloader(
+            batch_size=cfg['batch_size'], roi_size=cfg['target_size'],
+            context=args.roi_context, clahe_clip=cfg['clahe_clip'],
+            num_workers=cfg['num_workers'], seed=cfg['seed'],
+            jitter=(args.roi_jitter, 0.8, 1.4), per_component=True)
+    elif args.channels == 3:
         from datasets_3ch import dataloader
+        train_loader, val_loader = dataloader(
+            batch_size=cfg['batch_size'],
+            target_size=cfg['target_size'], clahe_clip=cfg['clahe_clip'],
+            num_workers=cfg['num_workers'], seed=cfg['seed'],
+            crop_frac=args.crop_frac)
     else:
         from datasets import dataloader
+        train_loader, val_loader = dataloader(
+            batch_size=cfg['batch_size'],
+            target_size=cfg['target_size'], clahe_clip=cfg['clahe_clip'],
+            num_workers=cfg['num_workers'], seed=cfg['seed'],
+            crop_frac=args.crop_frac,
+            size_weighted=args.size_weighted)
 
-    train_loader, val_loader = dataloader(
-        batch_size=cfg['batch_size'],
-        target_size=cfg['target_size'], clahe_clip=cfg['clahe_clip'],
-        num_workers=cfg['num_workers'], seed=cfg['seed'],
-        crop_frac=args.crop_frac)
-
-#    if is_vit:
-#        pretrained = args.pretrained or EVAX_PRETRAINED
-#        model = modeltype('evax_seg', in_channels=args.channels,
-#                          img_size=cfg['target_size'],
-#                          pretrained_path=pretrained).to(device)
     if is_vit:
         default_pt = (EVAX_PRETRAINED_BASE if args.variant == 'base'
                       else EVAX_PRETRAINED)

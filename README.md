@@ -5,19 +5,32 @@ MICCAI TREAT-MMTB 2026 챌린지 Task 1 (흉부 X선에서 결핵성 공동(cavi
 
 평가 지표: `final = 0.7 × detection_accuracy + 0.3 × mean_Dice`
 
+상세한 실험 기록·실패 분석·negative results는 [RESULTS.md](RESULTS.md) 참조.
+
 ---
 
-## 현재 성능 (internal validation, 111 cases / 58 pos, 53 neg)
+## 현재 성능
 
-| 시스템 | Detection | Dice | Final |
+### External set (본선)
+
+| 제출 | detection | Dice | final |
+|---|---|---|---|
+| EVA-X λ=0.5 + segmentation veto (예선 제출본) | 0.6713 | 0.1568 | 0.5170 |
+| **EVA-X λ=0.1 + classification-driven (현행)** | **0.6862** | **0.1644** | **0.5296** |
+
+### Internal validation (111 cases / 58 pos, 53 neg)
+
+| 시스템 | detection | Dice | final |
 |---|---|---|---|
 | nnU-Net (plain, 5-fold) | 0.7658 | 0.2725 | 0.6178 |
 | from-scratch multi-task U-Net + scale aug | 0.8378 | 0.2756 | 0.6692 |
 | EVA-X, seg 기반 detection (λ=0) | 0.8468 | 0.2999 | 0.6805 |
-| **EVA-X + cls head(λ=0.5) + combo detection** | **0.9189** | **0.3078** | **0.7356** |
+| EVA-X λ=0.5 + segmentation veto | **0.9189** | **0.3078** | **0.7356** |
+| EVA-X λ=0.1 + classification-driven (현행 제출본) | 0.9099 | 0.2751 | 0.7195 |
 
-최종 제출본은 마지막 행. Docker 이미지로 `--network none` 환경에서
-동일 점수 재현 확인 완료.
+> **주의**: internal 점수차가 external을 예측하지 못한다. veto 제거는
+> internal에서 −0.0161이었지만 external에서는 +0.0126으로 **부호가 반대**였다.
+> 자세한 내용은 RESULTS.md 참조.
 
 ---
 
@@ -29,7 +42,7 @@ MICCAI TREAT-MMTB 2026 챌린지 Task 1 (흉부 X선에서 결핵성 공동(cavi
   → EVA-X small ViT (patch16, embed 384, depth 12, SwiGLU, RoPE)
       ├─ blocks 2,5,8,11 feature → SimpleFeaturePyramid(ViTDet) → FPNDecoder → seg logits
       └─ block 11 feature → GAP → dropout → linear → cls logit
-  → combo detection (아래 참조) → 원본 그리드로 역변환
+  → classification-driven decision (아래) → 원본 그리드로 역변환
 ```
 
 총 29.9M 파라미터 (백본 22M + 디코더/헤드 7.9M).
@@ -41,18 +54,17 @@ mmcv / mmsegmentation 불필요, timm(>=0.9, 검증 1.0.22)만 있으면 동작.
 
 | 파일 | 역할 |
 |---|---|
-| `main_3ch.py` | 학습 진입점. **1채널/3채널 모두 지원**하며 최종 모델은 1채널로 학습됨 |
+| `main_3ch.py` | 학습 진입점. **1채널/3채널 모두 지원**하며 제출 모델은 1채널 |
 | `models.py` | `modeltype()` 팩토리 (multitask_unet / evax_seg) |
 | `models_evax.py` | `EVAXSegNet` — EVA-X 백본 + FPN 디코더 + cls head |
-| `eva_x.py` | EVA-X 공식 저장소의 `checkpoint_filter_fn` (사전학습 가중치 로드용) |
-| `datasets.py` | **1채널 파이프라인 (최종 모델이 사용)** |
-| `datasets_3ch.py` | 3채널 실험용 (원본/CLAHE2.0/CLAHE1.0). 성능 낮아 미채택 |
+| `eva_x.py` | EVA-X 공식 저장소의 `checkpoint_filter_fn` (사전학습 로드용) |
+| `datasets.py` | 1채널 파이프라인 |
+| `datasets_3ch.py` | 3채널 실험용 (성능 낮아 미채택) |
 | `training.py` | `fit()` / `compute_lr()` / `make_optimizer()` |
 | `utils.py` | DiceCE, Tversky, Boundary loss, dice metric, checkpoint 저장 |
-| `inference_evax.py` | 추론 + threshold sweep + combo detection |
+| `inference_evax.py` | 추론 + threshold sweep + 결정 규칙 |
 | `evaluate_task1.py` | 챌린지 평가 스크립트 |
-| `task1_submit_evax_cls/` | 제출용 Docker (predict + Dockerfile + requirements) |
-| `figs/` | 학습 곡선 PNG |
+| `task1_submit_evax_cls_l01/` | **현행 제출용 Docker** (predict + Dockerfile + requirements) |
 
 ---
 
@@ -73,11 +85,9 @@ pip install timm==1.0.22 numpy==1.26.4 opencv-python-headless pydicom==3.0.2 \
 mkdir -p ~/eva_x_backup && cd ~/eva_x_backup
 wget https://huggingface.co/MapleF/eva_x/resolve/main/eva_x_small_patch16_merged520k_mim.pt
 ```
-base 변형이 필요하면 `eva_x_base_patch16_merged520k_mim.pt` (단, 아래 negative
-results 참조 — base는 성능이 더 낮았음).
 
 ### 데이터 경로
-`datasets.py` / `datasets_3ch.py` 상단의 4개 상수를 각자 환경에 맞게 수정:
+`datasets.py` 상단의 4개 상수를 각자 환경에 맞게 수정:
 ```python
 TRAIN_DCM_DIR  = ".../data_original/train/CXR"
 TRAIN_MASK_DIR = ".../data_original/train/CXR_label"
@@ -90,20 +100,20 @@ VAL_MASK_DIR   = ".../data_original/val/CXR_label"
 
 ## 재현
 
-### 학습 (최종 모델)
+### 학습 (현행 제출 모델)
 ```bash
-python main_3ch.py --model evax_seg --tag evax_cls_l05 --channels 1 \
-    --lambda_cls 0.5 --target_size 1024 --batch_size 8 \
+python main_3ch.py --model evax_seg --tag evax_cls_l01 --channels 1 \
+    --lambda_cls 0.1 --target_size 1024 --batch_size 8 \
     --optimizer adamw --initial_lr 5e-5 \
     --scheduler cosine --warmup 5 --max_epochs 150
 ```
-A5000 24GB 기준 batch 8까지 가능(flash attention 사용). 150 epoch 약 5~6시간.
+A5000 24GB 기준 batch 8까지 가능(flash attention). 150 epoch 약 5~6시간.
 
 ### 추론 + 평가
 ```bash
-python inference_evax.py --model evax_seg --weights best_evax_cls_l05.pth \
+python inference_evax.py --model evax_seg --weights best_evax_cls_l01.pth \
     --target_size 1024 --out_dir results_final \
-    --detection combo --t_veto 0.005 --min_pixels 0
+    --detection cls --cls_threshold 0.5 --min_pixels 0
 
 python evaluate_task1.py --gt-csv data_original/val/test.csv \
     --pred-csv data_original/val/results_final/prediction.csv \
@@ -113,20 +123,28 @@ python evaluate_task1.py --gt-csv data_original/val/test.csv \
 
 ### 진단용 sweep
 ```bash
-python inference_evax.py --model evax_seg --weights best_evax_cls_l05.pth \
+python inference_evax.py --model evax_seg --weights best_evax_cls_l01.pth \
     --target_size 1024 --sweep
 ```
 cls / seg-max / top-100 / soft-area 4가지 detection 방식의 threshold 별 정확도,
 false negative 진단, cls-seg 불일치 케이스 목록을 출력.
 
+### 마스크 품질 분석
+```bash
+python analyze_masks.py --gt-mask-dir data_original/val/CXR_label \
+    --pred-mask-dir data_original/val/results_final \
+    --gt-csv data_original/val/test.csv
+```
+케이스별 Dice/precision/recall/면적비와 cavity 크기(small/medium/large)별 층화.
+
 ### Docker
 ```bash
-cd task1_submit_evax_cls
+cd task1_submit_evax_cls_l01
 # weights/best_evax_cls.pth 를 먼저 배치할 것
-docker build -f Dockerfile_task1 -t rami-task1-evax:latest .
+docker build -f Dockerfile_task1 -t rami-task1-l01:latest .
 docker run --rm --network none \
     -v /path/to/input:/input:ro -v /path/to/output:/output \
-    rami-task1-evax:latest
+    rami-task1-l01:latest
 ```
 
 ---
@@ -135,90 +153,59 @@ docker run --rm --network none \
 
 ### 1. 체크포인트 선택 기준 = 챌린지 지표
 `val_dice`가 아니라 **`0.7 × cls_acc + 0.3 × dice`** 가 최대인 epoch을 저장.
-detection 가중치가 Dice의 2배 이상이므로, Dice만 보고 고르면 체계적으로
-손해를 본다. 예: dice 최고 epoch 70(final 0.6937)보다
-epoch 83(dice 0.2768, cls 0.8829 → final 0.7010)이 실제로 더 좋다.
+detection 가중치가 Dice의 2배 이상이므로 Dice만 보고 고르면 체계적으로 손해다.
+(`--lambda_cls 0`인 경우에는 cls_acc가 무의미하므로 dice만 사용.)
 
-### 2. combo detection (cls 기본 + seg veto)
-두 head의 오류 성격이 다르다. seg는 음성 케이스에서 매우 보수적이라
-false positive가 거의 없고, cls는 민감하지만 정상 폐를 양성으로 오인한다.
-**일치하는 케이스는 건드리지 않고(Dice 보존), 불일치 케이스만 조정:**
-
+### 2. Classification-driven decision (현행)
 ```
-cls_pos = cls_prob >= 0.5,  seg_pos = seg_max >= 0.5
-일치            → seg 그대로 (mask = seg_prob >= 0.5)
-cls 양성 & seg_max >= t_veto → cls 채택, mask = seg_prob >= t_veto
-cls 양성 & seg_max <  t_veto → seg의 강한 음성 신뢰, mask = empty
-cls 음성 & seg 양성          → seg 채택
-cavity = 1 ⟺ mask non-empty  (CSV/마스크 일관성 자동 보장)
+present = cls_prob >= 0.5
+
+present & (P >= 0.5) non-empty  → mask = (P >= 0.5)
+present & (P >= 0.5) empty      → mask = (P >= 0.5 * p_max)
+not present                     → mask = empty
+
+cavity = 1 ⟺ 복원된 mask가 non-empty   (CSV/NIfTI 일관성 자동 보장)
 ```
-`t_veto = 0.005`. 더 낮추면 validation 1케이스를 더 얻지만
-seg 확률 0.001~0.003 경계에 과적합되므로 보수적 값을 채택.
+`P`는 전경 확률맵, `p_max = max P`.
 
-### 3. λ(cls loss 가중치)가 combo의 효용을 좌우
-λ가 작으면 cls head가 seg 인코더를 그대로 따라가 두 head가 유사해지고,
-불일치가 거의 없어 combo의 이득이 사라진다(λ=0.1: 불일치 4건, 전부 cls가 정답).
-λ가 크면 cls가 공격적(recall 위주)이 되어 정상 폐에 false positive를 내고,
-바로 그 케이스에서 seg의 확신 있는 음성이 상보적으로 작동한다
-(λ=0.5: 불일치 9건, 그중 4건을 seg veto가 정정, 순 +2).
-따라서 **combo를 쓴다면 λ는 큰 쪽이 유리**하다.
+두 번째 분기는 분류기가 양성인데 segmentation이 threshold 0.5를 못 넘겨
+CSV=1 / mask=empty가 되는 규칙 위반을 막는다. **절대 threshold 대신 `p_max`에
+대한 상대값**을 쓰는 이유는 절대값이 internal 확률 분포에 맞춰진 값이라
+external로 전이되지 않기 때문이다.
 
-### 4. cosine + warmup (poly 아님)
-poly decay로 학습하면 후반부(epoch ~88)에서 validation Dice가 0으로 붕괴했다.
-cosine annealing + 5 epoch linear warmup으로 150 epoch까지 안정적으로 학습된다.
+### 3. 왜 segmentation veto를 제거했는가
+예선에서는 "segmentation 확률이 극히 낮으면(`p_max < 0.005`) 분류기의 양성
+판정을 뒤집는" 규칙이 이득이었다(internal 0.7142 → 0.7356). 그러나 external에서
+Dice가 전 팀 0.11~0.22로 붕괴하면서, 낮은 `p_max`가 병변 부재가 아니라 단지
+segmentation head의 무반응을 뜻하게 되었다. veto를 제거하자 external final이
+0.5170 → 0.5296으로 올랐다.
+
+**적절한 결합 규칙은 아키텍처의 고정 속성이 아니라 두 헤드의 상대적 신뢰도의
+함수다.** 이것이 본 제출의 주된 방법론적 관찰이다.
+
+### 4. λ와 결정 규칙의 상호작용
+λ가 작으면 두 헤드가 유사해져 불일치가 거의 없고 veto가 개입할 여지가 없다.
+λ가 크면 분류기가 공격적이 되어 위양성을 내고, 바로 그 경우 segmentation의
+확신 있는 음성이 상보적으로 작동한다. 따라서 **veto를 쓸 때는 λ=0.5,
+쓰지 않을 때는 λ=0.1**이 유리하다.
 
 ### 5. 공격적 scale augmentation
-from-scratch 단계에서 가장 큰 성능 향상을 준 변경.
+from-scratch 단계에서 가장 큰 향상을 준 변경.
 `A.Affine(scale=(0.5,1.4), rotate=(-30,30), p=0.5)` — nnU-Net 기본값
-`scale=(0.7,1.4), p=0.2` 대비 범위와 확률을 모두 키웠다
-(detection 0.775 → 0.820). 다만 `p`가 scale과 rotation에 함께 걸리므로
-어느 쪽이 기여했는지는 분리 검증되지 않음.
+`scale=(0.7,1.4), p=0.2` 대비 범위와 확률을 모두 키웠다.
 
 ---
 
 ## Negative results
 
-같은 시도를 반복하지 않도록 기록. **모든 시도에서 Dice가 0.26~0.31 구간을
-벗어나지 못했다.**
+같은 시도를 반복하지 않도록 [RESULTS.md](RESULTS.md)에 정리되어 있다.
+요약하면 **백본 크기(base), 3채널 입력, Tversky/Boundary loss, crop 비율,
+mask threshold, DropPath, cls head 강화, 크기 가중 샘플링, DICOM VOI window**
+모두 Dice를 0.26~0.31 구간에서 벗어나게 하지 못했다.
 
-| 시도 | 결과 | 비고 |
-|---|---|---|
-| EVA-X **base** 백본 (86M) | λ0.5: ~0.691 / λ0.3: ~0.711 | small보다 낮음. 444장으로 fine-tune 시 과적합(train loss 0.37에서 val 정체) |
-| **3채널 입력** (원본/CLAHE2.0/CLAHE1.0) | 1채널보다 낮음 | EVA-X 사전학습이 "grayscale 3채널 복제"를 가정하므로 서로 다른 채널을 주면 표현이 깨짐 |
-| **Focal Tversky** (α0.3 β0.7 γ1.33) | dice 0.2963 | DiceCE(0.2942~0.2999)와 사실상 동일 |
-| **Dice + Boundary** (w=0.5) | dice 0.2975 | 위와 동일. cosine 후반부에서 loss 종류와 무관하게 수렴 |
-| **하부 crop 20%** (기본 15%) | ~0.714 | 차이 없음 |
-| **mask threshold sweep** (from-scratch 모델) | 0.2756 → 0.2760 | 확률맵이 극단적으로 이분화되어 threshold가 무의미 |
-| **3채널 multi-task U-Net** | 진행 중 판단 보류 | U-Net 계열은 800 epoch 이상 필요, 짧은 학습으로 판단 불가 |
-
-> base / crop20 수치는 학습 중 validation 근사값(`0.7×cls_acc + 0.3×dice`)이며
-> combo를 적용한 실제 evaluate 값이 아님. 어느 쪽이든 최종 제출본(0.7356)에
-> 미치지 못해 채택하지 않았다.
-
----
-
-## 남은 과제
-
-Dice가 **0.30 근처에서 구조적으로 막혀 있다.** 백본 크기, λ, crop 비율,
-loss 함수, threshold를 모두 바꿔봤지만 0.26~0.31을 벗어나지 못했다.
-리더보드 상위권 점수를 역산하면 그들의 Dice는 0.45~0.60 수준으로 추정되며,
-이는 튜닝 차이가 아니라 접근 방식의 차이로 보인다. 검토할 방향:
-
-1. **해상도 예산.** FPN 디코더가 H/4(256×256)에서 로짓을 만든 뒤 4배
-   업샘플한다. 1024 입력에서 40~80픽셀인 병변이 결정 단계에서는 10~20픽셀에
-   불과하다. → **ROI 2단계**(1단계로 위치 검출 → crop 확대 → 2단계 정밀 분할).
-   먼저 GT bbox로 crop한 oracle 조건에서 Dice 상한을 재보면 해상도가 병목인지
-   반나절 안에 확인 가능.
-2. **Annotation 컨벤션.** 예측을 육안 검토하면 병변을 지나치게 크게 잡거나
-   지나치게 작게 잡는 오류가 양방향으로 나타난다. CXR 마스크에는 'air'
-   (공기 음영만)와 'anatomy'(주변 음영 포함) 두 가지 주석 전략이 알려져 있고
-   (CheXmask, Sci Data 2024), GT에 두 방식이 섞여 있다면 모델은 그 중간을
-   학습하게 되어 어느 쪽과도 맞지 않는다. GT 마스크의 군집 여부 확인 필요.
-3. **Layer-wise LR decay.** EVA-X 공식 segmentation recipe는 LLRD 0.85를
-   사용하지만 현재 코드는 백본 전체에 동일 lr을 적용한다. Dice보다는
-   external test 강건성에 기여할 것으로 예상.
-4. **작은 고립 병변.** from-scratch 모델과 EVA-X가 **동일한 케이스들을**
-   놓친다(seg 확률 최대값 < 0.001). 사전학습으로도 해소되지 않는 subgroup.
+유일하게 벽을 넘은 것은 **ROI 2단계 oracle 실험**(전체 이미지 0.31 → ROI 조건
+0.80)이며, 이는 병목이 모델 용량이 아니라 입력 조건임을 시사한다. 실전
+파이프라인은 미구현.
 
 ---
 

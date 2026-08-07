@@ -124,8 +124,8 @@ def load_model(weights, device, model_name="multitask_unet",
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--weights", default="best_mtl_scale.pth")
-    ap.add_argument("--model", default="multitask_unet",
+    ap.add_argument("--weights", default="best_evax_cls_l05.pth")
+    ap.add_argument("--model", default="evax_seg",
                     choices=["multitask_unet", "evax_seg"])
     ap.add_argument("--pretrained", default=None,
                     help="evax_seg 백본 사전학습 경로 (state_dict를 덮어쓰므로 "
@@ -137,7 +137,7 @@ def main():
     ap.add_argument("--cls_threshold", type=float, default=0.5)
     ap.add_argument("--min_pixels", type=int, default=50,
                     help="0이면 small-component 제거 비활성화")
-    ap.add_argument("--detection", choices=["cls", "seg", "combo"], default="cls",
+    ap.add_argument("--detection", choices=["cls", "seg", "combo"], default="combo",
                     help="cls / seg / combo(일치는 seg, 불일치만 cls+seg veto)")
     ap.add_argument("--t_veto", type=float, default=0.01,
                     help="combo: 불일치에서 cls=present여도 seg_max<t_veto면 negative로 veto")
@@ -263,7 +263,7 @@ def main():
                 pred_ts = (fg_prob >= args.cls_threshold).cpu().numpy().astype(np.uint8)
                 score = seg_prob
             elif args.detection == "combo":
-                cls_pos = cls_prob >= 0.5
+                cls_pos = cls_prob >= args.cls_threshold
                 seg_pos = seg_prob >= 0.5
                 if cls_pos == seg_pos:                        # 일치 -> seg 그대로
                     pred_ts = (fg_prob >= 0.5).cpu().numpy().astype(np.uint8)
@@ -292,6 +292,11 @@ def main():
                 present = score >= args.cls_threshold
                 if args.detection == "cls" and not present and not args.no_suppress:
                     pred_orig = np.zeros_like(pred_orig)
+                elif args.detection == "cls" and present and pred_orig.sum() == 0:
+                    low = (fg_prob >= seg_prob * 0.5).cpu().numpy().astype(np.uint8)
+                    pred_orig = unpad_resize_restore(low, pad_info, ch, cw, oh, ow)
+                    pred_orig = remove_small_components(pred_orig,
+                                                        min_pixels=args.min_pixels)
             n_pos += int(present)
             rows.append((cid, int(present)))
 

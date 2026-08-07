@@ -220,7 +220,11 @@ def fit(model, train_loader, val_loader, device,
               f"train_loss={tr_loss:.4f} val_loss={val_loss:.4f} "
               f"dice={val_dice:.4f} cls_acc={val_acc:.4f}")
 
-        final_score = 0.7 * val_acc + 0.3 * val_dice
+        if lambda_cls > 0:
+            final_score = 0.7 * val_acc + 0.3 * val_dice
+        else:
+            final_score = val_dice          # cls 미학습 -> dice로만 선택
+        improved = final_score > best_score
         improved = final_score > best_score
         if improved:
             best_score, best_epoch, since_improve = final_score, epoch, 0
