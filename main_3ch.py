@@ -123,12 +123,15 @@ def main():
             crop_frac=args.crop_frac)
     else:
         from datasets import dataloader
+        if args.size_weighted:
+            raise NotImplementedError(
+                "--size_weighted is not implemented by datasets.py"
+            )
         train_loader, val_loader = dataloader(
             batch_size=cfg['batch_size'],
             target_size=cfg['target_size'], clahe_clip=cfg['clahe_clip'],
             num_workers=cfg['num_workers'], seed=cfg['seed'],
-            crop_frac=args.crop_frac,
-            size_weighted=args.size_weighted)
+            crop_frac=args.crop_frac)
 
     if is_vit:
         default_pt = (EVAX_PRETRAINED_BASE if args.variant == 'base'
