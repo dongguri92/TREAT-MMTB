@@ -12,6 +12,7 @@ Saves:  best checkpoint by mean validation dice
 """
 
 import os
+import time
 import numpy as np
 import torch
 from torch import autocast
@@ -99,7 +100,8 @@ def _seg_loss_on_output(seg_output, target, seg_loss_fn):
 
 
 def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
-                    device, scaler, use_amp=True):
+                    device, scaler, use_amp=True, wandb_run=None,
+                    epoch=0, global_step=0):
     model.train()
     losses = []
     bce = torch.nn.BCEWithLogitsLoss()
@@ -128,16 +130,25 @@ def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
             optimizer.step()
 
         losses.append(loss.item())
-    return float(np.mean(losses))
+        global_step += 1
+        if wandb_run is not None:
+            wandb_run.log({
+                'train/global_step': global_step,
+                'train/epoch': epoch + 1,
+                'train/batch_loss': loss.item(),
+                'train/learning_rate': optimizer.param_groups[0]['lr'],
+            })
+    return float(np.mean(losses)), global_step
 
 
 @torch.no_grad()
-def validate(model, loader, seg_loss_fn, lambda_cls, device, use_amp=True):
+def validate(model, loader, seg_loss_fn, lambda_cls, device, use_amp=True,
+             wandb_run=None, epoch=0):
     model.eval()
     dices, cls_correct, cls_total = [], 0, 0
     bce = torch.nn.BCEWithLogitsLoss()
     val_losses = []
-    for batch in loader:
+    for batch_index, batch in enumerate(loader):
         img = batch['image'].to(device, non_blocking=True)
         mask = batch['mask'].to(device, non_blocking=True)
         cls = batch['cls'].to(device, non_blocking=True)
@@ -150,6 +161,12 @@ def validate(model, loader, seg_loss_fn, lambda_cls, device, use_amp=True):
             l_cls = bce(cls_logit, cls)
             loss = l_seg + lambda_cls * l_cls
         val_losses.append(loss.item())
+        if wandb_run is not None:
+            wandb_run.log({
+                'validation/global_step': epoch * len(loader) + batch_index + 1,
+                'validation/epoch': epoch + 1,
+                'validation/batch_loss': loss.item(),
+            })
 
         # per-sample dice
         pred = seg_main.argmax(1).cpu().numpy()        # (B, H, W)
@@ -177,7 +194,8 @@ def fit(model, train_loader, val_loader, device,
         max_epochs=1000, lambda_cls=0.1,
         initial_lr=1e-2, ckpt_path="best.pth",
         patience=None, batch_dice=True, optimizer_name='sgd',
-        scheduler='poly', warmup_epochs=0, loss_name='dicece'):
+        scheduler='poly', warmup_epochs=0, loss_name='dicece',
+        wandb_run=None):
 
     optimizer = make_optimizer(model, initial_lr=initial_lr,
                                optimizer_name=optimizer_name)
@@ -196,17 +214,25 @@ def fit(model, train_loader, val_loader, device,
     plot_path = os.path.splitext(ckpt_path)[0] + "_curves.png"
 
     best_score, best_epoch, since_improve = -1.0, -1, 0
+    global_step = 0
+    total_started = time.perf_counter()
     for epoch in range(max_epochs):
+        epoch_started = time.perf_counter()
         #for g in optimizer.param_groups:
         #    g['lr'] = poly_lr(epoch, max_epochs, initial_lr)
         for g in optimizer.param_groups:
             g['lr'] = compute_lr(epoch, max_epochs, initial_lr,
                                  scheduler, warmup_epochs)        
 
-        tr_loss = train_one_epoch(model, train_loader, optimizer, seg_loss_fn,
-                                  lambda_cls, device, scaler)
-        val_loss, val_dice, val_acc = validate(model, val_loader, seg_loss_fn,
-                                               lambda_cls, device)
+        tr_loss, global_step = train_one_epoch(
+            model, train_loader, optimizer, seg_loss_fn,
+            lambda_cls, device, scaler, wandb_run=wandb_run,
+            epoch=epoch, global_step=global_step)
+        validation_started = time.perf_counter()
+        val_loss, val_dice, val_acc = validate(
+            model, val_loader, seg_loss_fn, lambda_cls, device,
+            wandb_run=wandb_run, epoch=epoch)
+        validation_seconds = time.perf_counter() - validation_started
 
         # record history + refresh plot every epoch
         history['train_loss'].append(tr_loss)
@@ -225,13 +251,31 @@ def fit(model, train_loader, val_loader, device,
         else:
             final_score = val_dice          # cls 미학습 -> dice로만 선택
         improved = final_score > best_score
-        improved = final_score > best_score
         if improved:
             best_score, best_epoch, since_improve = final_score, epoch, 0
             save_ckpt(ckpt_path, model, optimizer, epoch, final_score)
         
         else:
             since_improve += 1
+
+        epoch_seconds = time.perf_counter() - epoch_started
+        if wandb_run is not None:
+            wandb_run.log({
+                'epoch': epoch + 1,
+                'epoch/train_loss': tr_loss,
+                'epoch/validation_loss': val_loss,
+                'epoch/classification_accuracy': val_acc,
+                'epoch/dice': val_dice,
+                'epoch/weighted_composite': final_score,
+                'epoch/runtime_seconds': epoch_seconds,
+                'epoch/validation_seconds': validation_seconds,
+                'epoch/validation_case_count': len(val_loader.dataset),
+            })
+            wandb_run.summary['best/epoch'] = best_epoch + 1
+            wandb_run.summary['best/weighted_composite'] = best_score
+            wandb_run.summary['runtime/total_seconds'] = (
+                time.perf_counter() - total_started
+            )
 
         if patience is not None and since_improve >= patience:
             print(f"Early stop at epoch {epoch} "

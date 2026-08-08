@@ -143,10 +143,18 @@ def crop_lower(img, frac=LOWER_CROP_FRAC):
     keep = int(round(H * (1 - frac)))
     return img[:keep, :]
 
-TRAIN_DCM_DIR = "/home/djk25/Miccai/data_original/train/CXR"
-TRAIN_MASK_DIR = "/home/djk25/Miccai/data_original/train/CXR_label"
-VAL_DCM_DIR = "/home/djk25/Miccai/data_original/val/CXR"
-VAL_MASK_DIR = "/home/djk25/Miccai/data_original/val/CXR_label"
+TRAIN_DCM_DIR = os.environ.get(
+    "TREAT_TRAIN_DCM_DIR", "/home/djk25/Miccai/data_original/train/CXR"
+)
+TRAIN_MASK_DIR = os.environ.get(
+    "TREAT_TRAIN_MASK_DIR", "/home/djk25/Miccai/data_original/train/CXR_label"
+)
+VAL_DCM_DIR = os.environ.get(
+    "TREAT_VAL_DCM_DIR", "/home/djk25/Miccai/data_original/val/CXR"
+)
+VAL_MASK_DIR = os.environ.get(
+    "TREAT_VAL_MASK_DIR", "/home/djk25/Miccai/data_original/val/CXR_label"
+)
 
 class CXRCavityDataset(Dataset):
     def __init__(self, dcm_dir, mask_dir, ids, train=True,

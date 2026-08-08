@@ -21,9 +21,11 @@ mmcv / mmsegmentation 불필요. timm >= 0.9 (검증: 1.0.22) 만 있으면 된�
 
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from numpy._core.multiarray import scalar as numpy_scalar
 
 from timm.models.eva import Eva
 
@@ -94,7 +96,13 @@ def build_eva_x_small(img_size=1024, in_chans=1, pretrained_path=None,
         from eva_x import checkpoint_filter_fn      # 저장소에서 가져온 파일
 
         path = os.path.expanduser(pretrained_path)
-        ckpt = torch.load(path, map_location="cpu")
+        numpy_safe_globals = [
+            (numpy_scalar, "numpy.core.multiarray.scalar"),
+            np.dtype,
+            type(np.dtype(np.float64)),
+        ]
+        with torch.serialization.safe_globals(numpy_safe_globals):
+            ckpt = torch.load(path, map_location="cpu", weights_only=True)
         state = checkpoint_filter_fn(ckpt, model)   # pos_embed / patch_embed resample
         state = _adapt_patch_embed_in_chans(state, in_chans)
         msg = model.load_state_dict(state, strict=False)

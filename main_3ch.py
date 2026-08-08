@@ -69,6 +69,13 @@ def main():
                         help="ROI 중심 이동 최대 비율")
     parser.add_argument('--size_weighted', action='store_true',
                         help="cavity 크기별 가중 샘플링 (small 3x, medium 2x)")
+    parser.add_argument('--wandb', action='store_true',
+                        help="W&B에 step/epoch 학습 및 검증 지표 기록")
+    parser.add_argument('--wandb_entity', type=str, default=None)
+    parser.add_argument('--wandb_project', type=str, default='treat-mmtb-task1')
+    parser.add_argument('--wandb_run_name', type=str, default=None)
+    parser.add_argument('--wandb_mode', type=str, default='online',
+                        choices=['online', 'offline', 'disabled'])
     args = parser.parse_args()
 
     cfg['lambda_cls'] = args.lambda_cls
@@ -87,7 +94,12 @@ def main():
     else:
         cfg['initial_lr'] = 1e-4 if opt == 'adamw' else 1e-2
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"model={args.model} | channels={args.channels} | "
           f"target_size={cfg['target_size']} | "
           f"batch_size={cfg['batch_size']} | lambda_cls={cfg['lambda_cls']} | "
@@ -133,17 +145,63 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"model params: {n_params/1e6:.1f}M")
 
-    fit(model, train_loader, val_loader, device,
-        max_epochs=cfg['max_epochs'],
-        lambda_cls=cfg['lambda_cls'],
-        initial_lr=cfg['initial_lr'],
-        ckpt_path=cfg['ckpt_path'],
-        patience=cfg['patience'],
-        batch_dice=cfg['batch_dice'],
-        optimizer_name=opt,
-        scheduler=args.scheduler,
-        warmup_epochs=args.warmup,
-        loss_name=args.loss)
+    wandb_run = None
+    if args.wandb:
+        import wandb
+
+        wandb_run = wandb.init(
+            entity=args.wandb_entity,
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            mode=args.wandb_mode,
+            config={
+                **cfg,
+                'model': args.model,
+                'channels': args.channels,
+                'optimizer': opt,
+                'scheduler': args.scheduler,
+                'warmup_epochs': args.warmup,
+                'loss': args.loss,
+                'variant': args.variant,
+                'crop_frac': args.crop_frac,
+                'device': str(device),
+                'parameter_count': n_params,
+                'train_case_count': len(train_loader.dataset),
+                'validation_case_count': len(val_loader.dataset),
+                'train_steps_per_epoch': len(train_loader),
+                'validation_steps_per_epoch': len(val_loader),
+                'validation_sampling': 'deterministic_without_replacement',
+            },
+        )
+        wandb_run.define_metric('train/global_step')
+        wandb_run.define_metric('train/*', step_metric='train/global_step')
+        wandb_run.define_metric('validation/global_step')
+        wandb_run.define_metric(
+            'validation/*', step_metric='validation/global_step'
+        )
+        wandb_run.define_metric('epoch')
+        wandb_run.define_metric('epoch/*', step_metric='epoch')
+
+    try:
+        fit(model, train_loader, val_loader, device,
+            max_epochs=cfg['max_epochs'],
+            lambda_cls=cfg['lambda_cls'],
+            initial_lr=cfg['initial_lr'],
+            ckpt_path=cfg['ckpt_path'],
+            patience=cfg['patience'],
+            batch_dice=cfg['batch_dice'],
+            optimizer_name=opt,
+            scheduler=args.scheduler,
+            warmup_epochs=args.warmup,
+            loss_name=args.loss,
+            wandb_run=wandb_run)
+    except BaseException:
+        if wandb_run is not None:
+            wandb_run.finish(exit_code=1)
+        raise
+    else:
+        if wandb_run is not None:
+            wandb_run.finish()
 
 
 if __name__ == "__main__":
