@@ -6,7 +6,8 @@ from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from training import fit
+from training import fit, validate
+from utils import DiceCELoss
 
 
 class TinyDataset(Dataset):
@@ -36,6 +37,26 @@ class TinyModel(torch.nn.Module):
         segmentation = self.segment(images)
         classification = self.classify(segmentation.mean((2, 3)))
         return segmentation, classification
+
+
+class NativeTinyDataset(Dataset):
+    def __len__(self):
+        return 111
+
+    def __getitem__(self, index):
+        mask = torch.zeros(1, 8, 8, dtype=torch.long)
+        if index == 0:
+            mask[:, 2:4, 2:4] = 1
+        return {
+            "image": torch.zeros(1, 8, 8),
+            "mask": mask.clone(),
+            "native_mask": mask,
+            "native_shape": torch.tensor([8, 8]),
+            "crop_shape": torch.tensor([8, 8]),
+            "pad_info": torch.tensor([0, 0, 8, 8]),
+            "cls": torch.tensor([float(index == 0)]),
+            "id": str(index),
+        }
 
 
 class FakeRun:
@@ -69,3 +90,26 @@ def test_fit_logs_train_validation_and_epoch_metrics(tmp_path: Path):
     assert len(epoch_rows) == 1
     assert epoch_rows[0]["epoch/validation_case_count"] == 4
     assert run.summary["best/epoch"] == 1
+
+
+def test_native_combo_validation_covers_all_111_cases_once():
+    loader = DataLoader(NativeTinyDataset(), batch_size=1, shuffle=False)
+    expected_ids = [str(index) for index in range(111)]
+    _, _, _, native = validate(
+        TinyModel(),
+        loader,
+        DiceCELoss(),
+        lambda_cls=0.5,
+        device=torch.device("cpu"),
+        use_amp=False,
+        native_combo_expected_ids=expected_ids,
+    )
+
+    assert native["coverage"] == {
+        "expected": 111,
+        "observed": 111,
+        "unique": 111,
+        "missing": [],
+        "unexpected": [],
+        "duplicates": 0,
+    }
