@@ -17,6 +17,8 @@ Inputs (original data):
 
 import os
 import glob
+import random
+from functools import partial
 import numpy as np
 import cv2
 import pydicom
@@ -46,7 +48,7 @@ def load_mask(path):
     return (m > 0).astype(np.uint8)
 
 
-def resize_and_pad(img, target_size, is_mask=False):
+def resize_and_pad_info(img, target_size, is_mask=False):
     h, w = img.shape[:2]
     th, tw = target_size, target_size
     scale = min(th / h, tw / w)
@@ -57,6 +59,11 @@ def resize_and_pad(img, target_size, is_mask=False):
     top = (th - nh) // 2
     left = (tw - nw) // 2
     padded[top:top + nh, left:left + nw] = resized
+    return padded, (top, left, nh, nw)
+
+
+def resize_and_pad(img, target_size, is_mask=False):
+    padded, _ = resize_and_pad_info(img, target_size, is_mask=is_mask)
     return padded
 
 
@@ -182,6 +189,9 @@ class CXRCavityDataset(Dataset):
             mask = cv2.resize(mask, (img.shape[1], img.shape[0]),
                               interpolation=cv2.INTER_NEAREST)
 
+        native_mask = (mask > 0).astype(np.uint8)
+        native_shape = img.shape[:2]
+
         # 하부 15% crop (이미지 + 마스크 같이)
         img = crop_lower(img, self.crop_frac)
         mask = crop_lower(mask, self.crop_frac)
@@ -196,7 +206,9 @@ class CXRCavityDataset(Dataset):
                 mask = np.ascontiguousarray(mask[:, ::-1])
 
         # 2) resize + pad
-        img = resize_and_pad(img, self.target_size, is_mask=False)
+        img, pad_info = resize_and_pad_info(
+            img, self.target_size, is_mask=False
+        )
         mask = resize_and_pad(mask, self.target_size, is_mask=True)
 
         # 3) CLAHE on resized image
@@ -216,7 +228,21 @@ class CXRCavityDataset(Dataset):
         mask_t = torch.from_numpy(np.ascontiguousarray(mask)).unsqueeze(0).long()
         cls_t = torch.tensor([cls_label], dtype=torch.float32)
 
-        return {'image': img_t, 'mask': mask_t, 'cls': cls_t, 'id': cid}
+        sample = {'image': img_t, 'mask': mask_t, 'cls': cls_t, 'id': cid}
+        if not self.train:
+            sample.update({
+                'native_mask': torch.from_numpy(
+                    np.ascontiguousarray(native_mask)
+                ).unsqueeze(0).long(),
+                'native_shape': torch.tensor(native_shape, dtype=torch.long),
+                'crop_shape': torch.tensor(
+                    [int(round(native_shape[0] * (1 - self.crop_frac))),
+                     native_shape[1]],
+                    dtype=torch.long,
+                ),
+                'pad_info': torch.tensor(pad_info, dtype=torch.long),
+            })
+        return sample
 
 
 def _list_ids(dcm_dir):
@@ -231,6 +257,13 @@ def _cavity_presence(mask_dir, ids):
         m = load_mask(os.path.join(mask_dir, f"{cid}.nii.gz"))
         labels.append(int(m.sum() > 0))
     return labels
+
+
+def _seed_worker(worker_id, base_seed):
+    worker_seed = (base_seed + worker_id) % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
 
 
 def dataloader(batch_size=3, target_size=1024, clahe_clip=2.0,
@@ -252,10 +285,15 @@ def dataloader(batch_size=3, target_size=1024, clahe_clip=2.0,
                               train=False, target_size=target_size,
                               clahe_clip=clahe_clip, crop_frac=crop_frac)
 
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True, drop_last=True,
-        persistent_workers=True if num_workers > 0 else False)
+        persistent_workers=True if num_workers > 0 else False,
+        generator=generator,
+        worker_init_fn=partial(_seed_worker, base_seed=seed))
     val_loader = torch.utils.data.DataLoader(
         val_ds, batch_size=1, shuffle=False,
         num_workers=num_workers, pin_memory=True,

@@ -30,6 +30,7 @@ import SimpleITK as sitk
 
 from datasets import load_dicom_normalized, apply_clahe, zscore, LOWER_CROP_FRAC
 from models import modeltype
+from reproduction import combo_veto_mask
 
 VAL_DCM_DIR = os.path.expanduser("~/Miccai/data_original/val/CXR")
 VAL_BASE = os.path.expanduser("~/Miccai/data_original/val")
@@ -223,7 +224,7 @@ def main():
                       for c in cids
                       if gt.get(c, 0) == 0 and seg_max[c] < 0.5],
                      key=lambda r: -r[1])[:10]
-        print(f"\nTN 상위 10 (GT=0, seg max<0.5) — 낮출 때 뚫고 올라올 후보:")
+        print("\nTN 상위 10 (GT=0, seg max<0.5) — 낮출 때 뚫고 올라올 후보:")
         print(f"{'id':>6} {'seg_max':>8} {'top100':>8} {'area':>9}")
         for c, mx, tk, ar in tns:
             print(f"{c:>6} {mx:>8.4f} {tk:>8.4f} {ar:>9.2f}")
@@ -258,25 +259,15 @@ def main():
             fg_prob = torch.softmax(seg_out, dim=1)[0, 1]
             seg_prob = fg_prob.max().item()
 
-            combo_present = None
             if args.detection == "seg":
                 pred_ts = (fg_prob >= args.cls_threshold).cpu().numpy().astype(np.uint8)
                 score = seg_prob
             elif args.detection == "combo":
-                cls_pos = cls_prob >= args.cls_threshold
-                seg_pos = seg_prob >= 0.5
-                if cls_pos == seg_pos:                        # 일치 -> seg 그대로
-                    pred_ts = (fg_prob >= 0.5).cpu().numpy().astype(np.uint8)
-                    combo_present = seg_pos
-                elif cls_pos and seg_prob >= args.t_veto:     # cls 믿고 살림
-                    pred_ts = (fg_prob >= args.t_veto).cpu().numpy().astype(np.uint8)
-                    combo_present = True
-                elif cls_pos and seg_prob < args.t_veto:      # seg 강한 veto
-                    pred_ts = np.zeros(fg_prob.shape, dtype=np.uint8)
-                    combo_present = False
-                else:                                          # cls absent, seg present
-                    pred_ts = (fg_prob >= 0.5).cpu().numpy().astype(np.uint8)
-                    combo_present = True
+                pred_ts = combo_veto_mask(
+                    fg_prob.cpu().numpy(), cls_prob,
+                    cls_threshold=args.cls_threshold,
+                    veto_threshold=args.t_veto,
+                )
                 score = None
             else:
                 pred_ts = seg_out.argmax(1)[0].cpu().numpy().astype(np.uint8)
@@ -316,7 +307,7 @@ def main():
 
     print(f"\npredicted present (cavity=1): {n_pos}/{len(rows)}")
     print(f"-> {results_dir}")
-    print(f"\nevaluate:")
+    print("\nevaluate:")
     print(f"python evaluate_task1.py --gt-csv {GT_CSV} "
           f"--pred-csv {csv_path} "
           f"--gt-mask-dir {VAL_BASE}/CXR_label "
