@@ -19,17 +19,19 @@ inference.py / Docker를 그대로 재사용할 수 있다.
 mmcv / mmsegmentation 불필요. timm >= 0.9 (검증: 1.0.22) 만 있으면 된다.
 """
 
+import importlib
 import math
 import os
+from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from numpy._core.multiarray import scalar as numpy_scalar
 from timm.models.eva import Eva
 from torch import nn
 
 EXPECTED_SMALL_PRETRAINED_TENSORS = 162
+numpy_scalar: Any = importlib.import_module("numpy.core.multiarray").scalar
 
 
 def _load_weights_only_checkpoint(path):
@@ -86,7 +88,7 @@ def build_eva_x_small(img_size=1024, in_chans=1, pretrained_path=None,
     """EVA-X backbone. variant: 'small'(embed384) | 'base'(embed768).
     base는 eva_x.py의 eva_x_base_patch16과 동일하게 qkv 분리 + scale_mlp 사용."""
     if variant == "base":
-        arch = {
+        arch: dict[str, Any] = {
             "embed_dim": 768,
             "depth": 12,
             "num_heads": 12,

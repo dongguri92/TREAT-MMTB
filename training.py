@@ -13,10 +13,13 @@ Saves:  best checkpoint by mean validation dice
 
 import os
 import time
+
+import matplotlib
 import numpy as np
 import torch
 from torch import autocast
-import matplotlib
+from torch.amp.grad_scaler import GradScaler
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -26,7 +29,7 @@ from utils import DiceCELoss, dice_metric, save_ckpt
 def save_history_plot(history, out_path):
     """Save train/val loss + val dice + val cls_acc curves to a png."""
     epochs = range(1, len(history['train_loss']) + 1)
-    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+    _fig, ax = plt.subplots(1, 2, figsize=(12, 5))
 
     # left: losses
     ax[0].plot(epochs, history['train_loss'], label='train loss')
@@ -46,6 +49,7 @@ def save_history_plot(history, out_path):
     plt.close()
 
 import math
+
 
 def compute_lr(epoch, max_epochs, initial_lr, scheduler='poly', warmup_epochs=0):
     # warmup: 0 -> initial_lr 선형 증가
@@ -241,7 +245,7 @@ def fit(model, train_loader, val_loader, device,
         seg_loss_fn = BoundaryDiceLoss(batch_dice=batch_dice, w_boundary=0.5)
     else:
         seg_loss_fn = DiceCELoss(batch_dice=batch_dice)
-    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+    scaler = GradScaler('cuda') if device.type == 'cuda' else None
 
     history = {'train_loss': [], 'val_loss': [], 'val_dice': [], 'val_cls_acc': []}
     plot_path = os.path.splitext(ckpt_path)[0] + "_curves.png"
@@ -369,6 +373,8 @@ def fit(model, train_loader, val_loader, device,
 
 # small null-context for non-cuda
 import contextlib
+
+
 @contextlib.contextmanager
 def _nullctx():
     yield

@@ -88,13 +88,26 @@ and index are marked completed only after W&B finishes successfully. A failure
 at any earlier stage writes a sanitized `failure.json` and cannot produce a
 completed attempt.
 
-Verification uses the complete Python file set changed by this PR:
+Type checking is pinned to Pyright 1.1.411 and explicitly bound to the
+locked reproduction environment created above. The project configuration does
+not suppress missing-import diagnostics. Verify both the complete Python file
+set changed by this PR and the full project:
 
 ```bash
-uvx pyright $(git diff --name-only \
+uvx --from pyright==1.1.411 pyright \
+  --pythonpath .venv-reproduction/bin/python \
+  $(git diff --name-only \
   origin/codex/task1-wandb-reproduction...HEAD -- '*.py')
 # 0 errors, 0 warnings, 0 informations
+
+uvx --from pyright==1.1.411 pyright \
+  --pythonpath .venv-reproduction/bin/python
+# 0 errors, 0 warnings, 0 informations
 ```
+
+Adding `--verbose` to the changed-file command shows that Pyright searches the
+same environment's `site-packages`, where the locked NumPy, PyTorch, and timm
+packages are installed, rather than accepting unresolved imports.
 
 The pinned checkpoint smoke must report `loaded 162 tensors | missing 0 |
 unexpected 0` from `build_eva_x_small(...)` before approval. This is a

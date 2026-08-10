@@ -493,16 +493,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         dependency = validate_runtime_dependencies(LOCK_PATH)
         dependency["lock_sha256"] = sha256_file(LOCK_PATH)
         device = _device(args.device)
+        torch_cuda_version = getattr(getattr(torch, "version", None), "cuda", None)
         if device.type != "cuda":
             raise RuntimeError("scored reproduction requires a CUDA device")
-        if torch.version.cuda != EXPECTED_CUDA_VERSION:
+        if torch_cuda_version != EXPECTED_CUDA_VERSION:
             raise RuntimeError("runtime CUDA differs from the verified CUDA 11.8 build")
         if not hasattr(torch.serialization, "safe_globals"):
             raise RuntimeError("runtime torch lacks the required safe_globals API")
         dependency.update(
             {
                 "torch": torch.__version__,
-                "cuda": torch.version.cuda,
+                "cuda": torch_cuda_version,
                 "device": str(device),
                 "device_name": (
                     torch.cuda.get_device_name(device)
