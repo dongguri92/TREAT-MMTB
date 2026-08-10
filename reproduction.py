@@ -206,6 +206,16 @@ def _directory_ids(directory: Path, suffix: str) -> list[str]:
     )
 
 
+def _preflight_dataset_directory(directory: Path, label: str) -> None:
+    """Reject every nested external-final name or symlink before byte reads."""
+    entries = list(directory.iterdir())
+    for entry in entries:
+        reject_external_final_path(entry, label)
+    for entry in entries:
+        if entry.is_symlink():
+            raise ValueError(f"{label} must not contain symlinked dataset entries")
+
+
 def _content_rows(
     case_ids: Sequence[str], dcm_dir: Path, mask_dir: Path
 ) -> list[dict[str, str]]:
@@ -236,6 +246,13 @@ def validate_canonical_content(
     validation_ids = identity.get("validation")
     if not isinstance(train_ids, list) or not isinstance(validation_ids, list):
         raise TypeError("canonical case identity is incomplete")
+    for directory, label in (
+        (train_dcm_dir, "train_dcm_dir"),
+        (train_mask_dir, "train_mask_dir"),
+        (validation_dcm_dir, "validation_dcm_dir"),
+        (validation_mask_dir, "validation_mask_dir"),
+    ):
+        _preflight_dataset_directory(directory, label)
     train_rows = _content_rows(train_ids, train_dcm_dir, train_mask_dir)
     validation_rows = _content_rows(
         validation_ids, validation_dcm_dir, validation_mask_dir

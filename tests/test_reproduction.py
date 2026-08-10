@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import reproduce_teammate_l05 as launcher
 import reproduction
+from models_evax import _load_weights_only_checkpoint
 from reproduce_teammate_l05 import (
     ARTIFACT_NAMES,
     _validate_health_index,
@@ -137,6 +138,40 @@ def test_canonical_content_binds_bytes_and_rejects_extra_case(
     (directories[0] / "extra.dcm").write_bytes(b"forbidden")
     with pytest.raises(ValueError, match="identities differ"):
         validate_canonical_content(identity, *directories)
+
+
+def test_canonical_content_rejects_nested_symlink_before_any_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directories = [tmp_path / name for name in ("td", "tm", "vd", "vm")]
+    for directory in directories:
+        directory.mkdir()
+    identity = {"train": ["train"], "validation": ["validation"]}
+    (directories[0] / "train.dcm").write_bytes(b"train-dcm")
+    (directories[1] / "train.nii.gz").write_bytes(b"train-mask")
+    (directories[2] / "validation.dcm").write_bytes(b"val-dcm")
+    forbidden = tmp_path / "external-final" / "validation.nii.gz"
+    forbidden.parent.mkdir()
+    forbidden.write_bytes(b"must-not-be-read")
+    (directories[3] / "validation.nii.gz").symlink_to(forbidden)
+
+    def unexpected_hash(_path: Path | str) -> str:
+        raise AssertionError("dataset bytes must not be read before symlink rejection")
+
+    monkeypatch.setattr(reproduction, "sha256_file", unexpected_hash)
+    with pytest.raises(ValueError, match="symlinked dataset entries"):
+        validate_canonical_content(identity, *directories)
+
+
+def test_torch_251_safe_globals_allowlist_loads_numpy_checkpoint(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "numpy-checkpoint.pt"
+    import torch
+
+    torch.save({"numpy_scalar": np.float64(1.25)}, checkpoint)
+    loaded = _load_weights_only_checkpoint(checkpoint)
+    assert float(loaded["numpy_scalar"]) == 1.25
 
 
 def test_paired_regression_has_exact_taxonomy_mcnemar_and_bootstrap() -> None:
@@ -343,6 +378,7 @@ def test_health_index_recomputes_every_artifact_and_rejects_tampering(
     health_config = {
         "attempt_id": "health-001",
         "reviewed_by": "reviewer",
+        "num_workers": 4,
         "protocol": health_protocol,
         "protocol_sha256": reproduction.canonical_sha256(health_protocol),
         "pretrained": {"sha256": "pretrained"},
@@ -467,9 +503,15 @@ def test_health_index_recomputes_every_artifact_and_rejects_tampering(
     drifted_config["protocol_sha256"] = reproduction.canonical_sha256(
         drifted_config["protocol"]
     )
-    with pytest.raises(ValueError, match="health protocol"):
+    with pytest.raises(ValueError, match="health config differs"):
         _validate_health_index(
             tmp_path / "artifact_index.json", drifted_config, source
+        )
+    worker_drift = dict(current_config)
+    worker_drift["num_workers"] = 8
+    with pytest.raises(ValueError, match="health config differs"):
+        _validate_health_index(
+            tmp_path / "artifact_index.json", worker_drift, source
         )
     (tmp_path / "score.json").write_text("{}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="hash mismatch"):

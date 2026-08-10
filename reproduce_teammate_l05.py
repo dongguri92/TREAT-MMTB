@@ -7,6 +7,7 @@ immutable canonical dataset, baseline, dependency, source, and W&B identities.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import random
 import re
@@ -248,6 +249,24 @@ def _relative_artifact_hashes(artifact_dir: Path) -> dict[str, str]:
     return {name: sha256_file(artifact_dir / name) for name in ARTIFACT_NAMES}
 
 
+def _continuation_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Normalize only mandatory fresh-attempt and 5-to-50 phase differences."""
+    normalized = copy.deepcopy(config)
+    normalized.pop("attempt_id", None)
+    normalized.pop("parameter_count", None)
+    normalized.pop("protocol_sha256", None)
+    protocol = normalized.get("protocol")
+    if isinstance(protocol, dict):
+        protocol.pop("phase", None)
+        protocol.pop("epochs", None)
+    wandb_config = normalized.get("wandb")
+    if isinstance(wandb_config, dict):
+        wandb_config.pop("id", None)
+        wandb_config.pop("name", None)
+        wandb_config.pop("config_sha256", None)
+    return normalized
+
+
 def _validate_health_index(
     index_path: Path,
     current_config: dict[str, Any],
@@ -275,16 +294,10 @@ def _validate_health_index(
     record = read_json(root / "run_record.json")
     if source != expected_source:
         raise ValueError("source changed between health and convergence")
-    stable_fields = (
-        "pretrained",
-        "dataset_scope",
-        "manifest",
-        "content",
-        "baseline",
-        "dependency",
-    )
-    if any(config.get(field) != current_config.get(field) for field in stable_fields):
-        raise ValueError("health immutable input identity differs from convergence")
+    health_continuation = _continuation_config(config)
+    convergence_continuation = _continuation_config(current_config)
+    if health_continuation != convergence_continuation:
+        raise ValueError("health config differs beyond fresh attempt and phase fields")
     expected_health = protocol_contract("health")
     expected_convergence = protocol_contract("convergence")
     health_semantics = {
@@ -396,6 +409,7 @@ def _validate_health_index(
         "phase_transition_sha256": canonical_sha256(
             {"health": expected_health, "convergence": expected_convergence}
         ),
+        "continuation_config_sha256": canonical_sha256(health_continuation),
         "reviewed_by": record["reviewed_by"],
     }
 

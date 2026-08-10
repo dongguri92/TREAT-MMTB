@@ -20,7 +20,7 @@ historical 150-epoch teammate run.
 ```bash
 uv venv --python 3.11 .venv-reproduction
 uv pip sync --python .venv-reproduction/bin/python --require-hashes \
-  --extra-index-url https://download.pytorch.org/whl/cu118 \
+  --torch-backend cu118 \
   requirements-reproduction.lock
 ```
 
@@ -71,6 +71,10 @@ epoch, exact 111-case validation coverage, and completed W&B evidence.
 It also proves that health and convergence differ only by phase and requested
 epoch count, and cross-checks the selected epoch, score, per-case coverage,
 regression hash, and W&B public-config hash before the 50-epoch attempt starts.
+The full sealed configuration must match, including `num_workers`; only the
+mandatory fresh attempt/W&B identifiers, derived protocol/W&B hashes and
+parameter count, and protocol `phase`/`epochs` fields are normalized for the
+comparison.
 
 Every supplied path is checked lexically for external-final names before path
 resolution or any content access, then checked again after resolution to catch
