@@ -29,10 +29,13 @@ from numpy._core.multiarray import scalar as numpy_scalar
 from timm.models.eva import Eva
 from torch import nn
 
+EXPECTED_SMALL_PRETRAINED_TENSORS = 162
+
 
 def _load_weights_only_checkpoint(path):
     """Load the pinned EVA-X checkpoint with the PyTorch 2.5 allowlist."""
     numpy_safe_globals = [
+        set,
         numpy_scalar,
         np.dtype,
         type(np.dtype(np.float64)),
@@ -116,6 +119,15 @@ def build_eva_x_small(img_size=1024, in_chans=1, pretrained_path=None,
         state = _adapt_patch_embed_in_chans(state, in_chans)
         msg = model.load_state_dict(state, strict=False)
         n_loaded = len(state) - len(msg.unexpected_keys)
+        if variant == "small" and (
+            n_loaded != EXPECTED_SMALL_PRETRAINED_TENSORS
+            or msg.missing_keys
+            or msg.unexpected_keys
+        ):
+            raise RuntimeError(
+                "EVA-X small checkpoint must load exactly 162 tensors "
+                "with no missing or unexpected keys"
+            )
         print(f"  EVA-X pretrained: {path}")
         print(f"    loaded {n_loaded} tensors | "
               f"missing {len(msg.missing_keys)} | unexpected {len(msg.unexpected_keys)}")

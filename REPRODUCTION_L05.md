@@ -87,3 +87,15 @@ bootstrap), score, checkpoint, run record, and artifact index. The run record
 and index are marked completed only after W&B finishes successfully. A failure
 at any earlier stage writes a sanitized `failure.json` and cannot produce a
 completed attempt.
+
+Verification uses the complete Python file set changed by this PR:
+
+```bash
+uvx pyright $(git diff --name-only \
+  origin/codex/task1-wandb-reproduction...HEAD -- '*.py')
+# 0 errors, 0 warnings, 0 informations
+```
+
+The pinned checkpoint smoke must report `loaded 162 tensors | missing 0 |
+unexpected 0` from `build_eva_x_small(...)` before approval. This is a
+weights-only model construction check, not scored training.

@@ -163,15 +163,19 @@ def test_canonical_content_rejects_nested_symlink_before_any_hash(
         validate_canonical_content(identity, *directories)
 
 
-def test_torch_251_safe_globals_allowlist_loads_numpy_checkpoint(
+def test_torch_251_safe_globals_allowlist_loads_pinned_checkpoint_types(
     tmp_path: Path,
 ) -> None:
     checkpoint = tmp_path / "numpy-checkpoint.pt"
     import torch
 
-    torch.save({"numpy_scalar": np.float64(1.25)}, checkpoint)
+    torch.save(
+        {"numpy_scalar": np.float64(1.25), "parameter_names": {"weight"}},
+        checkpoint,
+    )
     loaded = _load_weights_only_checkpoint(checkpoint)
     assert float(loaded["numpy_scalar"]) == 1.25
+    assert loaded["parameter_names"] == {"weight"}
 
 
 def test_paired_regression_has_exact_taxonomy_mcnemar_and_bootstrap() -> None:
