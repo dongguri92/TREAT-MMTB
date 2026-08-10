@@ -55,6 +55,9 @@ MPS_LOCK_PATH = REPO_ROOT / "requirements-reproduction-mps.lock"
 ISSUE_URL = "https://github.com/choco9966/TREAT-MMTB-2026/issues/106"
 PARENT_ISSUE_URL = "https://github.com/choco9966/TREAT-MMTB-2026/issues/95"
 EPOCHS = 5
+PHASE = "health"
+WANDB_GROUP = "task1-teammate-l05-veto-mps-health"
+WANDB_JOB_TYPE = "reviewed-mps-health"
 TARGET_SIZE = 1024
 PHYSICAL_BATCH_SIZE = 1
 GRADIENT_ACCUMULATION_STEPS = 8
@@ -120,7 +123,7 @@ def _set_seed(seed: int) -> None:
 
 def mps_protocol_contract() -> dict[str, Any]:
     return {
-        "phase": "health",
+        "phase": PHASE,
         "epochs": EPOCHS,
         "execution_family": "apple_mps_resource_adjusted",
         "historical_cuda_equivalence_claimed": False,
@@ -421,8 +424,8 @@ def _start_wandb(config: dict[str, Any]) -> Any:
         name=config["wandb"]["name"],
         mode="online",
         resume="never",
-        group="task1-teammate-l05-veto-mps-health",
-        job_type="reviewed-mps-health",
+        group=WANDB_GROUP,
+        job_type=WANDB_JOB_TYPE,
         config=public_config,
     )
     run.define_metric("train/micro_step")
@@ -450,7 +453,7 @@ def _seal_resource_failure(
     index = {
         "schema_version": 1,
         "attempt_id": args.attempt_id,
-        "phase": "health",
+        "phase": PHASE,
         "status": "resource_infeasible",
         "resource_evidence_sha256": sha256_file(
             artifact_dir / "resource_evidence.json"
@@ -477,7 +480,7 @@ def _safe_failure(
         receipt: dict[str, Any] = {
             "schema_version": 1,
             "attempt_id": args.attempt_id,
-            "phase": "health",
+            "phase": PHASE,
             "status": "failed",
             "stage": stage,
             "error_type": type(error).__name__,
@@ -505,7 +508,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not args.execute:
         return {
             "status": "dry_run",
-            "phase": "health",
+            "phase": PHASE,
             "epochs": EPOCHS,
             "attempt_id": args.attempt_id,
             "protocol": mps_protocol_contract(),
@@ -703,7 +706,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "issue_url": ISSUE_URL,
             "parent_issue_url": PARENT_ISSUE_URL,
             "attempt_id": args.attempt_id,
-            "phase": "health",
+            "phase": PHASE,
             "execution_family": "apple_mps_resource_adjusted",
             "historical_cuda_equivalence_claimed": False,
             "dataset_scope": DATASET_SCOPE,
@@ -748,7 +751,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "issue_url": ISSUE_URL,
             "parent_issue_url": PARENT_ISSUE_URL,
             "attempt_id": args.attempt_id,
-            "phase": "health",
+            "phase": PHASE,
             "execution_family": "apple_mps_resource_adjusted",
             "historical_cuda_equivalence_claimed": False,
             "status": "completed",
@@ -773,12 +776,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         artifact_index = {
             "schema_version": 1,
             "attempt_id": args.attempt_id,
-            "phase": "health",
+            "phase": PHASE,
             "execution_family": "apple_mps_resource_adjusted",
             "status": "completed",
             "artifacts": {
-                name: sha256_file(artifact_dir / name)
-                for name in MPS_ARTIFACT_NAMES
+                name: sha256_file(artifact_dir / name) for name in MPS_ARTIFACT_NAMES
             },
         }
         write_json_once(artifact_dir / "artifact_index.json", artifact_index)
