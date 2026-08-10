@@ -12,6 +12,8 @@ import json
 import random
 import re
 import shutil
+import signal
+import threading
 import time
 from pathlib import Path
 from typing import Any, cast
@@ -80,6 +82,36 @@ class MPSFeasibilityFailure(RuntimeError):
         self.evidence = evidence
 
 
+class RunInterrupted(KeyboardInterrupt):
+    def __init__(self, signum: int):
+        self.signum = signum
+        self.signal_name = signal.Signals(signum).name
+        super().__init__(f"run interrupted by {self.signal_name}")
+
+
+def _install_interrupt_handlers() -> dict[signal.Signals, Any]:
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("MPS reproduction must run in the main thread")
+    previous: dict[signal.Signals, Any] = {}
+
+    def interrupt(signum: int, _frame: Any) -> None:
+        raise RunInterrupted(signum)
+
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, interrupt)
+    except BaseException:
+        _restore_interrupt_handlers(previous)
+        raise
+    return previous
+
+
+def _restore_interrupt_handlers(previous: dict[signal.Signals, Any]) -> None:
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
+
+
 def _set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -134,7 +166,12 @@ def mps_protocol_contract() -> dict[str, Any]:
 def _memory_snapshot() -> dict[str, int | None]:
     def value(name: str) -> int | None:
         function = getattr(torch.mps, name, None)
-        return int(cast(Any, function())) if callable(function) else None
+        if not callable(function):
+            return None
+        try:
+            return int(cast(Any, function()))
+        except RuntimeError:
+            return None
 
     return {
         "current_allocated_bytes": value("current_allocated_memory"),
@@ -144,14 +181,14 @@ def _memory_snapshot() -> dict[str, int | None]:
 
 
 def _mps_feasibility_probe(
-    model: torch.nn.Module, loader: Any, device: torch.device
+    loader: Any, device: torch.device, pretrained_path: Path
 ) -> dict[str, Any]:
     if device.type != "mps" or not torch.backends.mps.is_available():
         raise RuntimeError("feasibility probe requires the verified MPS device")
     empty_cache = getattr(torch.mps, "empty_cache", None)
     synchronize = getattr(torch.mps, "synchronize", None)
-    if callable(empty_cache):
-        empty_cache()
+    stage = "cache_prepare"
+    model: torch.nn.Module | None = None
     evidence: dict[str, Any] = {
         "schema_version": 1,
         "probe": "one_training_microbatch_forward_backward",
@@ -159,24 +196,45 @@ def _mps_feasibility_probe(
         "physical_batch_size": PHYSICAL_BATCH_SIZE,
         "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
         "effective_batch_size": EFFECTIVE_BATCH_SIZE,
-        "memory_before": _memory_snapshot(),
     }
     try:
+        if callable(empty_cache):
+            empty_cache()
+        evidence["memory_before"] = _memory_snapshot()
+        stage = "model_construction"
+        model = cast(
+            torch.nn.Module,
+            modeltype(
+                "evax_seg",
+                in_channels=1,
+                img_size=TARGET_SIZE,
+                pretrained_path=str(pretrained_path),
+                variant="small",
+            ),
+        )
+        stage = "device_transfer"
+        model = cast(torch.nn.Module, model.to(device))
+        stage = "microbatch_load"
         batch = next(iter(loader))
+        stage = "microbatch_device_transfer"
         image = batch["image"].to(device)
         mask = batch["mask"].to(device)
         cls = batch["cls"].to(device)
         if tuple(image.shape) != (1, 1, TARGET_SIZE, TARGET_SIZE):
             raise ValueError("feasibility batch is not exact 1x1x1024x1024")
+        stage = "forward"
         model.train()
         cast(Any, model).return_cls = True
         segmentation, classification = model(image)
+        stage = "loss"
         segmentation_loss = DiceCELoss(batch_dice=True)(segmentation, mask)
         classification_loss = torch.nn.BCEWithLogitsLoss()(classification, cls)
         loss = segmentation_loss + 0.5 * classification_loss
         if not bool(torch.isfinite(loss).item()):
             raise FloatingPointError("feasibility loss is non-finite")
+        stage = "backward"
         (loss / GRADIENT_ACCUMULATION_STEPS).backward()
+        stage = "synchronize"
         if callable(synchronize):
             synchronize()
         evidence.update(
@@ -191,6 +249,7 @@ def _mps_feasibility_probe(
         evidence.update(
             {
                 "status": "failed",
+                "failure_stage": stage,
                 "error_type": type(error).__name__,
                 "out_of_memory": "out of memory" in str(error).lower(),
                 "memory_at_failure": _memory_snapshot(),
@@ -198,9 +257,19 @@ def _mps_feasibility_probe(
         )
         raise MPSFeasibilityFailure(evidence) from error
     finally:
-        model.zero_grad(set_to_none=True)
+        if model is not None:
+            zero_grad = getattr(model, "zero_grad", None)
+            if callable(zero_grad):
+                try:
+                    zero_grad(set_to_none=True)
+                except RuntimeError:
+                    pass
+            del model
         if callable(empty_cache):
-            empty_cache()
+            try:
+                empty_cache()
+            except RuntimeError:
+                pass
 
 
 def _resource_evidence(
@@ -395,21 +464,38 @@ def _seal_resource_failure(
 
 
 def _safe_failure(
-    artifact_dir: Path, args: argparse.Namespace, stage: str, error: BaseException
+    artifact_dir: Path,
+    args: argparse.Namespace,
+    stage: str,
+    error: BaseException,
+    *,
+    wandb_finish_succeeded: bool | None = None,
+    wandb_finish_error: BaseException | None = None,
 ) -> None:
     path = artifact_dir / "failure.json"
     if artifact_dir.exists() and not path.exists():
-        write_json_once(
-            path,
-            {
-                "schema_version": 1,
-                "attempt_id": args.attempt_id,
-                "phase": "health",
-                "stage": stage,
-                "error_type": type(error).__name__,
-                "external_final_test_untouched": True,
-            },
-        )
+        receipt: dict[str, Any] = {
+            "schema_version": 1,
+            "attempt_id": args.attempt_id,
+            "phase": "health",
+            "status": "failed",
+            "stage": stage,
+            "error_type": type(error).__name__,
+            "external_final_test_untouched": True,
+        }
+        if isinstance(error, RunInterrupted):
+            receipt.update(
+                {
+                    "reason": "signal_interruption",
+                    "signal": error.signal_name,
+                    "signal_number": error.signum,
+                    "wandb_exit_code_1_requested": wandb_finish_succeeded is not None,
+                    "wandb_finish_succeeded": wandb_finish_succeeded,
+                }
+            )
+        if wandb_finish_error is not None:
+            receipt["wandb_finish_error_type"] = type(wandb_finish_error).__name__
+        write_json_once(path, receipt)
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -431,6 +517,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     artifact_dir.mkdir(parents=True, exist_ok=False)
     wandb_run: Any = None
     stage = "source_identity"
+    previous_handlers = _install_interrupt_handlers()
     try:
         source = source_identity(REPO_ROOT)
         protocol = mps_protocol_contract()
@@ -476,16 +563,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("MPS loaders differ from exact 444/111 microstep contract")
 
         stage = "mps_1024_feasibility"
-        probe_model = modeltype(
-            "evax_seg",
-            in_channels=1,
-            img_size=TARGET_SIZE,
-            pretrained_path=str(args.pretrained),
-            variant="small",
-        ).to(torch.device("mps"))
         try:
             probe = _mps_feasibility_probe(
-                probe_model, probe_loader, torch.device("mps")
+                probe_loader, torch.device("mps"), args.pretrained
             )
         except MPSFeasibilityFailure as error:
             resource = _resource_evidence(
@@ -501,11 +581,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 error.evidence,
             )
             return _seal_resource_failure(artifact_dir, args, resource)
-        finally:
-            del probe_model
-            empty_cache = getattr(torch.mps, "empty_cache", None)
-            if callable(empty_cache):
-                empty_cache()
 
         resource = _resource_evidence(
             args,
@@ -709,15 +784,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         write_json_once(artifact_dir / "artifact_index.json", artifact_index)
         return artifact_index
     except BaseException as error:
+        finish_succeeded: bool | None = None
+        finish_error: BaseException | None = None
         if wandb_run is not None:
             try:
                 wandb_run.finish(exit_code=1)
-            except BaseException as finish_error:  # noqa: BLE001
-                _safe_failure(
-                    artifact_dir, args, "wandb_failure_finish", finish_error
-                )
-        _safe_failure(artifact_dir, args, stage, error)
+                finish_succeeded = True
+            except BaseException as caught_finish_error:  # noqa: BLE001
+                finish_succeeded = False
+                finish_error = caught_finish_error
+        _safe_failure(
+            artifact_dir,
+            args,
+            stage,
+            error,
+            wandb_finish_succeeded=finish_succeeded,
+            wandb_finish_error=finish_error,
+        )
         raise
+    finally:
+        _restore_interrupt_handlers(previous_handlers)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

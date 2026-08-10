@@ -24,6 +24,10 @@ MACOSX_DEPLOYMENT_TARGET=14.0 uv pip sync \
   --require-hashes requirements-reproduction-mps.lock
 ```
 
+The exact repo-local `.venv-reproduction-mps/` path is ignored by Git, so the
+required clean-source identity gate remains valid after creating the documented
+environment.
+
 `requirements-reproduction-mps.in` records the direct inputs used to compile
 the hash lock. The runner fails closed unless every locked distribution,
 Python patch version, operating system, architecture, PyTorch/torchvision
@@ -81,5 +85,10 @@ artifacts seal source, protocol, dependency, checkpoint, canonical data,
 identity, feasibility, score, paired regression, checkpoint, W&B identity, and
 artifact hashes. W&B receives aggregate counts and hashes, never case IDs or
 local paths.
+
+`SIGTERM` and `SIGINT` are controlled cancellations. An active W&B run is
+finished with `exit_code=1`, a sanitized immutable `failure.json` receipt records
+the signal and finish outcome, and the prior process handlers are restored
+before exit.
 
 No training or W&B run is authorized by this document alone.

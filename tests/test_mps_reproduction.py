@@ -1,7 +1,14 @@
 import argparse
 import importlib.metadata
+import json
+import os
+import signal
+import subprocess
 import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -67,6 +74,41 @@ def test_mps_dry_run_requires_review_before_execution(tmp_path: Path) -> None:
     assert not (tmp_path / "artifacts" / args.attempt_id).exists()
 
 
+def test_documented_repo_local_mps_venv_preserves_clean_source_identity(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".gitignore").write_text(
+        (Path(__file__).resolve().parents[1] / ".gitignore").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    (repo / "tracked.txt").write_text("sealed\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "sealed",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    environment = repo / ".venv-reproduction-mps"
+    environment.mkdir()
+    (environment / "pyvenv.cfg").write_text("home = sealed\n", encoding="utf-8")
+
+    assert reproduction.source_identity(repo)["git_commit"]
+
+
 def test_resource_failure_emits_only_sealed_resource_evidence(tmp_path: Path) -> None:
     artifact_dir = tmp_path / "attempt"
     artifact_dir.mkdir()
@@ -93,6 +135,106 @@ def test_resource_failure_emits_only_sealed_resource_evidence(tmp_path: Path) ->
         mps._seal_resource_failure(artifact_dir, args, resource)
 
 
+@pytest.mark.parametrize(
+    ("failure_stage", "failure_factory"),
+    [
+        (
+            "model_construction",
+            lambda: (_ for _ in ()).throw(RuntimeError("MPS out of memory")),
+        ),
+        (
+            "device_transfer",
+            lambda: SimpleNamespace(
+                to=lambda _device: (_ for _ in ()).throw(
+                    RuntimeError("MPS backend out of memory")
+                )
+            ),
+        ),
+    ],
+)
+def test_probe_seals_model_construction_and_transfer_resource_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+    failure_factory: Callable[[], object],
+) -> None:
+    monkeypatch.setattr(mps.torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(mps, "_memory_snapshot", dict)
+    monkeypatch.setattr(mps.torch.mps, "empty_cache", lambda: None, raising=False)
+    monkeypatch.setattr(mps, "modeltype", lambda *_args, **_kwargs: failure_factory())
+
+    with pytest.raises(mps.MPSFeasibilityFailure) as caught:
+        mps._mps_feasibility_probe(
+            object(), mps.torch.device("mps"), tmp_path / "pretrained.pt"
+        )
+    assert caught.value.evidence["status"] == "failed"
+    assert caught.value.evidence["failure_stage"] == failure_stage
+    assert caught.value.evidence["out_of_memory"] is True
+
+
+@pytest.mark.parametrize("failure_stage", ["forward", "backward"])
+def test_probe_seals_forward_and_backward_resource_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    class Tensor:
+        shape = (1, 1, 1024, 1024)
+
+        def to(self, _device: object) -> "Tensor":
+            return self
+
+    class Loss:
+        def __add__(self, _other: object) -> "Loss":
+            return self
+
+        def __rmul__(self, _other: object) -> "Loss":
+            return self
+
+        def __truediv__(self, _other: object) -> "Loss":
+            return self
+
+        def backward(self) -> None:
+            raise RuntimeError("MPS backend out of memory")
+
+    class ProbeModel:
+        return_cls = False
+
+        def to(self, _device: object) -> "ProbeModel":
+            return self
+
+        def train(self) -> None:
+            pass
+
+        def zero_grad(self, *, set_to_none: bool) -> None:
+            assert set_to_none is True
+
+        def __call__(self, _image: Tensor) -> tuple[object, object]:
+            if failure_stage == "forward":
+                raise RuntimeError("MPS backend out of memory")
+            return object(), object()
+
+    monkeypatch.setattr(mps.torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(mps, "_memory_snapshot", dict)
+    monkeypatch.setattr(mps.torch.mps, "empty_cache", lambda: None, raising=False)
+    monkeypatch.setattr(mps, "modeltype", lambda *_args, **_kwargs: ProbeModel())
+    monkeypatch.setattr(mps, "DiceCELoss", lambda **_kwargs: lambda *_args: Loss())
+    monkeypatch.setattr(
+        mps.torch.nn, "BCEWithLogitsLoss", lambda: lambda *_args: Loss()
+    )
+    monkeypatch.setattr(
+        mps.torch, "isfinite", lambda _loss: SimpleNamespace(item=lambda: True)
+    )
+    loader = [{"image": Tensor(), "mask": Tensor(), "cls": Tensor()}]
+
+    with pytest.raises(mps.MPSFeasibilityFailure) as caught:
+        mps._mps_feasibility_probe(
+            loader, mps.torch.device("mps"), tmp_path / "pretrained.pt"
+        )
+    assert caught.value.evidence["failure_stage"] == failure_stage
+    assert caught.value.evidence["out_of_memory"] is True
+
+
 def test_execute_routes_failed_probe_to_resource_only_without_wandb(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -114,7 +256,7 @@ def test_execute_routes_failed_probe_to_resource_only_without_wandb(
 
     class ProbeModel:
         def to(self, _device: object) -> "ProbeModel":
-            return self
+            raise RuntimeError("MPS backend out of memory")
 
     monkeypatch.setattr(
         mps, "source_identity", lambda _root: {"git_commit": "c", "git_tree_sha1": "t"}
@@ -169,15 +311,8 @@ def test_execute_routes_failed_probe_to_resource_only_without_wandb(
         lambda *_args: (identity, "identity-hash"),
     )
     monkeypatch.setattr(mps, "modeltype", lambda *_args, **_kwargs: ProbeModel())
-    monkeypatch.setattr(
-        mps,
-        "_mps_feasibility_probe",
-        lambda *_args: (_ for _ in ()).throw(
-            mps.MPSFeasibilityFailure(
-                {"status": "failed", "out_of_memory": True}
-            )
-        ),
-    )
+    monkeypatch.setattr(mps.torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(mps, "_memory_snapshot", dict)
     monkeypatch.setattr(
         mps,
         "_start_wandb",
@@ -194,6 +329,63 @@ def test_execute_routes_failed_probe_to_resource_only_without_wandb(
         "resource_evidence.json",
         "resource_index.json",
     }
+
+
+@pytest.mark.parametrize("interrupt_signal", [signal.SIGTERM, signal.SIGINT])
+def test_subprocess_interrupt_closes_wandb_and_writes_safe_failure_receipt(
+    tmp_path: Path, interrupt_signal: signal.Signals
+) -> None:
+    artifact_root = tmp_path / "artifacts"
+    ready_path = tmp_path / "wandb-ready"
+    finish_path = tmp_path / "wandb-finish.json"
+    restored_path = tmp_path / "handlers-restored"
+    harness = Path(__file__).with_name("mps_interrupt_harness.py")
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(harness),
+            str(artifact_root),
+            str(ready_path),
+            str(finish_path),
+            str(restored_path),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while not ready_path.exists() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                pytest.fail("interrupt harness did not reach W&B-backed training")
+            time.sleep(0.02)
+        assert process.poll() is None
+        os.kill(process.pid, interrupt_signal)
+        assert process.wait(timeout=20) == 1
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    receipt = json.loads(
+        (artifact_root / "interrupt-test" / "failure.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt == {
+        "attempt_id": "interrupt-test",
+        "error_type": "RunInterrupted",
+        "external_final_test_untouched": True,
+        "phase": "health",
+        "reason": "signal_interruption",
+        "schema_version": 1,
+        "signal": interrupt_signal.name,
+        "signal_number": interrupt_signal.value,
+        "stage": "training",
+        "status": "failed",
+        "wandb_exit_code_1_requested": True,
+        "wandb_finish_succeeded": True,
+    }
+    assert json.loads(finish_path.read_text(encoding="utf-8")) == {"exit_code": 1}
+    assert restored_path.read_text(encoding="utf-8") == "restored\n"
 
 
 def test_mps_runtime_gate_is_exact_and_disables_cpu_fallback(

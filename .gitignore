@@ -10,3 +10,4 @@ docker_test/
 wandb/
 artifacts/reproduction/
 artifacts/reproduction-mps/
+.venv-reproduction-mps/
