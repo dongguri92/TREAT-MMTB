@@ -13,7 +13,7 @@ We try to import the exact PlainConvUNet from dynamic_network_architectures
 env), we fall back to an equivalent hand-written U-Net with the same config.
 """
 
-from typing import List
+from typing import Any, List
 import torch
 import torch.nn as nn
 
@@ -28,7 +28,9 @@ def _build_plainconv_unet(in_channels: int, num_classes: int,
                           deep_supervision: bool = False):
     """Build PlainConvUNet from dynamic_network_architectures using the
     Dataset513 (1024) plan. Returns the network or raises ImportError."""
-    from dynamic_network_architectures.architectures.unet import PlainConvUNet
+    from dynamic_network_architectures.architectures.unet import (  # pyright: ignore[reportMissingImports]
+        PlainConvUNet,
+    )
 
     net = PlainConvUNet(
         input_channels=in_channels,
@@ -145,6 +147,7 @@ class MultiTaskUNet(nn.Module):
         self.deep_supervision = deep_supervision
         self.return_cls = True
         self._is_plainconv = False
+        self.base: Any
 
         try:
             self.base = _build_plainconv_unet(in_channels, num_classes,
@@ -188,7 +191,7 @@ class MultiTaskUNet(nn.Module):
 #  Model selector (kept in your style)
 # ===========================================================================
 def modeltype(model: str, in_channels: int = 1, deep_supervision: bool = False,
-              img_size: int = 1024, pretrained_path: str = None,
+              img_size: int = 1024, pretrained_path: str | None = None,
               variant: str = "small"):
     if model == 'multitask_unet':
         return MultiTaskUNet(in_channels=in_channels, num_classes=2,

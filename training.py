@@ -13,20 +13,23 @@ Saves:  best checkpoint by mean validation dice
 
 import os
 import time
+
+import matplotlib
 import numpy as np
 import torch
 from torch import autocast
-import matplotlib
+from torch.amp.grad_scaler import GradScaler
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from utils import DiceCELoss, dice_metric, poly_lr, save_ckpt
+from utils import DiceCELoss, dice_metric, save_ckpt
 
 
 def save_history_plot(history, out_path):
     """Save train/val loss + val dice + val cls_acc curves to a png."""
     epochs = range(1, len(history['train_loss']) + 1)
-    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+    _fig, ax = plt.subplots(1, 2, figsize=(12, 5))
 
     # left: losses
     ax[0].plot(epochs, history['train_loss'], label='train loss')
@@ -46,6 +49,7 @@ def save_history_plot(history, out_path):
     plt.close()
 
 import math
+
 
 def compute_lr(epoch, max_epochs, initial_lr, scheduler='poly', warmup_epochs=0):
     # warmup: 0 -> initial_lr 선형 증가
@@ -143,9 +147,10 @@ def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
 
 @torch.no_grad()
 def validate(model, loader, seg_loss_fn, lambda_cls, device, use_amp=True,
-             wandb_run=None, epoch=0):
+             wandb_run=None, epoch=0, native_combo_expected_ids=None):
     model.eval()
     dices, cls_correct, cls_total = [], 0, 0
+    native_cases = []
     bce = torch.nn.BCEWithLogitsLoss()
     val_losses = []
     for batch_index, batch in enumerate(loader):
@@ -180,9 +185,40 @@ def validate(model, loader, seg_loss_fn, lambda_cls, device, use_amp=True,
         cls_correct += (cls_pred == cls).sum().item()
         cls_total += cls.numel()
 
+        if native_combo_expected_ids is not None:
+            from reproduction import native_case_record
+
+            required = {
+                'id', 'native_mask', 'native_shape', 'crop_shape', 'pad_info'
+            }
+            missing_fields = sorted(required - set(batch))
+            if missing_fields:
+                raise ValueError(
+                    f"native validation metadata missing: {missing_fields}"
+                )
+            fg_prob = torch.softmax(seg_main, dim=1)[:, 1].cpu().numpy()
+            cls_prob = torch.sigmoid(cls_logit).flatten().cpu().numpy()
+            for index, case_id in enumerate(batch['id']):
+                native_cases.append(native_case_record(
+                    case_id=case_id,
+                    foreground_probability=fg_prob[index],
+                    cls_probability=cls_prob[index],
+                    native_mask=batch['native_mask'][index].cpu().numpy(),
+                    pad_info=batch['pad_info'][index].cpu().numpy(),
+                    crop_shape=batch['crop_shape'][index].cpu().numpy(),
+                    native_shape=batch['native_shape'][index].cpu().numpy(),
+                ))
+
     mean_dice = float(np.nanmean(dices)) if len(dices) else 0.0
     cls_acc = cls_correct / max(cls_total, 1)
-    return float(np.mean(val_losses)), mean_dice, cls_acc
+    native_metrics = None
+    if native_combo_expected_ids is not None:
+        from reproduction import aggregate_native_cases
+
+        native_metrics = aggregate_native_cases(
+            native_cases, native_combo_expected_ids
+        )
+    return float(np.mean(val_losses)), mean_dice, cls_acc, native_metrics
 
 
 #def fit(model, train_loader, val_loader, device,
@@ -195,7 +231,8 @@ def fit(model, train_loader, val_loader, device,
         initial_lr=1e-2, ckpt_path="best.pth",
         patience=None, batch_dice=True, optimizer_name='sgd',
         scheduler='poly', warmup_epochs=0, loss_name='dicece',
-        wandb_run=None):
+        wandb_run=None, reproduction_expected_ids=None,
+        return_details=False):
 
     optimizer = make_optimizer(model, initial_lr=initial_lr,
                                optimizer_name=optimizer_name)
@@ -208,16 +245,19 @@ def fit(model, train_loader, val_loader, device,
         seg_loss_fn = BoundaryDiceLoss(batch_dice=batch_dice, w_boundary=0.5)
     else:
         seg_loss_fn = DiceCELoss(batch_dice=batch_dice)
-    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+    scaler = GradScaler('cuda') if device.type == 'cuda' else None
 
     history = {'train_loss': [], 'val_loss': [], 'val_dice': [], 'val_cls_acc': []}
     plot_path = os.path.splitext(ckpt_path)[0] + "_curves.png"
 
     best_score, best_epoch, since_improve = -1.0, -1, 0
+    best_native_metrics = None
+    epoch_records = []
     global_step = 0
     total_started = time.perf_counter()
     for epoch in range(max_epochs):
         epoch_started = time.perf_counter()
+        epoch_start_step = global_step
         #for g in optimizer.param_groups:
         #    g['lr'] = poly_lr(epoch, max_epochs, initial_lr)
         for g in optimizer.param_groups:
@@ -229,9 +269,13 @@ def fit(model, train_loader, val_loader, device,
             lambda_cls, device, scaler, wandb_run=wandb_run,
             epoch=epoch, global_step=global_step)
         validation_started = time.perf_counter()
-        val_loss, val_dice, val_acc = validate(
+        val_loss, val_dice, val_acc, native_metrics = validate(
             model, val_loader, seg_loss_fn, lambda_cls, device,
-            wandb_run=wandb_run, epoch=epoch)
+            wandb_run=wandb_run, epoch=epoch,
+            native_combo_expected_ids=reproduction_expected_ids)
+        if native_metrics is not None:
+            val_dice = native_metrics['dice']
+            val_acc = native_metrics['classification_accuracy']
         validation_seconds = time.perf_counter() - validation_started
 
         # record history + refresh plot every epoch
@@ -253,14 +297,31 @@ def fit(model, train_loader, val_loader, device,
         improved = final_score > best_score
         if improved:
             best_score, best_epoch, since_improve = final_score, epoch, 0
+            best_native_metrics = native_metrics
             save_ckpt(ckpt_path, model, optimizer, epoch, final_score)
         
         else:
             since_improve += 1
 
         epoch_seconds = time.perf_counter() - epoch_started
+        optimizer_steps = global_step - epoch_start_step
+        epoch_record = {
+            'epoch': epoch + 1,
+            'train_loss': tr_loss,
+            'validation_loss': val_loss,
+            'classification_accuracy': val_acc,
+            'dice': val_dice,
+            'weighted_composite': final_score,
+            'runtime_seconds': epoch_seconds,
+            'validation_seconds': validation_seconds,
+            'optimizer_steps': optimizer_steps,
+            'completed_train_steps': global_step,
+        }
+        if native_metrics is not None:
+            epoch_record['coverage'] = native_metrics['coverage']
+        epoch_records.append(epoch_record)
         if wandb_run is not None:
-            wandb_run.log({
+            epoch_log = {
                 'epoch': epoch + 1,
                 'epoch/train_loss': tr_loss,
                 'epoch/validation_loss': val_loss,
@@ -270,7 +331,20 @@ def fit(model, train_loader, val_loader, device,
                 'epoch/runtime_seconds': epoch_seconds,
                 'epoch/validation_seconds': validation_seconds,
                 'epoch/validation_case_count': len(val_loader.dataset),
-            })
+                'epoch/optimizer_steps': optimizer_steps,
+                'epoch/completed_train_steps': global_step,
+            }
+            if native_metrics is not None:
+                coverage = native_metrics['coverage']
+                epoch_log.update({
+                    'epoch/validation_expected': coverage['expected'],
+                    'epoch/validation_observed': coverage['observed'],
+                    'epoch/validation_unique': coverage['unique'],
+                    'epoch/validation_missing': len(coverage['missing']),
+                    'epoch/validation_unexpected': len(coverage['unexpected']),
+                    'epoch/validation_duplicates': coverage['duplicates'],
+                })
+            wandb_run.log(epoch_log)
             wandb_run.summary['best/epoch'] = best_epoch + 1
             wandb_run.summary['best/weighted_composite'] = best_score
             wandb_run.summary['runtime/total_seconds'] = (
@@ -284,11 +358,23 @@ def fit(model, train_loader, val_loader, device,
 
     print(f"Done. best final {best_score:.4f} @ epoch {best_epoch}")
     print(f"curves saved to {plot_path}")
+    if return_details:
+        return {
+            'best_score': best_score,
+            'best_epoch': best_epoch + 1,
+            'best_native_metrics': best_native_metrics,
+            'epochs': epoch_records,
+            'completed_epochs': len(epoch_records),
+            'completed_train_steps': global_step,
+            'runtime_seconds': time.perf_counter() - total_started,
+        }
     return best_score, best_epoch
 
 
 # small null-context for non-cuda
 import contextlib
+
+
 @contextlib.contextmanager
 def _nullctx():
     yield

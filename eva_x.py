@@ -13,9 +13,13 @@ by Jingfeng Yao
 from HUST-VL
 """
 
+from pathlib import Path
+
 import torch
+from timm.layers.patch_embed import resample_patch_embed
+from timm.layers.pos_embed import resample_abs_pos_embed
 from timm.models.eva import Eva
-from timm.layers import resample_abs_pos_embed, resample_patch_embed
+
 
 def checkpoint_filter_fn(
         state_dict,
@@ -56,7 +60,7 @@ def checkpoint_filter_fn(
             if v.shape[-1] != W or v.shape[-2] != H:
                 v = resample_patch_embed(
                     v,
-                    (H, W),
+                    [H, W],
                     interpolation=interpolation,
                     antialias=antialias,
                     verbose=True,
@@ -97,7 +101,7 @@ def checkpoint_filter_fn(
 
 class EVA_X(Eva):
     def __init__(self, **kwargs):
-        super(EVA_X, self).__init__(**kwargs)
+        super().__init__(**kwargs)
 
     def forward_features(self, x):
         x = self.patch_embed(x)
@@ -119,7 +123,7 @@ class EVA_X(Eva):
         x = self.forward_head(x)
         return x
 
-def eva_x_tiny_patch16(pretrained=False):
+def eva_x_tiny_patch16(pretrained: str | Path):
     model = EVA_X(
         img_size=224,
         patch_size=16,
@@ -137,7 +141,7 @@ def eva_x_tiny_patch16(pretrained=False):
     print(msg)
     return model
 
-def eva_x_small_patch16(pretrained=False):
+def eva_x_small_patch16(pretrained: str | Path):
     model = EVA_X(
         img_size=224,
         patch_size=16,
@@ -155,7 +159,7 @@ def eva_x_small_patch16(pretrained=False):
     print(msg)
     return model
 
-def eva_x_base_patch16(pretrained=False):
+def eva_x_base_patch16(pretrained: str | Path):
     model = EVA_X(
         img_size=224,
         patch_size=16,

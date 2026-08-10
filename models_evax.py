@@ -19,15 +19,31 @@ inference.py / Docker를 그대로 재사용할 수 있다.
 mmcv / mmsegmentation 불필요. timm >= 0.9 (검증: 1.0.22) 만 있으면 된다.
 """
 
+import importlib
 import math
+import os
+from typing import Any
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from numpy._core.multiarray import scalar as numpy_scalar
-
 from timm.models.eva import Eva
+from torch import nn
+
+EXPECTED_SMALL_PRETRAINED_TENSORS = 162
+numpy_scalar: Any = importlib.import_module("numpy.core.multiarray").scalar
+
+
+def _load_weights_only_checkpoint(path):
+    """Load the pinned EVA-X checkpoint with the PyTorch 2.5 allowlist."""
+    numpy_safe_globals = [
+        set,
+        numpy_scalar,
+        np.dtype,
+        type(np.dtype(np.float64)),
+    ]
+    with torch.serialization.safe_globals(numpy_safe_globals):
+        return torch.load(path, map_location="cpu", weights_only=True)
 
 
 # =============================================================================
@@ -46,7 +62,7 @@ def _adapt_patch_embed_in_chans(state_dict, in_chans):
     if in_chans == 1:
         state_dict[k] = w.sum(dim=1, keepdim=True)
     else:
-        rep = int(math.ceil(in_chans / c))
+        rep = math.ceil(in_chans / c)
         state_dict[k] = w.repeat(1, rep, 1, 1)[:, :in_chans]
     print(f"  patch_embed in_chans {c} -> {in_chans}")
     return state_dict
@@ -72,10 +88,15 @@ def build_eva_x_small(img_size=1024, in_chans=1, pretrained_path=None,
     """EVA-X backbone. variant: 'small'(embed384) | 'base'(embed768).
     base는 eva_x.py의 eva_x_base_patch16과 동일하게 qkv 분리 + scale_mlp 사용."""
     if variant == "base":
-        arch = dict(embed_dim=768, depth=12, num_heads=12,
-                    qkv_fused=False, scale_mlp=True)
+        arch: dict[str, Any] = {
+            "embed_dim": 768,
+            "depth": 12,
+            "num_heads": 12,
+            "qkv_fused": False,
+            "scale_mlp": True,
+        }
     else:
-        arch = dict(embed_dim=384, depth=12, num_heads=6)
+        arch = {"embed_dim": 384, "depth": 12, "num_heads": 6}
 
     model = Eva(
         img_size=img_size,
@@ -92,21 +113,23 @@ def build_eva_x_small(img_size=1024, in_chans=1, pretrained_path=None,
     )
 
     if pretrained_path:
-        import os
-        from eva_x import checkpoint_filter_fn      # 저장소에서 가져온 파일
+        from eva_x import checkpoint_filter_fn  # 저장소에서 가져온 파일
 
         path = os.path.expanduser(pretrained_path)
-        numpy_safe_globals = [
-            (numpy_scalar, "numpy.core.multiarray.scalar"),
-            np.dtype,
-            type(np.dtype(np.float64)),
-        ]
-        with torch.serialization.safe_globals(numpy_safe_globals):
-            ckpt = torch.load(path, map_location="cpu", weights_only=True)
+        ckpt = _load_weights_only_checkpoint(path)
         state = checkpoint_filter_fn(ckpt, model)   # pos_embed / patch_embed resample
         state = _adapt_patch_embed_in_chans(state, in_chans)
         msg = model.load_state_dict(state, strict=False)
         n_loaded = len(state) - len(msg.unexpected_keys)
+        if variant == "small" and (
+            n_loaded != EXPECTED_SMALL_PRETRAINED_TENSORS
+            or msg.missing_keys
+            or msg.unexpected_keys
+        ):
+            raise RuntimeError(
+                "EVA-X small checkpoint must load exactly 162 tensors "
+                "with no missing or unexpected keys"
+            )
         print(f"  EVA-X pretrained: {path}")
         print(f"    loaded {n_loaded} tensors | "
               f"missing {len(msg.missing_keys)} | unexpected {len(msg.unexpected_keys)}")

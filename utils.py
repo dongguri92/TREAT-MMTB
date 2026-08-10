@@ -9,10 +9,12 @@ utils.py
 - checkpoint save/load
 """
 
+from typing import Any, cast
+
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 
 # ===========================================================================
@@ -105,12 +107,13 @@ class TverskyCELoss(nn.Module):
 def _dist_transform(mask_bool):
     """각 배경 픽셀의 전경까지 거리 - 전경 픽셀의 배경까지 거리 (level set phi).
        boundary loss 표준 정의. mask_bool: (H,W) numpy bool."""
-    import numpy as np
     from scipy.ndimage import distance_transform_edt as edt
     posmask = mask_bool
     negmask = ~posmask
     if posmask.any():
-        phi = edt(negmask) - edt(posmask)   # 밖은 +, 안은 -
+        negative_distance = cast(Any, edt(negmask))
+        positive_distance = cast(Any, edt(posmask))
+        phi = negative_distance - positive_distance   # 밖은 +, 안은 -
     else:
         phi = edt(negmask)                  # 전경 없으면 전부 +
     return phi
@@ -126,8 +129,8 @@ class BoundaryDiceLoss(nn.Module):
         self.w_b = w_boundary
 
     def forward(self, logits, target):
-        import torch
         import numpy as np
+        import torch
         dc = self.dice(logits, target)
 
         probs = F.softmax(logits, dim=1)[:, 1]          # (B,H,W)
@@ -171,9 +174,9 @@ def remove_small_components(mask, min_pixels=50):
     mask: (H, W) binary numpy. Uses scipy if available, else returns as-is."""
     try:
         from scipy import ndimage
-    except Exception:
+    except ImportError:
         return mask
-    lbl, n = ndimage.label(mask > 0)
+    lbl, n = cast(tuple[Any, int], ndimage.label(mask > 0))
     if n == 0:
         return mask
     out = np.zeros_like(mask)
