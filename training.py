@@ -85,7 +85,7 @@ def make_optimizer(model, initial_lr=1e-2, weight_decay=3e-5,
                            weight_decay=weight_decay)
 
 
-def _seg_loss_on_output(seg_output, target, seg_loss_fn):
+def _seg_loss_on_output(seg_output, target, seg_loss_fn) -> torch.Tensor:
     """Handle deep-supervision (list) or single tensor."""
     if isinstance(seg_output, (list, tuple)):
         # simple equal-ish weighting if DS is on; highest res gets most weight
@@ -93,7 +93,7 @@ def _seg_loss_on_output(seg_output, target, seg_loss_fn):
         weights[-1] = 0.0
         s = sum(weights)
         weights = [w / s for w in weights]
-        loss = 0.0
+        loss = torch.zeros((), device=target.device)
         for w, o in zip(weights, seg_output):
             if w == 0:
                 continue
@@ -105,43 +105,72 @@ def _seg_loss_on_output(seg_output, target, seg_loss_fn):
 
 def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
                     device, scaler, use_amp=True, wandb_run=None,
-                    epoch=0, global_step=0):
+                    epoch=0, global_step=0, gradient_accumulation_steps=1):
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    usable_micro_steps = (
+        len(loader) // gradient_accumulation_steps
+    ) * gradient_accumulation_steps
+    if usable_micro_steps == 0:
+        raise ValueError("loader cannot provide one complete effective batch")
     model.train()
     losses = []
     bce = torch.nn.BCEWithLogitsLoss()
-    for batch in loader:
+    optimizer.zero_grad(set_to_none=True)
+    for batch_index, batch in enumerate(loader):
+        if batch_index >= usable_micro_steps:
+            break
         img = batch['image'].to(device, non_blocking=True)
         mask = batch['mask'].to(device, non_blocking=True)
         cls = batch['cls'].to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
         with autocast(device.type, enabled=use_amp) if device.type == 'cuda' else _nullctx():
             model.return_cls = True
             seg_out, cls_logit = model(img)
             l_seg = _seg_loss_on_output(seg_out, mask, seg_loss_fn)
             l_cls = bce(cls_logit, cls)
             loss = l_seg + lambda_cls * l_cls
+            backward_loss = loss / gradient_accumulation_steps
 
         if scaler is not None:
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 12)
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.scale(backward_loss).backward()
         else:
-            loss.backward()
+            backward_loss.backward()
+
+        optimizer_step_completed = (
+            (batch_index + 1) % gradient_accumulation_steps == 0
+        )
+        if optimizer_step_completed:
+            if scaler is not None:
+                scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 12)
-            optimizer.step()
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            global_step += 1
 
         losses.append(loss.item())
-        global_step += 1
         if wandb_run is not None:
-            wandb_run.log({
+            step_log = {
                 'train/global_step': global_step,
+                'train/micro_step': epoch * usable_micro_steps + batch_index + 1,
                 'train/epoch': epoch + 1,
                 'train/batch_loss': loss.item(),
+                'train/total_loss': loss.item(),
+                'train/segmentation_loss': l_seg.item(),
+                'train/classification_loss': l_cls.item(),
+                'train/optimizer_step_completed': optimizer_step_completed,
+                'train/gradient_accumulation_steps': gradient_accumulation_steps,
                 'train/learning_rate': optimizer.param_groups[0]['lr'],
+            }
+            step_log.update({
+                f'train/learning_rate_group_{index}': group['lr']
+                for index, group in enumerate(optimizer.param_groups)
             })
+            wandb_run.log(step_log)
     return float(np.mean(losses)), global_step
 
 
@@ -232,7 +261,7 @@ def fit(model, train_loader, val_loader, device,
         patience=None, batch_dice=True, optimizer_name='sgd',
         scheduler='poly', warmup_epochs=0, loss_name='dicece',
         wandb_run=None, reproduction_expected_ids=None,
-        return_details=False):
+        return_details=False, gradient_accumulation_steps=1):
 
     optimizer = make_optimizer(model, initial_lr=initial_lr,
                                optimizer_name=optimizer_name)
@@ -267,7 +296,8 @@ def fit(model, train_loader, val_loader, device,
         tr_loss, global_step = train_one_epoch(
             model, train_loader, optimizer, seg_loss_fn,
             lambda_cls, device, scaler, wandb_run=wandb_run,
-            epoch=epoch, global_step=global_step)
+            epoch=epoch, global_step=global_step,
+            gradient_accumulation_steps=gradient_accumulation_steps)
         validation_started = time.perf_counter()
         val_loss, val_dice, val_acc, native_metrics = validate(
             model, val_loader, seg_loss_fn, lambda_cls, device,
@@ -305,6 +335,9 @@ def fit(model, train_loader, val_loader, device,
 
         epoch_seconds = time.perf_counter() - epoch_started
         optimizer_steps = global_step - epoch_start_step
+        micro_steps = (
+            len(train_loader) // gradient_accumulation_steps
+        ) * gradient_accumulation_steps
         epoch_record = {
             'epoch': epoch + 1,
             'train_loss': tr_loss,
@@ -315,6 +348,7 @@ def fit(model, train_loader, val_loader, device,
             'runtime_seconds': epoch_seconds,
             'validation_seconds': validation_seconds,
             'optimizer_steps': optimizer_steps,
+            'micro_steps': micro_steps,
             'completed_train_steps': global_step,
         }
         if native_metrics is not None:
@@ -332,6 +366,8 @@ def fit(model, train_loader, val_loader, device,
                 'epoch/validation_seconds': validation_seconds,
                 'epoch/validation_case_count': len(val_loader.dataset),
                 'epoch/optimizer_steps': optimizer_steps,
+                'epoch/micro_steps': micro_steps,
+                'epoch/gradient_accumulation_steps': gradient_accumulation_steps,
                 'epoch/completed_train_steps': global_step,
             }
             if native_metrics is not None:
@@ -366,6 +402,10 @@ def fit(model, train_loader, val_loader, device,
             'epochs': epoch_records,
             'completed_epochs': len(epoch_records),
             'completed_train_steps': global_step,
+            'completed_micro_steps': sum(
+                record['micro_steps'] for record in epoch_records
+            ),
+            'gradient_accumulation_steps': gradient_accumulation_steps,
             'runtime_seconds': time.perf_counter() - total_started,
         }
     return best_score, best_epoch

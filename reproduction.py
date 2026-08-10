@@ -6,6 +6,7 @@ import hashlib
 import importlib.metadata
 import json
 import math
+import os
 import platform
 import re
 import subprocess
@@ -16,6 +17,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+import torch
 
 from utils import dice_metric
 
@@ -56,6 +58,11 @@ EXPECTED_PLATFORM_MACHINE = "x86_64"
 EXPECTED_TORCH_VERSION = "2.5.1+cu118"
 EXPECTED_TORCHVISION_VERSION = "0.20.1+cu118"
 EXPECTED_CUDA_VERSION = "11.8"
+EXPECTED_MPS_PYTHON = (3, 14, 7)
+EXPECTED_MPS_PLATFORM_SYSTEM = "Darwin"
+EXPECTED_MPS_PLATFORM_MACHINE = "arm64"
+EXPECTED_MPS_TORCH_VERSION = "2.13.0"
+EXPECTED_MPS_TORCHVISION_VERSION = "0.28.0"
 EXPECTED_PRETRAINED_NAME = "eva_x_small_patch16_merged520k_mim.pt"
 EXPECTED_PRETRAINED_SHA256 = (
     "135d70a6988b5aacfe4848e1c2a0d524b2c076536fcaccdce88b636d302316c2"
@@ -674,6 +681,53 @@ def validate_runtime_dependencies(lock_path: Path) -> dict[str, Any]:
         raise RuntimeError("runtime torch build differs from the verified CUDA build")
     if observed.get("torchvision") != EXPECTED_TORCHVISION_VERSION:
         raise RuntimeError("runtime torchvision build differs from the verified CUDA build")
+    return runtime
+
+
+def validate_mps_runtime_dependencies(lock_path: Path) -> dict[str, Any]:
+    """Validate the separate Apple-MPS amendment without changing CUDA seals."""
+    expected = locked_versions(lock_path)
+    observed: dict[str, str] = {}
+    mismatches: dict[str, dict[str, str]] = {}
+    for distribution, wanted in expected.items():
+        try:
+            actual = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            actual = "missing"
+        observed[distribution] = actual
+        if actual != wanted:
+            mismatches[distribution] = {"expected": wanted, "observed": actual}
+    if mismatches:
+        raise RuntimeError(
+            f"MPS runtime dependency versions differ from lock: {mismatches}"
+        )
+    runtime = {
+        "python": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+        "platform_system": platform.system(),
+        "platform_machine": platform.machine(),
+        "distributions": observed,
+    }
+    if sys.version_info[:3] != EXPECTED_MPS_PYTHON:
+        raise RuntimeError("MPS amendment requires exact CPython 3.14.7")
+    if platform.python_implementation() != "CPython":
+        raise RuntimeError("MPS amendment requires CPython")
+    if (
+        runtime["platform_system"] != EXPECTED_MPS_PLATFORM_SYSTEM
+        or runtime["platform_machine"] != EXPECTED_MPS_PLATFORM_MACHINE
+    ):
+        raise RuntimeError("MPS amendment requires Darwin arm64")
+    if observed.get("torch") != EXPECTED_MPS_TORCH_VERSION:
+        raise RuntimeError("runtime torch differs from the verified MPS build")
+    if observed.get("torchvision") != EXPECTED_MPS_TORCHVISION_VERSION:
+        raise RuntimeError("runtime torchvision differs from the verified MPS build")
+    if not torch.backends.mps.is_built() or not torch.backends.mps.is_available():
+        raise RuntimeError("verified Apple MPS device is unavailable")
+    if os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") == "1":
+        raise RuntimeError("MPS CPU fallback must remain disabled")
+    runtime["mps_built"] = True
+    runtime["mps_available"] = True
+    runtime["mps_cpu_fallback"] = False
     return runtime
 
 

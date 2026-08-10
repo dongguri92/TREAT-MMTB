@@ -1,0 +1,15 @@
+# Verified Issue #106 target: CPython 3.14.7, macOS arm64, Apple MPS.
+torch==2.13.0
+torchvision==0.28.0
+timm==1.0.22
+numpy==2.5.1
+opencv-python-headless==4.14.0.94
+pydicom==3.0.2
+SimpleITK==2.5.6
+scipy==1.18.0
+albumentations==2.0.8
+matplotlib==3.11.1
+wandb==0.28.1
+pylibjpeg==2.1.0
+pylibjpeg-libjpeg==2.4.0
+pylibjpeg-openjpeg==2.5.0
