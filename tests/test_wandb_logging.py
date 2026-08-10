@@ -105,6 +105,7 @@ def test_native_combo_validation_covers_all_111_cases_once():
         native_combo_expected_ids=expected_ids,
     )
 
+    assert native is not None
     assert native["coverage"] == {
         "expected": 111,
         "observed": 111,

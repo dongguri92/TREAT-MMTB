@@ -22,6 +22,7 @@ import os
 import csv
 import glob
 import argparse
+from typing import cast
 
 import numpy as np
 import cv2
@@ -76,7 +77,9 @@ def remove_small_components(mask, min_pixels=50):
         from scipy import ndimage
     except Exception:
         return mask
-    lbl, n = ndimage.label(mask > 0)
+    label_result = cast(tuple[np.ndarray, int], ndimage.label(mask > 0))
+    lbl = label_result[0]
+    n = int(label_result[1])
     if n == 0:
         return mask
     out = np.zeros_like(mask)
@@ -140,7 +143,7 @@ def main():
                     help="0이면 small-component 제거 비활성화")
     ap.add_argument("--detection", choices=["cls", "seg", "combo"], default="combo",
                     help="cls / seg / combo(일치는 seg, 불일치만 cls+seg veto)")
-    ap.add_argument("--t_veto", type=float, default=0.01,
+    ap.add_argument("--t_veto", type=float, default=0.005,
                     help="combo: 불일치에서 cls=present여도 seg_max<t_veto면 negative로 veto")
     ap.add_argument("--no_suppress", action="store_true",
                     help="cls absent일 때 마스크 비우는 후처리 끄기 (--detection cls에서만 의미)")

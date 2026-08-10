@@ -19,6 +19,7 @@ import os
 import glob
 import random
 from functools import partial
+from typing import Any
 import numpy as np
 import cv2
 import pydicom
@@ -27,9 +28,11 @@ import torch
 from torch.utils.data import Dataset
 
 try:
-    import albumentations as A
+    import albumentations as _albumentations
+    A: Any = _albumentations
     _HAS_ALBU = True
 except Exception:
+    A = None
     _HAS_ALBU = False
 
 
