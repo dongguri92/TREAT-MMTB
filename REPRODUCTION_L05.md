@@ -13,6 +13,10 @@ The scored environment is fixed to CPython 3.11 on Linux x86_64, CUDA 11.8,
 PyTorch `2.5.1+cu118`, and torchvision `0.20.1+cu118`. Install the complete
 hash-locked dependency graph first:
 
+This is the sealed environment for this fresh 5-to-50-epoch reproduction. It
+does not claim to reconstruct the unavailable environment used by the
+historical 150-epoch teammate run.
+
 ```bash
 uv venv --python 3.11 .venv-reproduction
 uv pip sync --python .venv-reproduction/bin/python --require-hashes \
