@@ -253,6 +253,7 @@ def fit(model, train_loader, val_loader, device,
     total_started = time.perf_counter()
     for epoch in range(max_epochs):
         epoch_started = time.perf_counter()
+        epoch_start_step = global_step
         #for g in optimizer.param_groups:
         #    g['lr'] = poly_lr(epoch, max_epochs, initial_lr)
         for g in optimizer.param_groups:
@@ -299,6 +300,7 @@ def fit(model, train_loader, val_loader, device,
             since_improve += 1
 
         epoch_seconds = time.perf_counter() - epoch_started
+        optimizer_steps = global_step - epoch_start_step
         epoch_record = {
             'epoch': epoch + 1,
             'train_loss': tr_loss,
@@ -308,6 +310,8 @@ def fit(model, train_loader, val_loader, device,
             'weighted_composite': final_score,
             'runtime_seconds': epoch_seconds,
             'validation_seconds': validation_seconds,
+            'optimizer_steps': optimizer_steps,
+            'completed_train_steps': global_step,
         }
         if native_metrics is not None:
             epoch_record['coverage'] = native_metrics['coverage']
@@ -323,6 +327,8 @@ def fit(model, train_loader, val_loader, device,
                 'epoch/runtime_seconds': epoch_seconds,
                 'epoch/validation_seconds': validation_seconds,
                 'epoch/validation_case_count': len(val_loader.dataset),
+                'epoch/optimizer_steps': optimizer_steps,
+                'epoch/completed_train_steps': global_step,
             }
             if native_metrics is not None:
                 coverage = native_metrics['coverage']

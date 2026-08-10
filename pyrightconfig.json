@@ -1,0 +1,8 @@
+{
+  "exclude": [
+    ".venv*"
+  ],
+  "pythonVersion": "3.11",
+  "reportMissingImports": "none",
+  "typeCheckingMode": "basic"
+}

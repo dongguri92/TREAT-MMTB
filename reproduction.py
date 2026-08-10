@@ -9,6 +9,7 @@ import math
 import platform
 import re
 import subprocess
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,22 @@ VETO_THRESHOLD = 0.005
 MIN_PIXELS = 0
 BOOTSTRAP_SEED = 20260810
 BOOTSTRAP_SAMPLES = 10_000
+EXPECTED_PYTHON = (3, 11)
+EXPECTED_PLATFORM_SYSTEM = "Linux"
+EXPECTED_PLATFORM_MACHINE = "x86_64"
+EXPECTED_TORCH_VERSION = "2.5.1+cu118"
+EXPECTED_TORCHVISION_VERSION = "0.20.1+cu118"
+EXPECTED_CUDA_VERSION = "11.8"
+EXPECTED_PRETRAINED_NAME = "eva_x_small_patch16_merged520k_mim.pt"
+EXPECTED_PRETRAINED_SHA256 = (
+    "135d70a6988b5aacfe4848e1c2a0d524b2c076536fcaccdce88b636d302316c2"
+)
+EXPECTED_PRETRAINED_BYTES = 307_569_543
+EXPECTED_PRETRAINED_SOURCE = (
+    "https://huggingface.co/MapleF/eva_x/resolve/"
+    "35ddcd6dab6ca99bbdb6cb45c8d1b093aefbd0ee/"
+    "eva_x_small_patch16_merged520k_mim.pt"
+)
 
 
 def sha256_file(path: Path | str) -> str:
@@ -93,13 +110,39 @@ def source_identity(repo_root: Path | str) -> dict[str, str]:
 
 
 def reject_external_final_path(path: Path | str, label: str) -> None:
+    """Reject a lexically forbidden path without touching the filesystem."""
     normalized = [
         "".join(ch if ch.isalnum() else "_" for ch in part.lower())
-        for part in Path(path).resolve().parts
+        for part in Path(path).parts
     ]
     forbidden = re.compile(r"external_final|external_test|final_test|test_final")
     if any(forbidden.search(part) for part in normalized):
         raise ValueError(f"{label} must not reference the external final test")
+
+
+def resolve_non_external_path(path: Path | str, label: str) -> Path:
+    """Reject named external-final paths before resolution, then reject targets."""
+    reject_external_final_path(path, label)
+    resolved = Path(path).resolve()
+    reject_external_final_path(resolved, label)
+    return resolved
+
+
+def validate_pretrained(path: Path | str) -> dict[str, Any]:
+    pretrained_path = Path(path)
+    reject_external_final_path(pretrained_path, "pretrained")
+    byte_size = pretrained_path.stat().st_size
+    digest = sha256_file(pretrained_path)
+    if pretrained_path.name != EXPECTED_PRETRAINED_NAME:
+        raise ValueError("pretrained filename is not the intended EVA-X small weight")
+    if byte_size != EXPECTED_PRETRAINED_BYTES or digest != EXPECTED_PRETRAINED_SHA256:
+        raise ValueError("pretrained bytes are not the pinned EVA-X small weight")
+    return {
+        "name": EXPECTED_PRETRAINED_NAME,
+        "byte_size": byte_size,
+        "sha256": digest,
+        "source": EXPECTED_PRETRAINED_SOURCE,
+    }
 
 
 def load_canonical_manifest(path: Path | str) -> dict[str, Any]:
@@ -561,11 +604,17 @@ def locked_versions(lock_path: Path) -> dict[str, str]:
     versions: dict[str, str] = {}
     for raw_line in lock_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
-        if not line or line.startswith(("#", "--")):
+        if (
+            not line
+            or raw_line[:1].isspace()
+            or line.startswith(("#", "--"))
+        ):
             continue
-        if "==" not in line:
+        requirement = line.removesuffix("\\").strip()
+        requirement = requirement.split(" ;", 1)[0].strip()
+        if "==" not in requirement:
             raise ValueError("dependency lock entries must use exact == pins")
-        name, version = line.split("==", 1)
+        name, version = requirement.split("==", 1)
         versions[name.strip()] = version.strip()
     if not versions:
         raise ValueError("dependency lock must contain pinned distributions")
@@ -588,12 +637,27 @@ def validate_runtime_dependencies(lock_path: Path) -> dict[str, Any]:
         raise RuntimeError(
             f"runtime dependency versions differ from lock: {mismatches}"
         )
-    return {
+    runtime = {
         "python": platform.python_version(),
         "python_implementation": platform.python_implementation(),
-        "platform": platform.platform(),
+        "platform_system": platform.system(),
+        "platform_machine": platform.machine(),
         "distributions": observed,
     }
+    if sys.version_info[:2] != EXPECTED_PYTHON:
+        raise RuntimeError("scored reproduction requires CPython 3.11")
+    if platform.python_implementation() != "CPython":
+        raise RuntimeError("scored reproduction requires CPython")
+    if (
+        runtime["platform_system"] != EXPECTED_PLATFORM_SYSTEM
+        or runtime["platform_machine"] != EXPECTED_PLATFORM_MACHINE
+    ):
+        raise RuntimeError("scored reproduction requires Linux x86_64")
+    if observed.get("torch") != EXPECTED_TORCH_VERSION:
+        raise RuntimeError("runtime torch build differs from the verified CUDA build")
+    if observed.get("torchvision") != EXPECTED_TORCHVISION_VERSION:
+        raise RuntimeError("runtime torchvision build differs from the verified CUDA build")
+    return runtime
 
 
 def validate_epoch_evidence(
@@ -629,6 +693,10 @@ def validate_epoch_evidence(
             "duplicates": 0,
         }:
             raise ValueError("epoch evidence does not prove exact validation coverage")
+        if evidence.get("optimizer_steps") != train_steps_per_epoch:
+            raise ValueError("epoch evidence does not prove exact optimizer steps")
+        if evidence.get("completed_train_steps") != expected_epoch * train_steps_per_epoch:
+            raise ValueError("epoch evidence cumulative optimizer steps are incomplete")
     if requested_epochs * train_steps_per_epoch <= 0:
         raise ValueError("epoch evidence requires positive optimizer-step coverage")
 

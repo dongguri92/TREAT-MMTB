@@ -7,8 +7,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import reproduction
 import reproduce_teammate_l05 as launcher
+import reproduction
 from reproduce_teammate_l05 import (
     ARTIFACT_NAMES,
     _validate_health_index,
@@ -201,7 +201,12 @@ def _cli(tmp_path: Path) -> list[str]:
 
 def test_launcher_dry_run_is_fixed_and_does_not_leak_paths(tmp_path: Path) -> None:
     args = parse_args(_cli(tmp_path))
-    config = build_config(args, {"git_commit": "a", "git_tree_sha1": "b"}, "c", "cpu")
+    config = build_config(
+        args,
+        {"git_commit": "a", "git_tree_sha1": "b"},
+        {"name": "weight.pt", "byte_size": 1, "sha256": "c", "source": "pinned"},
+        "cpu",
+    )
     protocol = config["protocol"]
     assert protocol["physical_batch_size"] == protocol["effective_batch_size"] == 8
     assert protocol["inference"]["t_veto"] == 0.005
@@ -220,6 +225,108 @@ def test_launcher_dry_run_is_fixed_and_does_not_leak_paths(tmp_path: Path) -> No
     assert not (tmp_path / "artifacts").exists()
 
 
+def test_external_final_path_is_rejected_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called = False
+
+    def unexpected_resolve(_self: Path) -> Path:
+        nonlocal called
+        called = True
+        raise AssertionError("filesystem resolution must not occur")
+
+    monkeypatch.setattr(Path, "resolve", unexpected_resolve)
+    argv = _cli(tmp_path)
+    argv[argv.index("--manifest") + 1] = str(tmp_path / "external-final.json")
+    with pytest.raises(ValueError, match="external final"):
+        parse_args(argv)
+    assert called is False
+
+
+def test_pretrained_validation_pins_name_size_and_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    weight = tmp_path / reproduction.EXPECTED_PRETRAINED_NAME
+    weight.write_bytes(b"verified-weight")
+    monkeypatch.setattr(reproduction, "EXPECTED_PRETRAINED_BYTES", weight.stat().st_size)
+    monkeypatch.setattr(
+        reproduction, "EXPECTED_PRETRAINED_SHA256", reproduction.sha256_file(weight)
+    )
+    assert reproduction.validate_pretrained(weight)["sha256"] == reproduction.sha256_file(
+        weight
+    )
+    weight.write_bytes(b"different-weight")
+    with pytest.raises(ValueError, match="pinned EVA-X"):
+        reproduction.validate_pretrained(weight)
+
+
+def test_dependency_lock_pins_verified_torch_api_environment() -> None:
+    lock = Path(__file__).resolve().parents[1] / "requirements-reproduction.lock"
+    versions = reproduction.locked_versions(lock)
+    assert versions["torch"] == reproduction.EXPECTED_TORCH_VERSION
+    assert versions["torchvision"] == reproduction.EXPECTED_TORCHVISION_VERSION
+    assert versions["timm"] == "1.0.22"
+    assert "--hash=sha256:" in lock.read_text(encoding="utf-8")
+
+
+def test_wandb_config_contains_only_aggregate_and_hash_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = parse_args(_cli(tmp_path))
+    config = build_config(
+        args,
+        {"git_commit": "a", "git_tree_sha1": "b"},
+        {"name": "weight.pt", "byte_size": 1, "sha256": "c", "source": "pinned"},
+        "cuda",
+        manifest={
+            "manifest_sha256": "manifest",
+            "identity": {"train": ["secret-train"], "validation": ["secret-val"]},
+        },
+        content={"combined_content_sha256": "content"},
+        baseline={
+            "baseline_id": "baseline",
+            "score_sha256": "score",
+            "run_record_sha256": "record",
+            "cases": [{"case_id": "secret-val"}],
+        },
+        dependency={
+            "lock_sha256": "lock",
+            "python": "3.11.0",
+            "torch": "2.5.1+cu118",
+            "cuda": "11.8",
+            "distributions": {"torchvision": "0.20.1+cu118"},
+        },
+    )
+    config["case_identity_sha256"] = "identity"
+    public = launcher._wandb_public_config(config)
+    serialized = str(public)
+    assert "secret-train" not in serialized
+    assert "secret-val" not in serialized
+    assert str(tmp_path) not in serialized
+    assert public["dataset"] == {
+        "scope": reproduction.DATASET_SCOPE,
+        "train_case_count": 444,
+        "validation_case_count": 111,
+        "manifest_sha256": "manifest",
+        "case_identity_sha256": "identity",
+        "combined_content_sha256": "content",
+    }
+    captured: dict[str, object] = {}
+
+    class FakeWandbRun:
+        def define_metric(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    def fake_init(**kwargs: object) -> FakeWandbRun:
+        captured.update(kwargs)
+        return FakeWandbRun()
+
+    config["wandb"]["config_sha256"] = reproduction.canonical_sha256(public)
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(init=fake_init))
+    launcher._start_wandb(config)
+    assert captured["config"] == public
+
+
 def test_health_index_recomputes_every_artifact_and_rejects_tampering(
     tmp_path: Path,
 ) -> None:
@@ -231,20 +338,27 @@ def test_health_index_recomputes_every_artifact_and_rejects_tampering(
             f"validation-{index}" for index in range(EXPECTED_VALIDATION_CASES)
         ],
     }
-    protocol = protocol_contract("health")
-    config = {
+    health_protocol = protocol_contract("health")
+    convergence_protocol = protocol_contract("convergence")
+    health_config = {
         "attempt_id": "health-001",
         "reviewed_by": "reviewer",
-        "protocol": protocol,
-        "protocol_sha256": reproduction.canonical_sha256(protocol),
-        "pretrained_sha256": "pretrained",
+        "protocol": health_protocol,
+        "protocol_sha256": reproduction.canonical_sha256(health_protocol),
+        "pretrained": {"sha256": "pretrained"},
         "dataset_scope": reproduction.DATASET_SCOPE,
         "manifest": {"manifest_sha256": "manifest"},
         "content": {"combined_content_sha256": "content"},
         "baseline": {"score_sha256": "baseline"},
         "dependency": {"lock_sha256": "lock"},
         "case_identity_sha256": reproduction.canonical_sha256(identity),
+        "wandb": {"config_sha256": "wandb-public"},
     }
+    current_config = dict(health_config)
+    current_config["protocol"] = convergence_protocol
+    current_config["protocol_sha256"] = reproduction.canonical_sha256(
+        convergence_protocol
+    )
     coverage = {
         "expected": 111,
         "observed": 111,
@@ -258,22 +372,35 @@ def test_health_index_recomputes_every_artifact_and_rejects_tampering(
             "epoch": epoch,
             "train_loss": 1.0,
             "validation_loss": 1.0,
-            "classification_accuracy": 0.5,
+            "classification_accuracy": 1.0,
             "dice": 0.5,
-            "weighted_composite": 0.5,
+            "weighted_composite": 0.85,
             "runtime_seconds": 1.0,
             "validation_seconds": 1.0,
             "coverage": coverage,
+            "optimizer_steps": 55,
+            "completed_train_steps": epoch * 55,
         }
         for epoch in range(1, 6)
     ]
+    metrics = {
+        "classification_accuracy": 1.0,
+        "dice": 0.5,
+        "weighted_composite": 0.85,
+        "coverage": coverage,
+    }
     record = {
+        "attempt_id": "health-001",
+        "phase": "health",
         "status": "completed",
         "reviewed_by": "reviewer",
+        "requested_epochs": 5,
         "completed_epochs": 5,
         "completed_train_steps": 275,
         "train_steps_per_epoch": 55,
         "validation_steps_per_epoch": 111,
+        "selected_epoch": 5,
+        "metrics": metrics,
         "wandb_finished": True,
         "wandb": {
             "id": "health-001",
@@ -281,21 +408,41 @@ def test_health_index_recomputes_every_artifact_and_rejects_tampering(
             "project": reproduction.WANDB_PROJECT,
             "mode": "online",
             "resume": "never",
+            "config_sha256": "wandb-public",
             "url": "https://wandb.example/health-001",
         },
     }
+    cases = [
+        {"case_id": case_id, "correct": 1, "dice": 0.5}
+        for case_id in identity["validation"]
+    ]
+    regression = {"case_count": 111, "cases": cases}
     payloads = {
-        "config.json": config,
+        "config.json": health_config,
         "source.json": source,
         "case_identity.json": identity,
         "epochs.json": {"epochs": epochs},
-        "best_epoch_cases.json": {"cases": []},
-        "regression.json": {"case_count": 111},
-        "score.json": {"status": "scored"},
+        "best_epoch_cases.json": {"cases": cases},
+        "regression.json": regression,
         "run_record.json": record,
     }
     for name, payload in payloads.items():
         write_json_once(tmp_path / name, payload)
+    write_json_once(
+        tmp_path / "score.json",
+        {
+            "attempt_id": "health-001",
+            "phase": "health",
+            "dataset_scope": reproduction.DATASET_SCOPE,
+            "external_final_test_untouched": True,
+            "selected_epoch": 5,
+            "metrics": metrics,
+            "decision": health_protocol["inference"],
+            "regression_sha256": reproduction.sha256_file(
+                tmp_path / "regression.json"
+            ),
+        },
+    )
     (tmp_path / "dependency.lock").write_text("package==1\n", encoding="utf-8")
     (tmp_path / "best_checkpoint.pth").write_bytes(b"checkpoint")
     index = {
@@ -307,14 +454,28 @@ def test_health_index_recomputes_every_artifact_and_rejects_tampering(
     }
     write_json_once(tmp_path / "artifact_index.json", index)
     assert (
-        _validate_health_index(tmp_path / "artifact_index.json", config, source)[
+        _validate_health_index(
+            tmp_path / "artifact_index.json", current_config, source
+        )[
             "attempt_id"
         ]
         == "health-001"
     )
+    drifted_config = dict(current_config)
+    drifted_config["protocol"] = dict(convergence_protocol)
+    drifted_config["protocol"]["lambda_cls"] = 0.25
+    drifted_config["protocol_sha256"] = reproduction.canonical_sha256(
+        drifted_config["protocol"]
+    )
+    with pytest.raises(ValueError, match="health protocol"):
+        _validate_health_index(
+            tmp_path / "artifact_index.json", drifted_config, source
+        )
     (tmp_path / "score.json").write_text("{}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="hash mismatch"):
-        _validate_health_index(tmp_path / "artifact_index.json", config, source)
+        _validate_health_index(
+            tmp_path / "artifact_index.json", current_config, source
+        )
 
 
 def test_setup_failure_is_sanitized_and_cannot_complete(

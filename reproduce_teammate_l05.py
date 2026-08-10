@@ -23,23 +23,28 @@ from models import modeltype
 from reproduction import (
     CLS_THRESHOLD,
     DATASET_SCOPE,
+    EXPECTED_CUDA_VERSION,
     EXPECTED_TRAIN_CASES,
     EXPECTED_VALIDATION_CASES,
     MIN_PIXELS,
     VETO_THRESHOLD,
     WANDB_ENTITY,
     WANDB_PROJECT,
+    aggregate_native_cases,
     build_paired_regression,
     canonical_sha256,
     load_canonical_manifest,
     load_pinned_baseline,
     read_json,
     reject_external_final_path,
+    resolve_non_external_path,
     sha256_file,
     source_identity,
     validate_canonical_content,
+    validate_coverage,
     validate_dataset_identity,
     validate_epoch_evidence,
+    validate_pretrained,
     validate_runtime_dependencies,
     write_json_once,
 )
@@ -122,7 +127,7 @@ def protocol_contract(phase: str) -> dict[str, Any]:
 def build_config(
     args: argparse.Namespace,
     source: dict[str, str],
-    pretrained_sha256: str,
+    pretrained: dict[str, Any],
     device: torch.device | str,
     manifest: dict[str, Any] | None = None,
     content: dict[str, str] | None = None,
@@ -142,7 +147,7 @@ def build_config(
         "num_workers": args.num_workers,
         "device": str(device),
         "source": source,
-        "pretrained_sha256": pretrained_sha256,
+        "pretrained": pretrained,
         "dataset_scope": DATASET_SCOPE,
         "manifest": manifest,
         "content": content,
@@ -170,6 +175,9 @@ def _start_wandb(config: dict[str, Any]) -> Any:
     import wandb
 
     wandb_config = config["wandb"]
+    public_config = _wandb_public_config(config)
+    if canonical_sha256(public_config) != wandb_config["config_sha256"]:
+        raise RuntimeError("W&B public config hash differs from the sealed config")
     run = wandb.init(
         entity=WANDB_ENTITY,
         project=WANDB_PROJECT,
@@ -179,7 +187,7 @@ def _start_wandb(config: dict[str, Any]) -> Any:
         resume="never",
         group="task1-teammate-l05-veto-reproduction",
         job_type=config["protocol"]["phase"],
-        config=config,
+        config=public_config,
     )
     run.define_metric("train/global_step")
     run.define_metric("train/*", step_metric="train/global_step")
@@ -188,6 +196,52 @@ def _start_wandb(config: dict[str, Any]) -> Any:
     run.define_metric("epoch")
     run.define_metric("epoch/*", step_metric="epoch")
     return run
+
+
+def _wandb_public_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return aggregate/hash-only W&B config without case identities or paths."""
+    manifest = config.get("manifest")
+    baseline = config.get("baseline")
+    dependency = config.get("dependency")
+    content = config.get("content")
+    return {
+        "schema_version": config.get("schema_version"),
+        "issue_url": config.get("issue_url"),
+        "attempt_id": config.get("attempt_id"),
+        "protocol": config.get("protocol"),
+        "protocol_sha256": config.get("protocol_sha256"),
+        "source": config.get("source"),
+        "pretrained": config.get("pretrained"),
+        "dataset": {
+            "scope": config.get("dataset_scope"),
+            "train_case_count": EXPECTED_TRAIN_CASES,
+            "validation_case_count": EXPECTED_VALIDATION_CASES,
+            "manifest_sha256": manifest.get("manifest_sha256")
+            if isinstance(manifest, dict)
+            else None,
+            "case_identity_sha256": config.get("case_identity_sha256"),
+            "combined_content_sha256": content.get("combined_content_sha256")
+            if isinstance(content, dict)
+            else None,
+        },
+        "baseline": {
+            "baseline_id": baseline.get("baseline_id"),
+            "score_sha256": baseline.get("score_sha256"),
+            "run_record_sha256": baseline.get("run_record_sha256"),
+        }
+        if isinstance(baseline, dict)
+        else None,
+        "dependency": {
+            "lock_sha256": dependency.get("lock_sha256"),
+            "python": dependency.get("python"),
+            "torch": dependency.get("torch"),
+            "torchvision": dependency.get("distributions", {}).get("torchvision"),
+            "cuda": dependency.get("cuda"),
+        }
+        if isinstance(dependency, dict)
+        else None,
+        "external_final_isolation": config.get("external_final_isolation"),
+    }
 
 
 def _relative_artifact_hashes(artifact_dir: Path) -> dict[str, str]:
@@ -215,11 +269,14 @@ def _validate_health_index(
     source = read_json(root / "source.json")
     identity = read_json(root / "case_identity.json")
     epochs = read_json(root / "epochs.json")
+    best_cases = read_json(root / "best_epoch_cases.json")
+    regression = read_json(root / "regression.json")
+    score = read_json(root / "score.json")
     record = read_json(root / "run_record.json")
     if source != expected_source:
         raise ValueError("source changed between health and convergence")
     stable_fields = (
-        "pretrained_sha256",
+        "pretrained",
         "dataset_scope",
         "manifest",
         "content",
@@ -229,9 +286,24 @@ def _validate_health_index(
     if any(config.get(field) != current_config.get(field) for field in stable_fields):
         raise ValueError("health immutable input identity differs from convergence")
     expected_health = protocol_contract("health")
+    expected_convergence = protocol_contract("convergence")
+    health_semantics = {
+        key: value
+        for key, value in expected_health.items()
+        if key not in {"phase", "epochs"}
+    }
+    convergence_semantics = {
+        key: value
+        for key, value in expected_convergence.items()
+        if key not in {"phase", "epochs"}
+    }
     if (
-        config.get("protocol") != expected_health
+        current_config.get("protocol") != expected_convergence
+        or current_config.get("protocol_sha256")
+        != canonical_sha256(expected_convergence)
+        or config.get("protocol") != expected_health
         or config.get("protocol_sha256") != canonical_sha256(expected_health)
+        or health_semantics != convergence_semantics
         or canonical_sha256(identity) != current_config.get("case_identity_sha256")
         or identity.get("dataset_scope") != DATASET_SCOPE
         or len(identity.get("train", [])) != EXPECTED_TRAIN_CASES
@@ -240,15 +312,70 @@ def _validate_health_index(
     ):
         raise ValueError("health protocol or case identity is invalid")
     validate_epoch_evidence(epochs["epochs"], 5, 55)
+    cases = best_cases.get("cases")
+    if not isinstance(cases, list):
+        raise TypeError("health best-epoch case evidence is missing")
+    if not all(isinstance(case, dict) and "case_id" in case for case in cases):
+        raise TypeError("health best-epoch cases must contain case identities")
+    validate_coverage(identity["validation"], [str(case["case_id"]) for case in cases])
+    case_metrics = aggregate_native_cases(cases, identity["validation"])
+    selected_epoch = score.get("selected_epoch")
+    if not isinstance(selected_epoch, int) or not 1 <= selected_epoch <= 5:
+        raise ValueError("health selected epoch is outside the completed phase")
+    selected_evidence = epochs["epochs"][selected_epoch - 1]
+    selected_metrics = {
+        key: selected_evidence[key]
+        for key in (
+            "classification_accuracy",
+            "dice",
+            "weighted_composite",
+            "coverage",
+        )
+    }
+    if (
+        score.get("attempt_id") != config.get("attempt_id")
+        or score.get("phase") != "health"
+        or score.get("dataset_scope") != DATASET_SCOPE
+        or score.get("external_final_test_untouched") is not True
+        or score.get("metrics") != selected_metrics
+        or score.get("metrics")
+        != {
+            key: case_metrics[key]
+            for key in (
+                "classification_accuracy",
+                "dice",
+                "weighted_composite",
+                "coverage",
+            )
+        }
+        or score.get("decision") != expected_health["inference"]
+        or score.get("regression_sha256") != sha256_file(root / "regression.json")
+        or regression.get("case_count") != EXPECTED_VALIDATION_CASES
+    ):
+        raise ValueError("health score or regression semantics are invalid")
+    regression_cases = regression.get("cases")
+    if not isinstance(regression_cases, list) or not all(
+        isinstance(case, dict) and "case_id" in case for case in regression_cases
+    ):
+        raise TypeError("health regression per-case evidence is missing")
+    validate_coverage(
+        identity["validation"],
+        [str(case["case_id"]) for case in regression_cases],
+    )
     wandb_evidence = record.get("wandb")
     if (
         record.get("status") != "completed"
+        or record.get("attempt_id") != config.get("attempt_id")
+        or record.get("phase") != "health"
         or record.get("reviewed_by") != config.get("reviewed_by")
         or not str(record.get("reviewed_by", "")).strip()
         or record.get("completed_epochs") != 5
         or record.get("completed_train_steps") != 275
         or record.get("train_steps_per_epoch") != 55
         or record.get("validation_steps_per_epoch") != 111
+        or record.get("requested_epochs") != 5
+        or record.get("selected_epoch") != selected_epoch
+        or record.get("metrics") != selected_metrics
         or record.get("wandb_finished") is not True
         or not isinstance(wandb_evidence, dict)
         or wandb_evidence.get("id") != config["attempt_id"]
@@ -256,6 +383,8 @@ def _validate_health_index(
         or wandb_evidence.get("project") != WANDB_PROJECT
         or wandb_evidence.get("mode") != "online"
         or wandb_evidence.get("resume") != "never"
+        or wandb_evidence.get("config_sha256")
+        != config.get("wandb", {}).get("config_sha256")
         or not str(wandb_evidence.get("url", "")).startswith("https://")
     ):
         raise ValueError(
@@ -264,6 +393,9 @@ def _validate_health_index(
     return {
         "attempt_id": config["attempt_id"],
         "artifact_index_sha256": sha256_file(index_path),
+        "phase_transition_sha256": canonical_sha256(
+            {"health": expected_health, "convergence": expected_convergence}
+        ),
         "reviewed_by": record["reviewed_by"],
     }
 
@@ -303,6 +435,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         value = getattr(args, label, None)
         if value is not None:
             reject_external_final_path(value, label)
+    for label in bound_paths:
+        value = getattr(args, label, None)
+        if value is not None:
+            setattr(args, label, resolve_non_external_path(value, label))
     artifact_dir = args.artifact_root / args.attempt_id
     if artifact_dir.exists():
         raise FileExistsError(
@@ -338,11 +474,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             args.baseline_run_record,
             manifest["identity"]["validation"],
         )
-        pretrained_sha256 = sha256_file(args.pretrained)
+        pretrained = validate_pretrained(args.pretrained)
         stage = "dependency_identity"
         dependency = validate_runtime_dependencies(LOCK_PATH)
         dependency["lock_sha256"] = sha256_file(LOCK_PATH)
         device = _device(args.device)
+        if device.type != "cuda":
+            raise RuntimeError("scored reproduction requires a CUDA device")
+        if torch.version.cuda != EXPECTED_CUDA_VERSION:
+            raise RuntimeError("runtime CUDA differs from the verified CUDA 11.8 build")
+        if not hasattr(torch.serialization, "safe_globals"):
+            raise RuntimeError("runtime torch lacks the required safe_globals API")
         dependency.update(
             {
                 "torch": torch.__version__,
@@ -358,7 +500,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         config = build_config(
             args,
             source,
-            pretrained_sha256,
+            pretrained,
             device,
             manifest,
             content,
@@ -392,6 +534,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "train_steps_per_epoch": 55,
                 "validation_steps_per_epoch": 111,
             }
+        )
+        config["wandb"]["config_sha256"] = canonical_sha256(
+            _wandb_public_config(config)
         )
         stage = "health_gate"
         health_gate = None
@@ -459,7 +604,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "selected_epoch": details["best_epoch"],
             "source": source,
             "config_sha256": sha256_file(artifact_dir / "config.json"),
-            "pretrained_sha256": pretrained_sha256,
+            "pretrained_sha256": pretrained["sha256"],
             "case_identity_sha256": identity_sha256,
         }
         torch.save(checkpoint, checkpoint_path)
@@ -578,8 +723,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--attempt-id must be a single safe path component")
     if args.num_workers < 0:
         parser.error("--num-workers must be non-negative")
-    args.artifact_root = args.artifact_root.resolve()
-    for name in (
+    path_names = (
+        "artifact_root",
         "manifest",
         "baseline_score",
         "baseline_run_record",
@@ -589,10 +734,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "val_dcm_dir",
         "val_mask_dir",
         "health_artifact_index",
-    ):
+    )
+    for name in path_names:
         value = getattr(args, name)
         if value is not None:
-            setattr(args, name, value.resolve())
+            reject_external_final_path(value, name)
+    for name in path_names:
+        value = getattr(args, name)
+        if value is not None:
+            setattr(args, name, resolve_non_external_path(value, name))
     args.wandb_run_name = args.wandb_run_name or (
         f"task1-teammate-l05-veto-{args.phase}-{args.attempt_id}"
     )

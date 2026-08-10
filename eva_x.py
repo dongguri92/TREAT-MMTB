@@ -13,9 +13,11 @@ by Jingfeng Yao
 from HUST-VL
 """
 
+from pathlib import Path
+
 import torch
-from timm.models.eva import Eva
 from timm.layers import resample_abs_pos_embed, resample_patch_embed
+from timm.models.eva import Eva
 
 def checkpoint_filter_fn(
         state_dict,
@@ -119,7 +121,7 @@ class EVA_X(Eva):
         x = self.forward_head(x)
         return x
 
-def eva_x_tiny_patch16(pretrained=False):
+def eva_x_tiny_patch16(pretrained: str | Path):
     model = EVA_X(
         img_size=224,
         patch_size=16,
@@ -137,7 +139,7 @@ def eva_x_tiny_patch16(pretrained=False):
     print(msg)
     return model
 
-def eva_x_small_patch16(pretrained=False):
+def eva_x_small_patch16(pretrained: str | Path):
     model = EVA_X(
         img_size=224,
         patch_size=16,
@@ -155,7 +157,7 @@ def eva_x_small_patch16(pretrained=False):
     print(msg)
     return model
 
-def eva_x_base_patch16(pretrained=False):
+def eva_x_base_patch16(pretrained: str | Path):
     model = EVA_X(
         img_size=224,
         patch_size=16,

@@ -1,5 +1,6 @@
-import os
 import argparse
+from typing import Any
+
 import torch
 
 from models import modeltype
@@ -29,7 +30,7 @@ EVAX_PRETRAINED_BASE = "~/eva_x_backup/eva_x_base_patch16_merged520k_mim.pt"
 
 
 def main():
-    cfg = dict(CONFIG)
+    cfg: dict[str, Any] = dict(CONFIG)
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='multitask_unet',
@@ -108,26 +109,25 @@ def main():
 
     # 채널 수에 따라 dataloader 모듈 선택
     if args.roi:
-        from datasets_roi import dataloader
-        train_loader, val_loader = dataloader(
+        from datasets_roi import dataloader as roi_dataloader
+        train_loader, val_loader = roi_dataloader(
             batch_size=cfg['batch_size'], roi_size=cfg['target_size'],
             context=args.roi_context, clahe_clip=cfg['clahe_clip'],
             num_workers=cfg['num_workers'], seed=cfg['seed'],
             jitter=(args.roi_jitter, 0.8, 1.4), per_component=True)
     elif args.channels == 3:
-        from datasets_3ch import dataloader
-        train_loader, val_loader = dataloader(
+        from datasets_3ch import dataloader as three_channel_dataloader
+        train_loader, val_loader = three_channel_dataloader(
             batch_size=cfg['batch_size'],
             target_size=cfg['target_size'], clahe_clip=cfg['clahe_clip'],
-            num_workers=cfg['num_workers'], seed=cfg['seed'],
-            crop_frac=args.crop_frac)
+            num_workers=cfg['num_workers'], seed=cfg['seed'])
     else:
-        from datasets import dataloader
+        from datasets import dataloader as one_channel_dataloader
         if args.size_weighted:
             raise NotImplementedError(
                 "--size_weighted is not implemented by datasets.py"
             )
-        train_loader, val_loader = dataloader(
+        train_loader, val_loader = one_channel_dataloader(
             batch_size=cfg['batch_size'],
             target_size=cfg['target_size'], clahe_clip=cfg['clahe_clip'],
             num_workers=cfg['num_workers'], seed=cfg['seed'],

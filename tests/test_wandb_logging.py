@@ -89,6 +89,8 @@ def test_fit_logs_train_validation_and_epoch_metrics(tmp_path: Path):
     epoch_rows = [row for row in run.rows if "epoch/weighted_composite" in row]
     assert len(epoch_rows) == 1
     assert epoch_rows[0]["epoch/validation_case_count"] == 4
+    assert epoch_rows[0]["epoch/optimizer_steps"] == 2
+    assert epoch_rows[0]["epoch/completed_train_steps"] == 2
     assert run.summary["best/epoch"] == 1
 
 
