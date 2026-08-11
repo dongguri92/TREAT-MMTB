@@ -12,6 +12,7 @@ Saves:  best checkpoint by mean validation dice
 """
 
 import os
+import random
 import time
 
 import matplotlib
@@ -395,6 +396,12 @@ def fit(model, train_loader, val_loader, device,
     print(f"Done. best final {best_score:.4f} @ epoch {best_epoch}")
     print(f"curves saved to {plot_path}")
     if return_details:
+        mps_rng = None
+        get_mps_rng_state = getattr(torch.mps, "get_rng_state", None)
+        if device.type == "mps" and not callable(get_mps_rng_state):
+            raise RuntimeError("MPS continuation requires RNG-state support")
+        if device.type == "mps" and callable(get_mps_rng_state):
+            mps_rng = get_mps_rng_state()
         return {
             'best_score': best_score,
             'best_epoch': best_epoch + 1,
@@ -407,6 +414,25 @@ def fit(model, train_loader, val_loader, device,
             ),
             'gradient_accumulation_steps': gradient_accumulation_steps,
             'runtime_seconds': time.perf_counter() - total_started,
+            'continuation_state': {
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': {
+                    'kind': scheduler,
+                    'warmup_epochs': warmup_epochs,
+                    'initial_lr': initial_lr,
+                    'next_epoch': len(epoch_records),
+                    'last_learning_rates': [
+                        group['lr'] for group in optimizer.param_groups
+                    ],
+                },
+                'completed_epochs': len(epoch_records),
+                'global_optimizer_updates': global_step,
+                'python_rng_state': random.getstate(),
+                'numpy_rng_state': np.random.get_state(),
+                'torch_rng_state': torch.get_rng_state(),
+                'mps_rng_state': mps_rng,
+            },
         }
     return best_score, best_epoch
 

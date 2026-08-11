@@ -88,6 +88,20 @@ def _health_approval(tmp_path: Path, *, allowed_to: str = "conv-001") -> Path:
             }
         )
     )
+    source_delta = tmp_path / "source-delta.json"
+    source_delta.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "independently_reviewed",
+                "reviewer": "reviewer",
+                "health_source": source_payload,
+                "convergence_source": convergence._head_source(),
+                "execution_surface": convergence._execution_surface(),
+                "external_final_accessed": False,
+            }
+        )
+    )
     approval = tmp_path / "health-approval.json"
     approval.write_text(
         json.dumps(
@@ -102,6 +116,8 @@ def _health_approval(tmp_path: Path, *, allowed_to: str = "conv-001") -> Path:
                 "health_run_record_sha256": sha256_file(run_record),
                 "health_artifact_index_path": str(artifact_index.resolve()),
                 "health_artifact_index_sha256": sha256_file(artifact_index),
+                "source_delta_path": str(source_delta.resolve()),
+                "source_delta_sha256": sha256_file(source_delta),
                 "allowed_to": allowed_to,
                 "external_final_accessed": False,
             }
@@ -161,6 +177,8 @@ def test_queue_spec_is_fresh_single_attempt_and_no_resume(tmp_path: Path) -> Non
         attempt_id="conv-001",
         raw_argv=["--attempt-id", "conv-001", "--health-approval", str(approval_path)],
         health_approval=approval_path,
+        artifact_root=tmp_path / "artifacts",
+        wandb_run_name="convergence-conv-001",
     )
     spec = convergence.queue_spec(args, approval)
     assert spec["attempt"] == spec["max_attempts"] == 1
@@ -171,6 +189,41 @@ def test_queue_spec_is_fresh_single_attempt_and_no_resume(tmp_path: Path) -> Non
     assert spec["forbidden_initialization"]["sha256"] == sha256_file(
         tmp_path / "health" / "best_checkpoint.pth"
     )
+    queue_path, queue_hash = convergence._bind_queue_receipt(args, spec, execute=False)
+    assert queue_hash == sha256_file(queue_path)
+    assert convergence._bind_queue_receipt(args, spec, execute=True)[1] == queue_hash
+    queue_approval = tmp_path / "queue-approval.json"
+    queue_approval.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "independently_reviewed_approved",
+                "reviewer": "reviewer",
+                "attempt_id": "conv-001",
+                "queue_spec_sha256": queue_hash,
+                "external_final_accessed": False,
+            }
+        )
+    )
+    assert convergence._validate_queue_approval(
+        queue_approval, attempt_id="conv-001", queue_spec_sha256=queue_hash
+    ) == sha256_file(queue_approval)
+
+
+def test_health_approval_rejects_same_attempt_and_parent_symlink(
+    tmp_path: Path,
+) -> None:
+    same = _health_approval(tmp_path, allowed_to="health-003")
+    with pytest.raises(ValueError, match="not bound"):
+        convergence.validate_health_approval(same, "health-003")
+
+    external = tmp_path / "external_final"
+    external.mkdir()
+    real_approval = _health_approval(external)
+    alias = tmp_path / "benign"
+    alias.symlink_to(external, target_is_directory=True)
+    with pytest.raises(ValueError, match="external final|symlink"):
+        convergence.validate_health_approval(alias / real_approval.name, "conv-001")
 
 
 @pytest.mark.parametrize("name", list(convergence.engine.MPS_ARTIFACT_NAMES))
@@ -204,34 +257,187 @@ def test_contract_rejects_config_drift_and_health_checkpoint_initialization(
         convergence.validate_convergence_contract(args, approval)
 
 
+def _completed_base(
+    artifact_dir: Path, attempt_id: str, rows: list[dict[str, float | int]]
+) -> tuple[dict[str, object], str]:
+    queue_path = artifact_dir.parent / "queue_specs" / f"{attempt_id}.json"
+    queue_path.parent.mkdir(parents=True)
+    queue_path.write_text("{}")
+    queue_sha = sha256_file(queue_path)
+    approval_sha = "a" * 64
+    artifact_dir.mkdir(parents=True)
+    for name in convergence.CONVERGENCE_ARTIFACT_NAMES:
+        (artifact_dir / name).write_bytes(b"{}")
+    (artifact_dir / "epochs.json").write_text(json.dumps({"epochs": rows}))
+    (artifact_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "execution_receipt_sha256": queue_sha,
+                "execution_approval_sha256": approval_sha,
+            }
+        )
+    )
+    (artifact_dir / "run_record.json").write_text(
+        json.dumps(
+            {
+                "execution_receipt_sha256": queue_sha,
+                "execution_approval_sha256": approval_sha,
+                "wandb_completion": {
+                    "state": "finished",
+                    "identity_verified": True,
+                    "verification": "wandb_api_post_finish",
+                    "entity": convergence.engine.WANDB_ENTITY,
+                    "project": convergence.engine.WANDB_PROJECT,
+                    "id": attempt_id,
+                    "name": f"convergence-{attempt_id}",
+                    "group": convergence.engine.WANDB_GROUP,
+                    "job_type": convergence.engine.WANDB_JOB_TYPE,
+                },
+            }
+        )
+    )
+    convergence.engine.torch.save(
+        {
+            "model": {},
+            "optimizer": {},
+            "scheduler": {
+                "kind": "cosine",
+                "warmup_epochs": 5,
+                "initial_lr": 5e-5,
+                "next_epoch": 50,
+                "last_learning_rates": [1e-7],
+            },
+            "completed_epochs": 50,
+            "global_optimizer_updates": 2750,
+            "python_rng_state": (),
+            "numpy_rng_state": (),
+            "torch_rng_state": convergence.engine.torch.tensor(
+                [], dtype=convergence.engine.torch.uint8
+            ),
+            "mps_rng_state": convergence.engine.torch.tensor(
+                [], dtype=convergence.engine.torch.uint8
+            ),
+        },
+        artifact_dir / convergence.CONTINUATION_CHECKPOINT,
+    )
+    base: dict[str, object] = {
+        "schema_version": 1,
+        "status": "completed",
+        "attempt_id": attempt_id,
+        "phase": "convergence_50e",
+        "execution_family": "apple_mps_resource_adjusted",
+        "artifacts": {
+            name: sha256_file(artifact_dir / name)
+            for name in convergence.CONVERGENCE_ARTIFACT_NAMES
+        },
+    }
+    (artifact_dir / "artifact_index.json").write_text(json.dumps(base))
+    return base, queue_sha
+
+
 def test_completion_seals_decision_pending_handoff_and_final_index(
     tmp_path: Path,
 ) -> None:
     approval_path = _health_approval(tmp_path)
     approval = convergence.validate_health_approval(approval_path, "conv-001")
     artifact_dir = tmp_path / "artifacts" / "conv-001"
-    artifact_dir.mkdir(parents=True)
     rows = [
         _epoch(epoch, 0.50 + epoch * 0.001, 1.0 - epoch * 0.002)
         for epoch in range(1, 51)
     ]
-    (artifact_dir / "epochs.json").write_text(json.dumps({"epochs": rows}))
-    base = {"status": "completed", "attempt_id": "conv-001", "phase": "convergence_50e"}
-    (artifact_dir / "artifact_index.json").write_text(json.dumps(base))
+    base, queue_sha = _completed_base(artifact_dir, "conv-001", rows)
     args = argparse.Namespace(
         attempt_id="conv-001",
         artifact_root=tmp_path / "artifacts",
         health_approval=approval_path,
+        wandb_run_name="convergence-conv-001",
+        execution_approval_sha256="a" * 64,
     )
-    final = convergence._seal_completion(args, approval, base)
+    final = convergence._seal_completion(args, approval, base, queue_sha)
     assert final["auto_launched_150"] is False
     handoff = json.loads(
         (artifact_dir / "issue93_champion_handoff.pending.json").read_text()
     )
     assert handoff["launch_eligible"] is False
     assert handoff["review_state"] == "pending_independent_review"
+    assert handoff["convergence_index_sha256"] == sha256_file(
+        artifact_dir / "convergence_index.json"
+    )
     with pytest.raises(FileExistsError):
-        convergence._seal_completion(args, approval, base)
+        convergence._seal_completion(args, approval, base, queue_sha)
+
+
+def test_completion_rejects_self_consistent_indexed_epoch_substitution(
+    tmp_path: Path,
+) -> None:
+    approval_path = _health_approval(tmp_path)
+    approval = convergence.validate_health_approval(approval_path, "conv-001")
+    artifact_dir = tmp_path / "artifacts" / "conv-001"
+    rows = [_epoch(epoch, 0.5, 1.0) for epoch in range(1, 51)]
+    base, queue_sha = _completed_base(artifact_dir, "conv-001", rows)
+    (artifact_dir / "epochs.json").write_text(
+        json.dumps({"epochs": [_epoch(epoch, 0.9, 0.1) for epoch in range(1, 51)]})
+    )
+    args = argparse.Namespace(
+        attempt_id="conv-001",
+        artifact_root=tmp_path / "artifacts",
+        health_approval=approval_path,
+        wandb_run_name="convergence-conv-001",
+        execution_approval_sha256="a" * 64,
+    )
+    with pytest.raises(ValueError, match="indexed artifact bytes differ"):
+        convergence._seal_completion(args, approval, base, queue_sha)
+
+
+def test_completion_rejects_incomplete_continuation_and_approval_toctou(
+    tmp_path: Path,
+) -> None:
+    approval_path = _health_approval(tmp_path)
+    approval = convergence.validate_health_approval(approval_path, "conv-001")
+    artifact_dir = tmp_path / "artifacts" / "conv-001"
+    rows = [_epoch(epoch, 0.5, 1.0) for epoch in range(1, 51)]
+    base, queue_sha = _completed_base(artifact_dir, "conv-001", rows)
+    continuation_path = artifact_dir / convergence.CONTINUATION_CHECKPOINT
+    continuation = convergence.engine.torch.load(
+        continuation_path, map_location="cpu", weights_only=False
+    )
+    del continuation["mps_rng_state"]
+    convergence.engine.torch.save(continuation, continuation_path)
+    base["artifacts"][convergence.CONTINUATION_CHECKPOINT] = sha256_file(  # type: ignore[index]
+        continuation_path
+    )
+    (artifact_dir / "artifact_index.json").write_text(json.dumps(base))
+    args = argparse.Namespace(
+        attempt_id="conv-001",
+        artifact_root=tmp_path / "artifacts",
+        health_approval=approval_path,
+        wandb_run_name="convergence-conv-001",
+        execution_approval_sha256="a" * 64,
+    )
+    with pytest.raises(ValueError, match="continuation state is incomplete"):
+        convergence._seal_completion(args, approval, base, queue_sha)
+
+    approval_path.write_text("{}")
+    with pytest.raises(ValueError, match="health approval changed"):
+        convergence._seal_completion(args, approval, base, queue_sha)
+
+
+def test_convergence_finalization_failure_receipt_is_durable(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "artifacts" / "conv-001"
+    artifact_dir.mkdir(parents=True)
+    args = argparse.Namespace(
+        attempt_id="conv-001", artifact_root=tmp_path / "artifacts"
+    )
+    convergence._write_convergence_failure(
+        args, convergence.engine.RunInterrupted(15), "convergence_finalization"
+    )
+    receipt = json.loads((artifact_dir / "convergence_failure.json").read_text())
+    assert receipt["signal"] == "SIGTERM"
+    assert receipt["status"] == "failed"
+    convergence._write_convergence_failure(args, RuntimeError("later"), "later")
+    assert (
+        json.loads((artifact_dir / "convergence_failure.json").read_text()) == receipt
+    )
 
 
 @pytest.mark.parametrize("count", [1, 4, 49])
@@ -239,16 +445,17 @@ def test_partial_epochs_never_seal_completion(tmp_path: Path, count: int) -> Non
     approval_path = _health_approval(tmp_path)
     approval = convergence.validate_health_approval(approval_path, "conv-001")
     artifact_dir = tmp_path / "artifacts" / "conv-001"
-    artifact_dir.mkdir(parents=True)
-    (artifact_dir / "epochs.json").write_text(
-        json.dumps({"epochs": [_epoch(i, 0.5, 1.0) for i in range(1, count + 1)]})
+    base, queue_sha = _completed_base(
+        artifact_dir,
+        "conv-001",
+        [_epoch(i, 0.5, 1.0) for i in range(1, count + 1)],
     )
-    base = {"status": "completed", "attempt_id": "conv-001", "phase": "convergence_50e"}
-    (artifact_dir / "artifact_index.json").write_text(json.dumps(base))
     args = argparse.Namespace(
         attempt_id="conv-001",
         artifact_root=tmp_path / "artifacts",
         health_approval=approval_path,
+        wandb_run_name="convergence-conv-001",
+        execution_approval_sha256="a" * 64,
     )
     with pytest.raises(ValueError):
-        convergence._seal_completion(args, approval, base)
+        convergence._seal_completion(args, approval, base, queue_sha)

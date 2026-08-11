@@ -366,7 +366,11 @@ def _build_config(
             "id": args.attempt_id,
             "name": args.wandb_run_name,
             "resume": "never",
+            "group": WANDB_GROUP,
+            "job_type": WANDB_JOB_TYPE,
         },
+        "execution_receipt_sha256": getattr(args, "execution_receipt_sha256", None),
+        "execution_approval_sha256": getattr(args, "execution_approval_sha256", None),
         "external_final_isolation": {
             "dataset_scope": DATASET_SCOPE,
             "canonical_bytes_verified": True,
@@ -435,6 +439,35 @@ def _start_wandb(config: dict[str, Any]) -> Any:
     run.define_metric("epoch")
     run.define_metric("epoch/*", step_metric="epoch")
     return run
+
+
+def _verify_wandb_completion(config: dict[str, Any], run_url: str) -> dict[str, Any]:
+    import wandb
+
+    expected_path = f"{WANDB_ENTITY}/{WANDB_PROJECT}/{config['attempt_id']}"
+    remote = wandb.Api().run(expected_path)
+    expected = config["wandb"]
+    if (
+        str(remote.state) != "finished"
+        or str(remote.id) != expected["id"]
+        or str(remote.name) != expected["name"]
+        or str(remote.group) != expected["group"]
+        or str(remote.job_type) != expected["job_type"]
+        or str(remote.url) != str(run_url)
+    ):
+        raise RuntimeError("W&B API completion identity differs from sealed contract")
+    return {
+        "state": "finished",
+        "identity_verified": True,
+        "verification": "wandb_api_post_finish",
+        "entity": WANDB_ENTITY,
+        "project": WANDB_PROJECT,
+        "id": expected["id"],
+        "name": expected["name"],
+        "group": expected["group"],
+        "job_type": expected["job_type"],
+        "url": run_url,
+    }
 
 
 def _validate_mps_epochs(epochs: list[dict[str, Any]]) -> None:
@@ -674,6 +707,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
         )
 
+        continuation = details.pop("continuation_state", None)
+        if PHASE == "convergence_50e":
+            if not isinstance(continuation, dict):
+                raise TypeError("convergence lacks exact-final continuation state")
+            torch.save(continuation, artifact_dir / "continuation_epoch_50.pth")
+
         stage = "artifact_finalization"
         epochs = details["epochs"]
         _validate_mps_epochs(epochs)
@@ -733,6 +772,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             or str(wandb_run.id) != args.attempt_id
             or str(wandb_run.entity) != WANDB_ENTITY
             or str(wandb_run.project) != WANDB_PROJECT
+            or config["wandb"]["name"] != args.wandb_run_name
+            or config["wandb"]["group"] != WANDB_GROUP
+            or config["wandb"]["job_type"] != WANDB_JOB_TYPE
         ):
             raise RuntimeError("W&B identity differs from sealed MPS contract")
         for name, value in score["metrics"].items():
@@ -746,6 +788,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ]
         wandb_run.finish()
         wandb_run = None
+        wandb_completion = (
+            _verify_wandb_completion(config, str(run_url))
+            if getattr(args, "require_wandb_completion_verification", False)
+            else {
+                "state": "finished",
+                "identity_verified": True,
+                "verification": "local_finish_only",
+                "entity": WANDB_ENTITY,
+                "project": WANDB_PROJECT,
+                "id": args.attempt_id,
+                "name": args.wandb_run_name,
+                "group": WANDB_GROUP,
+                "job_type": WANDB_JOB_TYPE,
+                "url": run_url,
+            }
+        )
         run_record = {
             "schema_version": 1,
             "issue_url": ISSUE_URL,
@@ -770,6 +828,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "resource_evidence_sha256": resource_sha256,
             "wandb_finished": True,
             "wandb": {**config["wandb"], "url": run_url},
+            "wandb_completion": wandb_completion,
+            "execution_receipt_sha256": getattr(args, "execution_receipt_sha256", None),
+            "execution_approval_sha256": getattr(
+                args, "execution_approval_sha256", None
+            ),
             "artifacts": list(MPS_ARTIFACT_NAMES),
         }
         write_json_once(artifact_dir / "run_record.json", run_record)

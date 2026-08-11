@@ -14,17 +14,27 @@ Validation rehashes every file covered by that index, including the actual
 `best_checkpoint.pth` bytes. It rebuilds the prospective source,
 manifest/content, pretrained, baseline, dependency, and resource contract and
 requires exact equality after normalizing only attempt, phase, epoch, and W&B
-run identity. Both the health checkpoint path and its bytes are forbidden as
+run identity. The approved health head and convergence head differ, so a
+separate independently reviewed source-delta receipt must bind both source
+identities and the exact hashes of every execution-surface file. Both the
+health checkpoint path and its bytes are forbidden as
 initialization; the candidate must use the reviewed pretrained weights.
 The emitted queue specification is single-attempt (`max_attempts=1`), binds the
 review receipt, uses a distinct W&B identity with `resume=never`, and forbids
-external-final access. A retry is a new reviewed attempt and directory.
+external-final access. Dry-run writes that specification once under
+`<artifact-root>/queue_specs/`; execution requires a separate reviewer approval
+bound to its exact SHA-256. A retry is a new reviewed attempt and directory.
 
 The successful 50-epoch path preserves the base runner's signal handling:
 SIGINT/SIGTERM finish active W&B with `exit_code=1`, write an immutable
 privacy-safe failure receipt, and restore prior handlers. The base artifact
-index remains immutable. A second `convergence_index.json` binds that index,
-the health approval, convergence decision, and pending Issue #93 handoff.
+index remains immutable, and convergence finalization installs its own signal
+boundary and immutable failure receipt. A second `convergence_index.json` binds
+the rehashed base artifacts, original health approval, queue approval/spec,
+config, run record, best checkpoint, exact epoch-50 continuation checkpoint,
+and convergence decision. The pending Issue #93 handoff then binds both indexes
+and both checkpoints. W&B name/group/job type are convergence-specific and the
+run record requires post-finish API verification of the complete identity.
 
 ## Conditional epoch-150 semantics
 
@@ -34,8 +44,10 @@ validation-loss slope, more than 0.01 improvement over epoch five, and no
 plateau. Eligibility produces only a request for fresh independent review.
 
 The safest preregistered extension semantics are an exact continuation from
-the sealed epoch-50 selected checkpoint to total epoch 150, with optimizer,
-scheduler, RNG, update-count, and checkpoint hashes restored and verified.
+the distinct sealed epoch-50 checkpoint to total epoch 150. It contains model,
+optimizer, scheduler/LR phase, completed epoch/update counters, and
+Python/NumPy/Torch/MPS RNG state; the independently selected best checkpoint
+remains separate.
 That continuation requires a new runner/spec/attempt/W&B ID and review receipt;
 this amendment deliberately contains no executable epoch-150 path.
 
@@ -44,5 +56,6 @@ The Issue #93 handoff remains `pending_independent_review` and
 the health-gate selected epoch, and becomes launch evidence only after a
 separate reviewer binds the final convergence bytes and reviewed commit.
 
-No GPU, data, feasibility probe, training, or W&B operation is performed by
-the tests or dry-run documentation.
+No GPU, private data, feasibility probe, training, or W&B operation has been
+performed by this remediation. `NO-LAUNCH` remains in force until the new
+source-delta and queue receipts receive fresh independent approval.

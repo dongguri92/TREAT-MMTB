@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -26,6 +27,21 @@ PLATEAU_RANGE_TOLERANCE = 0.002
 PLATEAU_SLOPE_TOLERANCE = 0.0002
 EXTENSION_COMPOSITE_SLOPE = 0.0002
 SHORT_BUDGET_NOISE_FLOOR = 0.01
+CONTINUATION_CHECKPOINT = "continuation_epoch_50.pth"
+HEALTH_ARTIFACT_NAMES = tuple(engine.MPS_ARTIFACT_NAMES)
+CONVERGENCE_ARTIFACT_NAMES = (*HEALTH_ARTIFACT_NAMES, CONTINUATION_CHECKPOINT)
+EXECUTION_SURFACE = (
+    "datasets.py",
+    "eva_x.py",
+    "models.py",
+    "models_evax.py",
+    "reproduction.py",
+    "reproduce_teammate_l05_mps.py",
+    "reproduce_teammate_l05_mps_convergence.py",
+    "training.py",
+    "utils.py",
+    "requirements-reproduction-mps.lock",
+)
 
 
 def _read_json_object(path: Path, label: str) -> dict[str, Any]:
@@ -35,21 +51,81 @@ def _read_json_object(path: Path, label: str) -> dict[str, Any]:
     return payload
 
 
-def _indexed_health_artifacts(index_path: Path, index: Mapping[str, Any]) -> dict[str, Path]:
+def _safe_path(path: Path | str, label: str, *, require_absolute: bool = True) -> Path:
+    lexical = Path(path)
+    if require_absolute and not lexical.is_absolute():
+        raise ValueError(f"{label} must be absolute")
+    resolved = engine.resolve_non_external_path(lexical, label)
+    if lexical.is_symlink() or any(parent.is_symlink() for parent in lexical.parents):
+        raise ValueError(f"{label} must not traverse symlinks")
+    return resolved
+
+
+def _execution_surface() -> dict[str, str]:
+    return {
+        name: sha256_file(_safe_path(engine.REPO_ROOT / name, name))
+        for name in EXECUTION_SURFACE
+    }
+
+
+def _head_source() -> dict[str, str]:
+    return {
+        "git_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=engine.REPO_ROOT, text=True
+        ).strip(),
+        "git_tree_sha1": subprocess.check_output(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=engine.REPO_ROOT, text=True
+        ).strip(),
+    }
+
+
+def _validate_source_delta(
+    path: Path, expected_sha256: str, health_source: Mapping[str, Any]
+) -> dict[str, Any]:
+    resolved = _safe_path(path, "source_delta")
+    if resolved.is_symlink() or sha256_file(resolved) != expected_sha256:
+        raise ValueError("source-delta receipt bytes do not match approval")
+    delta = _read_json_object(resolved, "source-delta receipt")
+    current_source = _head_source()
+    if (
+        set(delta)
+        != {
+            "schema_version",
+            "status",
+            "reviewer",
+            "health_source",
+            "convergence_source",
+            "execution_surface",
+            "external_final_accessed",
+        }
+        or delta.get("status") != "independently_reviewed"
+        or not str(delta.get("reviewer", "")).strip()
+        or delta.get("health_source") != dict(health_source)
+        or delta.get("convergence_source") != current_source
+        or delta.get("execution_surface") != _execution_surface()
+        or delta.get("external_final_accessed") is not False
+    ):
+        raise ValueError("source-delta execution surface is not exactly approved")
+    return delta
+
+
+def _indexed_health_artifacts(
+    index_path: Path, index: Mapping[str, Any]
+) -> dict[str, Path]:
     artifacts = index.get("artifacts")
-    if not isinstance(artifacts, dict) or set(artifacts) != set(engine.MPS_ARTIFACT_NAMES):
+    if not isinstance(artifacts, dict) or set(artifacts) != set(HEALTH_ARTIFACT_NAMES):
         raise ValueError("health artifact index does not cover the exact artifact set")
-    root = index_path.parent.resolve()
+    root = _safe_path(index_path.parent, "health artifact root")
     resolved: dict[str, Path] = {}
-    for name in engine.MPS_ARTIFACT_NAMES:
+    for name in HEALTH_ARTIFACT_NAMES:
         expected = artifacts.get(name)
-        path = root / name
+        path = _safe_path(root / name, f"health artifact {name}")
         if (
             not isinstance(expected, str)
             or len(expected) != 64
             or path.is_symlink()
             or not path.is_file()
-            or path.resolve().parent != root
+            or path.parent != root
             or sha256_file(path) != expected
         ):
             raise ValueError(f"health indexed artifact bytes differ: {name}")
@@ -191,6 +267,8 @@ def convergence_decision(
 
 
 def validate_health_approval(path: Path, expected_attempt_id: str) -> dict[str, Any]:
+    path = _safe_path(path, "health approval")
+    approval_sha256 = sha256_file(path)
     payload = json.loads(path.read_text(encoding="utf-8"))
     required = {
         "schema_version",
@@ -203,6 +281,8 @@ def validate_health_approval(path: Path, expected_attempt_id: str) -> dict[str, 
         "health_run_record_sha256",
         "health_artifact_index_path",
         "health_artifact_index_sha256",
+        "source_delta_path",
+        "source_delta_sha256",
         "allowed_to",
         "external_final_accessed",
     }
@@ -218,22 +298,24 @@ def validate_health_approval(path: Path, expected_attempt_id: str) -> dict[str, 
         raise ValueError("health approval reviewer is missing")
     if (
         payload["allowed_to"] != expected_attempt_id
+        or payload["health_attempt_id"] == expected_attempt_id
         or payload["external_final_accessed"] is not False
     ):
         raise ValueError("health approval is not bound to this attempt")
     for prefix in ("health_run_record", "health_artifact_index"):
-        evidence = Path(payload[f"{prefix}_path"])
-        engine.reject_external_final_path(evidence, prefix)
+        evidence = _safe_path(payload[f"{prefix}_path"], prefix)
         if (
-            not evidence.is_absolute()
-            or evidence.is_symlink()
+            evidence.is_symlink()
             or sha256_file(evidence) != payload[f"{prefix}_sha256"]
         ):
             raise ValueError(f"{prefix} bytes do not match approval")
     run_record = _read_json_object(
-        Path(payload["health_run_record_path"]), "health run record"
+        _safe_path(payload["health_run_record_path"], "health run record"),
+        "health run record",
     )
-    index_path = Path(payload["health_artifact_index_path"])
+    index_path = _safe_path(
+        payload["health_artifact_index_path"], "health artifact index"
+    )
     index = _read_json_object(index_path, "health artifact index")
     if (
         run_record.get("attempt_id") != payload["health_attempt_id"]
@@ -259,11 +341,19 @@ def validate_health_approval(path: Path, expected_attempt_id: str) -> dict[str, 
     source = _read_json_object(artifact_paths["source.json"], "health source")
     if config.get("source") != source:
         raise ValueError("health source artifact differs from health config")
+    source_delta = _validate_source_delta(
+        Path(payload["source_delta_path"]),
+        str(payload["source_delta_sha256"]),
+        source,
+    )
     payload["health_checkpoint_path"] = str(
         artifact_paths["best_checkpoint.pth"].resolve()
     )
     payload["health_checkpoint_sha256"] = artifacts["best_checkpoint.pth"]
     payload["health_contract"] = _normalized_config_contract(config)
+    payload["health_contract"]["source"] = source_delta["convergence_source"]
+    payload["approval_sha256"] = approval_sha256
+    payload["source_delta"] = source_delta
     return payload
 
 
@@ -272,7 +362,9 @@ def validate_convergence_contract(
 ) -> dict[str, Any]:
     current = _prospective_contract(args)
     if current != approval.get("health_contract"):
-        raise ValueError("prospective convergence contract differs from approved health")
+        raise ValueError(
+            "prospective convergence contract differs from approved health"
+        )
     health_checkpoint = Path(str(approval["health_checkpoint_path"])).resolve()
     if args.pretrained.resolve() == health_checkpoint:
         raise ValueError("convergence must not initialize from the health checkpoint")
@@ -309,40 +401,221 @@ def queue_spec(args: argparse.Namespace, approval: Mapping[str, Any]) -> dict[st
                 "allowed_to": [args.attempt_id],
             }
         ],
+        "source_delta_sha256": approval["source_delta_sha256"],
         "wandb": {
             "entity": engine.WANDB_ENTITY,
             "project": engine.WANDB_PROJECT,
             "id": args.attempt_id,
             "resume": "never",
             "mode": "online",
+            "name": args.wandb_run_name,
+            "group": "task1-teammate-l05-veto-mps-convergence",
+            "job_type": "reviewed-mps-convergence-50e",
         },
         "external_final_accessed": False,
     }
 
 
-def _seal_completion(
-    args: argparse.Namespace, approval: Mapping[str, Any], base_index: Mapping[str, Any]
-) -> dict[str, Any]:
-    artifact_dir = args.artifact_root / args.attempt_id
+def _queue_receipt_path(args: argparse.Namespace) -> Path:
+    return _safe_path(
+        args.artifact_root / "queue_specs" / f"{args.attempt_id}.json",
+        "queue spec receipt",
+        require_absolute=False,
+    )
+
+
+def _bind_queue_receipt(
+    args: argparse.Namespace, spec: Mapping[str, Any], *, execute: bool
+) -> tuple[Path, str]:
+    path = _queue_receipt_path(args)
+    if execute:
+        if not path.is_file() or path.is_symlink():
+            raise FileNotFoundError(
+                "execute requires the immutable reviewed queue spec"
+            )
+        persisted = _read_json_object(path, "queue spec receipt")
+        if persisted != dict(spec):
+            raise ValueError("persisted queue spec differs from prospective execution")
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_once(path, dict(spec))
+    return path, sha256_file(path)
+
+
+def _validate_queue_approval(
+    path: Path, *, attempt_id: str, queue_spec_sha256: str
+) -> str:
+    resolved = _safe_path(path, "queue approval")
+    digest = sha256_file(resolved)
+    payload = _read_json_object(resolved, "queue approval")
     if (
-        base_index.get("status") != "completed"
+        set(payload)
+        != {
+            "schema_version",
+            "status",
+            "reviewer",
+            "attempt_id",
+            "queue_spec_sha256",
+            "external_final_accessed",
+        }
+        or payload.get("status") != "independently_reviewed_approved"
+        or not str(payload.get("reviewer", "")).strip()
+        or payload.get("attempt_id") != attempt_id
+        or payload.get("queue_spec_sha256") != queue_spec_sha256
+        or payload.get("external_final_accessed") is not False
+    ):
+        raise ValueError("queue approval does not authorize this exact spec")
+    return digest
+
+
+def _seal_completion(
+    args: argparse.Namespace,
+    approval: Mapping[str, Any],
+    base_index: Mapping[str, Any],
+    queue_receipt_sha256: str,
+) -> dict[str, Any]:
+    artifact_dir = _safe_path(
+        args.artifact_root / args.attempt_id, "convergence artifact root"
+    )
+    if (
+        set(base_index)
+        != {
+            "schema_version",
+            "attempt_id",
+            "phase",
+            "execution_family",
+            "status",
+            "artifacts",
+        }
+        or base_index.get("schema_version") != 1
+        or base_index.get("status") != "completed"
         or base_index.get("attempt_id") != args.attempt_id
         or base_index.get("phase") != "convergence_50e"
+        or base_index.get("execution_family") != "apple_mps_resource_adjusted"
     ):
         raise ValueError("base artifact index is not the completed convergence attempt")
     index_path = artifact_dir / "artifact_index.json"
-    persisted_index = json.loads(index_path.read_text(encoding="utf-8"))
+    persisted_index = _read_json_object(index_path, "base artifact index")
     if persisted_index != dict(base_index):
         raise ValueError("base artifact index bytes differ from returned index")
-    epochs_payload = json.loads(
-        (artifact_dir / "epochs.json").read_text(encoding="utf-8")
+    artifacts = persisted_index.get("artifacts")
+    expected_artifacts = set(CONVERGENCE_ARTIFACT_NAMES)
+    if not isinstance(artifacts, dict) or set(artifacts) != expected_artifacts:
+        raise ValueError("base artifact index does not seal the exact artifact set")
+    artifact_paths: dict[str, Path] = {}
+    for name in CONVERGENCE_ARTIFACT_NAMES:
+        path = _safe_path(artifact_dir / name, f"base artifact {name}")
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or sha256_file(path) != artifacts[name]
+        ):
+            raise ValueError(f"base indexed artifact bytes differ: {name}")
+        artifact_paths[name] = path
+    if sha256_file(args.health_approval) != approval["approval_sha256"]:
+        raise ValueError("health approval changed during convergence execution")
+    if sha256_file(_queue_receipt_path(args)) != queue_receipt_sha256:
+        raise ValueError("queue spec changed during convergence execution")
+    config = _read_json_object(artifact_paths["config.json"], "convergence config")
+    run_record = _read_json_object(
+        artifact_paths["run_record.json"], "convergence run record"
     )
+    if (
+        config.get("execution_receipt_sha256") != queue_receipt_sha256
+        or run_record.get("execution_receipt_sha256") != queue_receipt_sha256
+        or config.get("execution_approval_sha256") != args.execution_approval_sha256
+        or run_record.get("execution_approval_sha256") != args.execution_approval_sha256
+    ):
+        raise ValueError("base config/run record do not bind the queue receipt")
+    wandb = run_record.get("wandb_completion")
+    if (
+        not isinstance(wandb, dict)
+        or wandb.get("state") != "finished"
+        or wandb.get("identity_verified") is not True
+        or wandb.get("verification") != "wandb_api_post_finish"
+        or tuple(
+            wandb.get(key)
+            for key in ("entity", "project", "id", "name", "group", "job_type")
+        )
+        != (
+            engine.WANDB_ENTITY,
+            engine.WANDB_PROJECT,
+            args.attempt_id,
+            args.wandb_run_name,
+            engine.WANDB_GROUP,
+            engine.WANDB_JOB_TYPE,
+        )
+    ):
+        raise ValueError("durable W&B completion identity is invalid")
+    continuation = engine.torch.load(
+        artifact_paths[CONTINUATION_CHECKPOINT], map_location="cpu", weights_only=False
+    )
+    required_continuation = {
+        "model",
+        "optimizer",
+        "scheduler",
+        "completed_epochs",
+        "global_optimizer_updates",
+        "python_rng_state",
+        "numpy_rng_state",
+        "torch_rng_state",
+        "mps_rng_state",
+    }
+    scheduler = (
+        continuation.get("scheduler") if isinstance(continuation, dict) else None
+    )
+    if (
+        not isinstance(continuation, dict)
+        or set(continuation) != required_continuation
+        or not isinstance(continuation.get("model"), dict)
+        or not isinstance(continuation.get("optimizer"), dict)
+        or not isinstance(scheduler, dict)
+        or scheduler.get("kind") != "cosine"
+        or scheduler.get("warmup_epochs") != 5
+        or scheduler.get("initial_lr") != 5e-5
+        or scheduler.get("next_epoch") != EPOCHS
+        or not isinstance(scheduler.get("last_learning_rates"), list)
+        or not scheduler["last_learning_rates"]
+        or any(
+            not isinstance(value, (int, float)) or not math.isfinite(float(value))
+            for value in scheduler["last_learning_rates"]
+        )
+        or not isinstance(continuation.get("python_rng_state"), tuple)
+        or not isinstance(continuation.get("numpy_rng_state"), tuple)
+        or not isinstance(continuation.get("torch_rng_state"), engine.torch.Tensor)
+        or not isinstance(continuation.get("mps_rng_state"), engine.torch.Tensor)
+        or continuation.get("completed_epochs") != EPOCHS
+        or continuation.get("global_optimizer_updates")
+        != EPOCHS * engine.TRAIN_OPTIMIZER_STEPS
+    ):
+        raise ValueError("epoch-50 continuation state is incomplete")
+    epochs_payload = _read_json_object(artifact_paths["epochs.json"], "epochs")
     decision = convergence_decision(epochs_payload["epochs"], health_gate_passed=True)
     if decision["completed_epochs"] != EPOCHS or decision["final_epoch"] != EPOCHS:
         raise ValueError("completion sealing requires exact contiguous 50 epochs")
     write_json_once(artifact_dir / "convergence_decision.json", decision)
-    handoff = {
+    final = {
         "schema_version": 2,
+        "attempt_id": args.attempt_id,
+        "phase": "convergence_50e",
+        "status": "completed_pending_independent_review",
+        "base_artifact_index_sha256": sha256_file(index_path),
+        "health_approval_sha256": approval["approval_sha256"],
+        "queue_spec_sha256": queue_receipt_sha256,
+        "queue_approval_sha256": args.execution_approval_sha256,
+        "config_sha256": artifacts["config.json"],
+        "run_record_sha256": artifacts["run_record.json"],
+        "best_checkpoint_sha256": artifacts["best_checkpoint.pth"],
+        "continuation_checkpoint_sha256": artifacts[CONTINUATION_CHECKPOINT],
+        "convergence_decision_sha256": sha256_file(
+            artifact_dir / "convergence_decision.json"
+        ),
+        "auto_launched_150": False,
+        "external_final_accessed": False,
+    }
+    write_json_once(artifact_dir / "convergence_index.json", final)
+    handoff = {
+        "schema_version": 3,
         "selection_issue": 95,
         "review_state": "pending_independent_review",
         "reviewer": None,
@@ -353,28 +626,18 @@ def _seal_completion(
         "selection_receipt_sha256": sha256_file(
             artifact_dir / "convergence_decision.json"
         ),
+        "base_artifact_index_sha256": final["base_artifact_index_sha256"],
+        "convergence_index_sha256": sha256_file(
+            artifact_dir / "convergence_index.json"
+        ),
+        "config_sha256": final["config_sha256"],
+        "best_checkpoint_sha256": final["best_checkpoint_sha256"],
+        "continuation_checkpoint_sha256": final["continuation_checkpoint_sha256"],
         "initialization_policy": "fresh_from_reviewed_pretrained",
         "external_final_accessed": False,
         "launch_eligible": False,
     }
     write_json_once(artifact_dir / "issue93_champion_handoff.pending.json", handoff)
-    final = {
-        "schema_version": 1,
-        "attempt_id": args.attempt_id,
-        "phase": "convergence_50e",
-        "status": "completed_pending_independent_review",
-        "base_artifact_index_sha256": sha256_file(index_path),
-        "health_approval_sha256": sha256_file(args.health_approval),
-        "convergence_decision_sha256": sha256_file(
-            artifact_dir / "convergence_decision.json"
-        ),
-        "issue93_handoff_sha256": sha256_file(
-            artifact_dir / "issue93_champion_handoff.pending.json"
-        ),
-        "auto_launched_150": False,
-        "external_final_accessed": False,
-    }
-    write_json_once(artifact_dir / "convergence_index.json", final)
     return final
 
 
@@ -382,34 +645,97 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     raw = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--health-approval", type=Path, required=True)
+    parser.add_argument("--queue-approval", type=Path)
     extra, _ = parser.parse_known_args(raw)
-    health_index = raw.index("--health-approval")
-    engine_argv = raw[:health_index] + raw[health_index + 2 :]
+    engine_argv = list(raw)
+    for option in ("--health-approval", "--queue-approval"):
+        if option in engine_argv:
+            index = engine_argv.index(option)
+            del engine_argv[index : index + 2]
     args = engine.parse_args(engine_argv)
-    args.health_approval = extra.health_approval
-    args.raw_argv = [item for item in raw if item != "--execute"]
+    args.health_approval = _safe_path(extra.health_approval, "health approval")
+    args.queue_approval = (
+        _safe_path(extra.queue_approval, "queue approval")
+        if extra.queue_approval is not None
+        else None
+    )
+    raw_spec = list(raw)
+    if "--queue-approval" in raw_spec:
+        index = raw_spec.index("--queue-approval")
+        del raw_spec[index : index + 2]
+    args.raw_argv = [item for item in raw_spec if item != "--execute"]
+    health_default = f"task1-teammate-l05-veto-mps-health-{args.attempt_id}"
+    if args.wandb_run_name == health_default:
+        args.wandb_run_name = (
+            f"task1-teammate-l05-veto-mps-convergence-50e-{args.attempt_id}"
+        )
     return args
+
+
+def _write_convergence_failure(
+    args: argparse.Namespace, error: BaseException, stage: str
+) -> None:
+    artifact_dir = args.artifact_root / args.attempt_id
+    if not artifact_dir.is_dir():
+        return
+    receipt = {
+        "schema_version": 1,
+        "attempt_id": args.attempt_id,
+        "phase": "convergence_50e_sealing",
+        "status": "failed",
+        "stage": stage,
+        "error_type": type(error).__name__,
+        "signal": error.signal_name
+        if isinstance(error, engine.RunInterrupted)
+        else None,
+        "external_final_accessed": False,
+    }
+    path = artifact_dir / "convergence_failure.json"
+    if not path.exists():
+        write_json_once(path, receipt)
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     approval = validate_health_approval(args.health_approval, args.attempt_id)
     validate_convergence_contract(args, approval)
     spec = queue_spec(args, approval)
+    queue_path, queue_sha256 = _bind_queue_receipt(
+        args, spec, execute=bool(args.execute)
+    )
     if not args.execute:
         return {
             "status": "dry_run",
             "review_required": True,
             "protocol": "fresh_50e",
             "queue_spec": spec,
+            "queue_spec_path": str(queue_path),
+            "queue_spec_sha256": queue_sha256,
+            "launch_approved": False,
         }
+    if args.queue_approval is None:
+        raise ValueError("execute requires an independent exact queue approval")
+    args.execution_approval_sha256 = _validate_queue_approval(
+        args.queue_approval,
+        attempt_id=args.attempt_id,
+        queue_spec_sha256=queue_sha256,
+    )
     engine.EPOCHS = EPOCHS
     engine.PHASE = "convergence_50e"
     engine.ISSUE_URL = ISSUE_URL
     engine.WANDB_GROUP = "task1-teammate-l05-veto-mps-convergence"
     engine.WANDB_JOB_TYPE = "reviewed-mps-convergence-50e"
-    engine.MPS_ARTIFACT_NAMES = tuple(engine.MPS_ARTIFACT_NAMES)
-    base = engine.run(args)
-    return _seal_completion(args, approval, base)
+    engine.MPS_ARTIFACT_NAMES = CONVERGENCE_ARTIFACT_NAMES
+    args.execution_receipt_sha256 = queue_sha256
+    args.require_wandb_completion_verification = True
+    previous_handlers = engine._install_interrupt_handlers()
+    try:
+        base = engine.run(args)
+        return _seal_completion(args, approval, base, queue_sha256)
+    except BaseException as error:
+        _write_convergence_failure(args, error, "engine_or_convergence_finalization")
+        raise
+    finally:
+        engine._restore_interrupt_handlers(previous_handlers)
 
 
 def main(argv: list[str] | None = None) -> int:
