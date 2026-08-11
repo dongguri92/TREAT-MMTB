@@ -56,7 +56,7 @@ def _cli(tmp_path: Path) -> list[str]:
 
 def test_mps_protocol_is_distinct_and_preregistered() -> None:
     protocol = mps.mps_protocol_contract()
-    assert protocol["execution_family"] == "apple_mps_resource_adjusted"
+    assert protocol["execution_family"] == mps.EXECUTION_FAMILY
     assert protocol["historical_cuda_equivalence_claimed"] is False
     assert protocol["target_size"] == 1024
     assert protocol["physical_batch_size"] == 1
@@ -809,6 +809,7 @@ def _mock_successful_optimizer_probe(
         lambda *_args: {
             "parameter_dtypes": ["torch.float32"],
             "optimizer_state_dtypes": ["torch.float32"],
+            "optimizer_state_tensor_count": 2,
         },
     )
     monkeypatch.setattr(training, "_autocast_context", lambda *_args: training._nullctx())
@@ -890,6 +891,97 @@ def test_mps_bf16_request_fails_closed_when_unavailable(
         training._autocast_context(
             training.torch.device("mps"), True, training.torch.float16
         )
+    with pytest.raises(RuntimeError, match="cannot disable autocast"):
+        training._autocast_context(
+            training.torch.device("mps"), False, training.torch.bfloat16
+        )
+
+
+def test_empty_adamw_master_state_fails_closed() -> None:
+    model = mps.torch.nn.Linear(2, 1)
+    optimizer = mps.torch.optim.AdamW(model.parameters())
+    with pytest.raises(RuntimeError, match="observed AdamW master state"):
+        mps._validate_fp32_master_state(model, optimizer)
+
+
+@pytest.mark.parametrize(
+    ("device_type", "amp_dtype", "loss_inside_autocast"),
+    [("cuda", None, True), ("mps", training.torch.bfloat16, False)],
+)
+def test_loss_autocast_boundary_is_scoped_to_explicit_mps_bf16(
+    monkeypatch: pytest.MonkeyPatch,
+    device_type: str,
+    amp_dtype: object,
+    loss_inside_autocast: bool,
+) -> None:
+    active = False
+
+    class Context:
+        def __enter__(self) -> None:
+            nonlocal active
+            active = True
+
+        def __exit__(self, *_args: object) -> None:
+            nonlocal active
+            active = False
+
+    class Tensor:
+        def to(self, *_args: object, **_kwargs: object) -> "Tensor":
+            return self
+
+    class Loss:
+        def __add__(self, _other: object) -> "Loss":
+            return self
+
+        def __rmul__(self, _other: object) -> "Loss":
+            return self
+
+        def __truediv__(self, _other: object) -> "Loss":
+            return self
+
+        def backward(self) -> None:
+            return None
+
+        def detach(self) -> "Loss":
+            return self
+
+        def item(self) -> float:
+            return 1.0
+
+    class Model:
+        return_cls = False
+
+        def __call__(self, _image: Tensor) -> tuple[Tensor, Tensor]:
+            return Tensor(), Tensor()
+
+        def parameters(self) -> list[object]:
+            return []
+
+    class Optimizer:
+        def step(self) -> None:
+            return None
+
+        def zero_grad(self, **_kwargs: object) -> None:
+            return None
+
+    def loss_fn(*_args: object) -> Loss:
+        assert active is loss_inside_autocast
+        return Loss()
+
+    monkeypatch.setattr(training, "_autocast_context", lambda *_args: Context())
+    monkeypatch.setattr(training.torch.nn, "BCEWithLogitsLoss", lambda: loss_fn)
+    monkeypatch.setattr(training.torch.nn.utils, "clip_grad_norm_", lambda *_a: None)
+    training.accumulated_train_step(
+        Model(),
+        [{"image": Tensor(), "mask": Tensor(), "cls": Tensor()}],
+        Optimizer(),
+        loss_fn,
+        0.5,
+        SimpleNamespace(type=device_type),
+        use_amp=True,
+        accumulation=1,
+        amp_dtype=amp_dtype,
+    )
 
 
 def test_no_wandb_acceptance_soak_covers_full_lifecycle(

@@ -108,6 +108,14 @@ def _fp32_for_loss(value):
     return value.float() if isinstance(value, torch.Tensor) else value
 
 
+def _is_explicit_mps_bf16(device, use_amp, amp_dtype):
+    return (
+        use_amp
+        and device.type == 'mps'
+        and amp_dtype is torch.bfloat16
+    )
+
+
 def accumulated_train_step(
     model,
     batches,
@@ -154,23 +162,36 @@ def accumulated_train_step(
         img = batch['image'].to(device, non_blocking=True)
         mask = batch['mask'].to(device, non_blocking=True)
         cls = batch['cls'].to(device, non_blocking=True)
+        explicit_mps_bf16 = _is_explicit_mps_bf16(
+            device, use_amp, amp_dtype
+        )
         with _autocast_context(device, use_amp, amp_dtype):
             model.return_cls = True
             if stage_callback is not None:
                 stage_callback("forward")
             seg_out, cls_logit = model(img)
-        if stage_callback is not None:
-            stage_callback("loss")
-        # Loss math is deliberately outside autocast and uses FP32 outputs.
-        loss_seg_out = (
-            [_fp32_for_loss(value) for value in seg_out]
-            if isinstance(seg_out, (list, tuple))
-            else _fp32_for_loss(seg_out)
-        )
-        l_seg = _seg_loss_on_output(loss_seg_out, mask, seg_loss_fn)
-        l_cls = bce(_fp32_for_loss(cls_logit), _fp32_for_loss(cls))
-        loss = l_seg + lambda_cls * l_cls
-        backward_loss = loss / accumulation
+            if not explicit_mps_bf16:
+                # Preserve the legacy CUDA/full-precision loss boundary.
+                if stage_callback is not None:
+                    stage_callback("loss")
+                l_seg = _seg_loss_on_output(seg_out, mask, seg_loss_fn)
+                l_cls = bce(cls_logit, cls)
+                loss = l_seg + lambda_cls * l_cls
+                backward_loss = loss / accumulation
+        if explicit_mps_bf16:
+            if stage_callback is not None:
+                stage_callback("loss")
+            # Only the explicit MPS BF16 ablation promotes loss inputs and
+            # computes loss outside autocast.
+            loss_seg_out = (
+                [_fp32_for_loss(value) for value in seg_out]
+                if isinstance(seg_out, (list, tuple))
+                else _fp32_for_loss(seg_out)
+            )
+            l_seg = _seg_loss_on_output(loss_seg_out, mask, seg_loss_fn)
+            l_cls = bce(_fp32_for_loss(cls_logit), _fp32_for_loss(cls))
+            loss = l_seg + lambda_cls * l_cls
+            backward_loss = loss / accumulation
         if scaler is not None:
             if stage_callback is not None:
                 stage_callback("backward")
@@ -326,15 +347,21 @@ def validation_step(model, batch, seg_loss_fn, lambda_cls, device,
     img = batch['image'].to(device, non_blocking=True)
     mask = batch['mask'].to(device, non_blocking=True)
     cls = batch['cls'].to(device, non_blocking=True)
+    explicit_mps_bf16 = _is_explicit_mps_bf16(device, use_amp, amp_dtype)
     with _autocast_context(device, use_amp, amp_dtype):
         model.return_cls = True
         if stage_callback is not None:
             stage_callback('forward')
         seg_out, cls_logit = model(img)
         seg_main = seg_out[0] if isinstance(seg_out, (list, tuple)) else seg_out
-    l_seg = seg_loss_fn(_fp32_for_loss(seg_main), mask)
-    l_cls = bce(_fp32_for_loss(cls_logit), _fp32_for_loss(cls))
-    loss = l_seg + lambda_cls * l_cls
+        if not explicit_mps_bf16:
+            l_seg = seg_loss_fn(seg_main, mask)
+            l_cls = bce(cls_logit, cls)
+            loss = l_seg + lambda_cls * l_cls
+    if explicit_mps_bf16:
+        l_seg = seg_loss_fn(_fp32_for_loss(seg_main), mask)
+        l_cls = bce(_fp32_for_loss(cls_logit), _fp32_for_loss(cls))
+        loss = l_seg + lambda_cls * l_cls
     if stage_callback is not None:
         stage_callback('loss_item')
     loss_value = loss.item()
@@ -613,6 +640,8 @@ def _nullctx():
 
 def _autocast_context(device, enabled, amp_dtype=None):
     """Return an explicit autocast context; unsupported requests fail closed."""
+    if amp_dtype is torch.bfloat16 and device.type == 'mps' and not enabled:
+        raise RuntimeError('explicit MPS BF16 cannot disable autocast')
     if not enabled:
         return _nullctx()
     # Preserve the pre-existing non-CUDA full-precision behavior unless a

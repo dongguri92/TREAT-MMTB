@@ -130,6 +130,7 @@ def _write_valid_gate(tmp_path: Path, attempt_id: str) -> Path:
             "master_state": {
                 "parameter_dtypes": ["torch.float32"],
                 "optimizer_state_dtypes": ["torch.float32"],
+                "optimizer_state_tensor_count": 2,
             },
             "critical_memory": {
                 "phase": "backward_complete_pre_adamw_memory",
@@ -223,6 +224,11 @@ def _write_valid_gate(tmp_path: Path, attempt_id: str) -> Path:
                 "cleanup": {"status": "passed", "errors": [], **memory()},
             },
             "acceptance_soak": {
+                "precision": mps_evidence.BF16_PRECISION_CONTRACT,
+                "precision_runtime": {
+                    **mps_evidence.BF16_PRECISION_CONTRACT,
+                    "runtime_probe": "passed",
+                },
                 "status": "passed",
                 "completed_optimizer_updates": 76,
                 "completed_micro_steps": 608,
@@ -341,6 +347,11 @@ def _write_valid_science(tmp_path: Path, attempt_id: str) -> Path:
     baseline_score_sha = "d" * 64
     baseline_record_sha = "e" * 64
     config = {
+        "precision": mps_evidence.BF16_PRECISION_CONTRACT,
+        "protocol": {
+            "execution_family": mps_evidence.EXECUTION_FAMILY,
+            "precision": mps_evidence.BF16_PRECISION_CONTRACT,
+        },
         "resource_gate_receipt_sha256": gate_receipt_sha,
         "baseline": {
             "score_sha256": baseline_score_sha,
@@ -350,6 +361,14 @@ def _write_valid_science(tmp_path: Path, attempt_id: str) -> Path:
     }
     _write_json(tmp_path / "config.json", config)
     _write_json(tmp_path / "resource_evidence.json", {
+        "precision": mps_evidence.BF16_PRECISION_CONTRACT,
+        "acceptance_soak": {
+            "precision": mps_evidence.BF16_PRECISION_CONTRACT,
+            "precision_runtime": {
+                **mps_evidence.BF16_PRECISION_CONTRACT,
+                "runtime_probe": "passed",
+            },
+        },
         "pretrained_sha256": "b" * 64,
         "canonical_case_sha256": canonical_cases,
         "baseline_score_sha256": baseline_score_sha,
@@ -367,7 +386,12 @@ def _write_valid_science(tmp_path: Path, attempt_id: str) -> Path:
         }
         for epoch in range(1, 6)
     ]})
-    _write_json(tmp_path / "score.json", {"selected_epoch": 3, "metrics": metrics})
+    _write_json(tmp_path / "score.json", {
+        "execution_family": mps_evidence.EXECUTION_FAMILY,
+        "precision": mps_evidence.BF16_PRECISION_CONTRACT,
+        "selected_epoch": 3,
+        "metrics": metrics,
+    })
     cases = [
         {
             "case_id": case_id,
@@ -403,6 +427,8 @@ def _write_valid_science(tmp_path: Path, attempt_id: str) -> Path:
     })
     checkpoint_receipt = {
         "attempt_id": attempt_id, "selected_epoch": 3,
+        "execution_family": mps_evidence.EXECUTION_FAMILY,
+        "precision": mps_evidence.BF16_PRECISION_CONTRACT,
         "source_git_commit": source["git_commit"],
         "config_sha256": bootstrap._sha256_file(tmp_path / "config.json"),
         "resource_evidence_sha256": bootstrap._sha256_file(
@@ -437,6 +463,8 @@ def _write_valid_science(tmp_path: Path, attempt_id: str) -> Path:
         run_record,
         {
             "status": "completed",
+            "execution_family": mps_evidence.EXECUTION_FAMILY,
+            "precision": mps_evidence.BF16_PRECISION_CONTRACT,
             "wandb_finished": True,
             "external_final_test_untouched": True,
             "completed_epochs": 5,
@@ -466,6 +494,8 @@ def _write_valid_science(tmp_path: Path, attempt_id: str) -> Path:
             "schema_version": 1,
             "attempt_id": attempt_id,
             "status": "completed",
+            "execution_family": mps_evidence.EXECUTION_FAMILY,
+            "precision": mps_evidence.BF16_PRECISION_CONTRACT,
             "artifacts": {
                 name: bootstrap._sha256_file(tmp_path / name)
                 for name in artifacts
@@ -481,6 +511,8 @@ def _independent_science(tmp_path: Path, attempt_id: str) -> dict[str, Any]:
     metadata = {
         "native_epoch": score["selected_epoch"] - 1,
         "selected_epoch": score["selected_epoch"],
+        "execution_family": mps_evidence.EXECUTION_FAMILY,
+        "precision": mps_evidence.BF16_PRECISION_CONTRACT,
         "native_best_metric": score["metrics"]["weighted_composite"],
         "selected_weighted_composite": score["metrics"]["weighted_composite"],
         "model_keys": ["weight"],
@@ -967,6 +999,29 @@ def test_gate_rejects_precision_contract_drift_after_rehash(
     ) == (False, None, None)
 
 
+@pytest.mark.parametrize("mutation", ["delete", "drift"])
+def test_gate_rejects_acceptance_soak_precision_tampering_after_rehash(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    path = _write_valid_gate(tmp_path, "sealed-attempt")
+    resource_path = tmp_path / "resource_evidence.json"
+    resource = json.loads(resource_path.read_text())
+    if mutation == "delete":
+        del resource["acceptance_soak"]["precision"]
+    else:
+        resource["acceptance_soak"]["precision_runtime"][
+            "autocast_dtype"
+        ] = "float16"
+    _write_json(resource_path, resource)
+    index = json.loads(path.read_text())
+    index["resource_evidence_sha256"] = bootstrap._sha256_file(resource_path)
+    _write_json(path, index)
+    assert bootstrap._validate_child_completion(
+        path, "resource_gate", "sealed-attempt", 0, 0.1
+    ) == (False, None, None)
+
+
 def test_gate_rejects_minimal_feasibility_summary_after_rehash(
     tmp_path: Path,
 ) -> None:
@@ -1037,6 +1092,29 @@ def test_science_rejects_rehashed_raw_case_forgery(tmp_path: Path) -> None:
     _write_json(path, index)
     assert bootstrap._validate_child_completion(
         path, "scientific_run", "sealed-attempt", 0, 0.1
+    ) == (False, None, None)
+
+
+def test_science_rejects_execution_family_drift_after_rehash(
+    tmp_path: Path,
+) -> None:
+    path = _write_valid_science(tmp_path, "sealed-attempt")
+    score_path = tmp_path / "score.json"
+    score = json.loads(score_path.read_text())
+    score["execution_family"] = "apple_mps_resource_adjusted"
+    _write_json(score_path, score)
+    index = json.loads(path.read_text())
+    index["artifacts"]["score.json"] = bootstrap._sha256_file(score_path)
+    _write_json(path, index)
+    assert bootstrap._validate_child_completion(
+        path,
+        "scientific_run",
+        "sealed-attempt",
+        0,
+        0.1,
+        independent_scientific_verification=_independent_science(
+            tmp_path, "sealed-attempt"
+        ),
     ) == (False, None, None)
 
 

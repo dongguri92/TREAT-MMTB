@@ -52,6 +52,7 @@ BF16_PRECISION_CONTRACT = {
     "gradient_scaler": False,
     "fallback_policy": "fail_closed",
 }
+EXECUTION_FAMILY = "apple_mps_bf16_resource_adjusted"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
@@ -218,11 +219,17 @@ def _validate_raw_gate_rows(
             or update.get("finite_losses") is not True
             or update.get("gradient_clip_completed") is not True
             or update.get("precision") != BF16_PRECISION_CONTRACT
-            or update.get("master_state")
-            != {
-                "parameter_dtypes": ["torch.float32"],
-                "optimizer_state_dtypes": ["torch.float32"],
-            }
+            or update.get("master_state", {}).get("parameter_dtypes")
+            != ["torch.float32"]
+            or update.get("master_state", {}).get("optimizer_state_dtypes")
+            != ["torch.float32"]
+            or not isinstance(
+                update.get("master_state", {}).get(
+                    "optimizer_state_tensor_count"
+                ),
+                int,
+            )
+            or update["master_state"]["optimizer_state_tensor_count"] < 1
             or not isinstance(identities, list)
             or len(identities) != GRADIENT_ACCUMULATION_STEPS
             or len(set(identities)) != GRADIENT_ACCUMULATION_STEPS
@@ -245,10 +252,14 @@ def _validate_raw_gate_rows(
     probe_optimizer = probe.get("optimizer")
     sealed_loader_start = bootstrap.get("loader_start")
     probe_loader_components = probe.get("loader_start_components")
+    soak = resource.get("acceptance_soak", {})
     if (
         resource.get("precision") != BF16_PRECISION_CONTRACT
         or probe.get("precision") != BF16_PRECISION_CONTRACT
         or probe.get("precision_runtime")
+        != {**BF16_PRECISION_CONTRACT, "runtime_probe": "passed"}
+        or soak.get("precision") != BF16_PRECISION_CONTRACT
+        or soak.get("precision_runtime")
         != {**BF16_PRECISION_CONTRACT, "runtime_probe": "passed"}
         or probe.get("status") != "passed"
         or probe.get("probe") != FEASIBILITY_PROBE
@@ -476,6 +487,8 @@ def validate_gate_artifacts(
         "minimum_headroom_ratio": recomputed_minimum,
         "bootstrap_proof_sha256": bootstrap_sha256,
         "supervisor_progress_sha256": progress_sha256,
+        "execution_family": EXECUTION_FAMILY,
+        "precision": BF16_PRECISION_CONTRACT,
     }
 
 
@@ -565,6 +578,8 @@ def validate_scientific_artifacts(
         index.get("schema_version") != 1
         or index.get("attempt_id") != attempt_id
         or index.get("status") != "completed"
+        or index.get("execution_family") != EXECUTION_FAMILY
+        or index.get("precision") != BF16_PRECISION_CONTRACT
         or not isinstance(artifacts, dict)
         or set(artifacts) != SCIENCE_ARTIFACTS
     ):
@@ -590,7 +605,17 @@ def validate_scientific_artifacts(
         key: value for key, value in bootstrap.items() if key != "proof_sha256"
     }
     if (
-        _require_sha256(bootstrap_sha, "scientific bootstrap proof")
+        config.get("precision") != BF16_PRECISION_CONTRACT
+        or config.get("protocol", {}).get("precision")
+        != BF16_PRECISION_CONTRACT
+        or config.get("protocol", {}).get("execution_family")
+        != EXECUTION_FAMILY
+        or resource.get("precision") != BF16_PRECISION_CONTRACT
+        or resource.get("acceptance_soak", {}).get("precision")
+        != BF16_PRECISION_CONTRACT
+        or resource.get("acceptance_soak", {}).get("precision_runtime")
+        != {**BF16_PRECISION_CONTRACT, "runtime_probe": "passed"}
+        or _require_sha256(bootstrap_sha, "scientific bootstrap proof")
         != canonical_sha256(bootstrap_body)
         or (
             expected_bootstrap_proof_sha256 is not None
@@ -830,6 +855,10 @@ def validate_scientific_artifacts(
     wandb = run_record.get("wandb", {})
     if (
         run_record.get("status") != "completed"
+        or run_record.get("execution_family") != EXECUTION_FAMILY
+        or run_record.get("precision") != BF16_PRECISION_CONTRACT
+        or score.get("execution_family") != EXECUTION_FAMILY
+        or score.get("precision") != BF16_PRECISION_CONTRACT
         or run_record.get("wandb_finished") is not True
         or run_record.get("external_final_test_untouched") is not True
         or run_record.get("completed_epochs") != 5
@@ -848,6 +877,8 @@ def validate_scientific_artifacts(
     checkpoint_sha256 = sha256_file(science_dir / "best_checkpoint.pth")
     if (
         checkpoint_receipt.get("attempt_id") != attempt_id
+        or checkpoint_receipt.get("execution_family") != EXECUTION_FAMILY
+        or checkpoint_receipt.get("precision") != BF16_PRECISION_CONTRACT
         or checkpoint_receipt.get("selected_epoch") != selected_epoch
         or checkpoint_receipt.get("source_git_commit") != source.get("git_commit")
         or checkpoint_receipt.get("config_sha256")
@@ -905,6 +936,8 @@ def validate_scientific_artifacts(
         not isinstance(checkpoint_metadata, dict)
         or checkpoint_metadata.get("native_epoch") != selected_epoch - 1
         or checkpoint_metadata.get("selected_epoch") != selected_epoch
+        or checkpoint_metadata.get("execution_family") != EXECUTION_FAMILY
+        or checkpoint_metadata.get("precision") != BF16_PRECISION_CONTRACT
         or not _same_number(
             checkpoint_metadata.get("native_best_metric"),
             metrics.get("weighted_composite"),

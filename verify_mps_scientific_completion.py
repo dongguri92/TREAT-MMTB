@@ -10,7 +10,11 @@ from typing import Any
 import torch
 import wandb
 
-from reproduce_teammate_l05_mps import _wandb_public_config
+from reproduce_teammate_l05_mps import (
+    BF16_PRECISION_CONTRACT,
+    EXECUTION_FAMILY,
+    _wandb_public_config,
+)
 from reproduction import (
     WANDB_ENTITY,
     WANDB_PROJECT,
@@ -93,6 +97,8 @@ def verify(
     expected_reproduction = {
         "attempt_id": attempt_id,
         "selected_epoch": score["selected_epoch"],
+        "execution_family": EXECUTION_FAMILY,
+        "precision": BF16_PRECISION_CONTRACT,
         "source": read_json(science_dir / "source.json"),
         "config_sha256": sha256_file(science_dir / "config.json"),
         "resource_evidence_sha256": sha256_file(
@@ -106,6 +112,10 @@ def verify(
         or checkpoint_receipt.get("checkpoint_sha256") != sha256_file(checkpoint_path)
     ):
         raise ValueError("checkpoint embedded reproduction metadata is invalid")
+    checkpoint_metadata.update({
+        "execution_family": EXECUTION_FAMILY,
+        "precision": BF16_PRECISION_CONTRACT,
+    })
 
     remote = wandb.Api(timeout=30).run(
         f"{WANDB_ENTITY}/{WANDB_PROJECT}/{attempt_id}"

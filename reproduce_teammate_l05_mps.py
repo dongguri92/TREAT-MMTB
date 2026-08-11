@@ -71,6 +71,7 @@ MPS_RESOURCE_CONTRACT_PATH = REPO_ROOT / "mps_resource_contract.json"
 MPS_BOOTSTRAP_PATH = REPO_ROOT / "reproduce_teammate_l05_mps_bootstrap.py"
 ISSUE_URL = "https://github.com/choco9966/TREAT-MMTB-2026/issues/106"
 PARENT_ISSUE_URL = "https://github.com/choco9966/TREAT-MMTB-2026/issues/95"
+EXECUTION_FAMILY = "apple_mps_bf16_resource_adjusted"
 EPOCHS = 5
 TARGET_SIZE = 1024
 PHYSICAL_BATCH_SIZE = 1
@@ -164,7 +165,7 @@ def mps_protocol_contract() -> dict[str, Any]:
     return {
         "phase": "health",
         "epochs": EPOCHS,
-        "execution_family": "apple_mps_resource_adjusted",
+        "execution_family": EXECUTION_FAMILY,
         "historical_cuda_equivalence_claimed": False,
         "model": "evax_seg",
         "variant": "small",
@@ -268,19 +269,23 @@ def _validate_fp32_master_state(
     parameter_dtypes = {
         str(parameter.dtype) for parameter in model.parameters()
     }
-    state_dtypes = {
-        str(value.dtype)
+    state_tensors = [
+        value
         for state in optimizer.state.values()
         for value in state.values()
         if isinstance(value, torch.Tensor) and value.is_floating_point()
-    }
+    ]
+    state_dtypes = {str(value.dtype) for value in state_tensors}
     if parameter_dtypes != {"torch.float32"}:
         raise RuntimeError("BF16 soak requires FP32 master parameters")
-    if state_dtypes and state_dtypes != {"torch.float32"}:
+    if not state_tensors:
+        raise RuntimeError("BF16 soak requires observed AdamW master state")
+    if state_dtypes != {"torch.float32"}:
         raise RuntimeError("BF16 soak requires FP32 AdamW master state")
     return {
         "parameter_dtypes": sorted(parameter_dtypes),
-        "optimizer_state_dtypes": sorted(state_dtypes or {"torch.float32"}),
+        "optimizer_state_dtypes": sorted(state_dtypes),
+        "optimizer_state_tensor_count": len(state_tensors),
     }
 
 
@@ -1780,6 +1785,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         checkpoint["reproduction"] = {
             "attempt_id": args.attempt_id,
             "selected_epoch": details["best_epoch"],
+            "execution_family": EXECUTION_FAMILY,
+            "precision": protocol["precision"],
             "source": source,
             "config_sha256": sha256_file(artifact_dir / "config.json"),
             "resource_evidence_sha256": resource_sha256,
@@ -1791,6 +1798,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "schema_version": 1,
             "attempt_id": args.attempt_id,
             "selected_epoch": details["best_epoch"],
+            "execution_family": EXECUTION_FAMILY,
+            "precision": protocol["precision"],
             "source_git_commit": source["git_commit"],
             "config_sha256": sha256_file(artifact_dir / "config.json"),
             "resource_evidence_sha256": resource_sha256,
@@ -1813,7 +1822,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "parent_issue_url": PARENT_ISSUE_URL,
             "attempt_id": args.attempt_id,
             "phase": "health",
-            "execution_family": "apple_mps_resource_adjusted",
+            "execution_family": EXECUTION_FAMILY,
+            "precision": protocol["precision"],
             "historical_cuda_equivalence_claimed": False,
             "dataset_scope": DATASET_SCOPE,
             "external_final_test_untouched": True,
@@ -1873,7 +1883,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "parent_issue_url": PARENT_ISSUE_URL,
             "attempt_id": args.attempt_id,
             "phase": "health",
-            "execution_family": "apple_mps_resource_adjusted",
+            "execution_family": EXECUTION_FAMILY,
+            "precision": protocol["precision"],
             "historical_cuda_equivalence_claimed": False,
             "status": "completed",
             "reviewed_by": args.reviewed_by,
@@ -1904,7 +1915,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "schema_version": 1,
             "attempt_id": args.attempt_id,
             "phase": "health",
-            "execution_family": "apple_mps_resource_adjusted",
+            "execution_family": EXECUTION_FAMILY,
+            "precision": protocol["precision"],
             "status": "completed",
             "artifacts": {
                 name: sha256_file(artifact_dir / name)
