@@ -141,14 +141,16 @@ def source_identity(repo_root: Path | str) -> dict[str, str]:
 
 def reject_external_final_path(path: Path | str, label: str) -> None:
     """Reject a lexically forbidden path without touching the filesystem."""
-    if ".." in Path(path).parts:
+    parts = Path(path).parts
+    if ".." in parts:
         raise ValueError(f"{label} must not contain path traversal")
-    normalized = [
-        "".join(ch if ch.isalnum() else "_" for ch in part.lower())
-        for part in Path(path).parts
+    normalized = ["".join(ch for ch in part.lower() if ch.isalnum()) for part in parts]
+    ancestry = normalized + [
+        normalized[index] + normalized[index + 1]
+        for index in range(len(normalized) - 1)
     ]
-    forbidden = re.compile(r"external_final|external_test|final_test|test_final")
-    if any(forbidden.search(part) for part in normalized):
+    forbidden = re.compile(r"external(?:final|test)|(?:final|test)(?:test|final)")
+    if any(forbidden.search(component) for component in ancestry):
         raise ValueError(f"{label} must not reference the external final test")
 
 

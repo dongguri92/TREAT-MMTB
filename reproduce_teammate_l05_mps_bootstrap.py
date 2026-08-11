@@ -34,7 +34,7 @@ CANONICAL_MANIFEST_SHA256 = (
     "98484d6d96b9f6898393331d0493fa4d22ed6af0057b29210e14d32be7d5aef8"
 )
 SAFE_ATTEMPT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
-PROTECTED_PATH_RE = re.compile(r"external_final|external_test|final_test|test_final")
+PROTECTED_PATH_RE = re.compile(r"external(?:final|test)|(?:final|test)(?:test|final)")
 
 
 def _reject_unsafe_attempt(attempt_id: str) -> None:
@@ -47,10 +47,14 @@ def _reject_protected_path(path: Path | str, label: str) -> None:
     if ".." in candidate.parts:
         raise ValueError(f"{label} must not contain path traversal")
     normalized = [
-        "".join(ch if ch.isalnum() else "_" for ch in part.lower())
+        "".join(ch for ch in part.lower() if ch.isalnum())
         for part in candidate.parts
     ]
-    if any(PROTECTED_PATH_RE.search(part) for part in normalized):
+    ancestry = normalized + [
+        normalized[index] + normalized[index + 1]
+        for index in range(len(normalized) - 1)
+    ]
+    if any(PROTECTED_PATH_RE.search(component) for component in ancestry):
         raise ValueError(f"{label} must not reference the external final test")
 
 

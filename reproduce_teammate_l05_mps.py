@@ -745,20 +745,50 @@ def _run_mps_optimizer_probe(
             evidence["heartbeat_sha256"] = sha256_file(cast(Path, heartbeat_path))
         return evidence
     except BaseException as error:
+        evidence_errors: list[dict[str, str]] = []
+
+        def record_evidence_error(
+            evidence_stage: str, evidence_error: BaseException
+        ) -> None:
+            evidence_errors.append(
+                {
+                    "stage": evidence_stage,
+                    "error_type": type(evidence_error).__name__,
+                }
+            )
+
         if heartbeat_stream is not None:
-            heartbeat_stream.flush()
-            os.fsync(heartbeat_stream.fileno())
-            evidence["heartbeat_sha256"] = sha256_file(cast(Path, heartbeat_path))
+            try:
+                heartbeat_stream.flush()
+            except BaseException as evidence_error:
+                record_evidence_error("failure_heartbeat_flush", evidence_error)
+            try:
+                os.fsync(heartbeat_stream.fileno())
+            except BaseException as evidence_error:
+                record_evidence_error("failure_heartbeat_fsync", evidence_error)
+            try:
+                evidence["heartbeat_sha256"] = sha256_file(
+                    cast(Path, heartbeat_path)
+                )
+            except BaseException as evidence_error:
+                record_evidence_error("failure_heartbeat_hash", evidence_error)
+        failure_memory: dict[str, Any] = {}
+        try:
+            failure_memory = _memory_snapshot()
+        except BaseException as evidence_error:
+            record_evidence_error("failure_memory_snapshot", evidence_error)
         evidence.update(
             {
                 "status": "failed",
                 "failure_stage": stage,
                 "error_type": type(error).__name__,
                 "out_of_memory": "out of memory" in str(error).lower(),
-                "memory_at_failure": _memory_snapshot(),
+                "memory_at_failure": failure_memory,
                 "heartbeat_records_written": emitted_records,
             }
         )
+        if evidence_errors:
+            evidence["failure_evidence_errors"] = evidence_errors
         if isinstance(error, RunInterrupted):
             evidence.update(
                 {

@@ -892,6 +892,93 @@ def test_primary_probe_failure_survives_cleanup_headroom_failure(
     ]
 
 
+def test_primary_probe_failure_survives_failure_memory_snapshot_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loader = _mock_successful_optimizer_probe(monkeypatch, fail_optimizer_step=True)
+    calls = 0
+
+    def memory_snapshot() -> dict[str, int]:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise RuntimeError("failure snapshot unavailable")
+        return _healthy_memory_snapshot()
+
+    monkeypatch.setattr(mps, "_memory_snapshot", memory_snapshot)
+    with pytest.raises(mps.MPSFeasibilityFailure) as caught:
+        mps._run_mps_optimizer_probe(
+            loader,
+            mps.torch.device("mps"),
+            tmp_path / "pretrained.pt",
+            optimizer_updates=1,
+            probe_name="failure-snapshot-error",
+        )
+    assert caught.value.evidence["failure_stage"] == "optimizer_step"
+    assert caught.value.evidence["memory_at_failure"] == {}
+    assert caught.value.evidence["failure_evidence_errors"] == [
+        {"stage": "failure_memory_snapshot", "error_type": "RuntimeError"}
+    ]
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "patch_target"),
+    [
+        ("failure_heartbeat_flush", "flush"),
+        ("failure_heartbeat_fsync", "fsync"),
+        ("failure_heartbeat_hash", "sha256_file"),
+    ],
+)
+def test_primary_probe_failure_survives_heartbeat_sealing_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+    patch_target: str,
+) -> None:
+    loader = _mock_successful_optimizer_probe(monkeypatch, fail_optimizer_step=True)
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise OSError("heartbeat evidence unavailable")
+
+    if patch_target == "flush":
+        original_open = Path.open
+
+        class FailingFlushStream:
+            def __init__(self, stream: object) -> None:
+                self.stream = stream
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self.stream, name)
+
+            def flush(self) -> None:
+                fail()
+
+        def open_with_failing_flush(path: Path, *args: object, **kwargs: object) -> object:
+            stream = original_open(path, *args, **kwargs)
+            if path.name.endswith(".jsonl"):
+                return FailingFlushStream(stream)
+            return stream
+
+        monkeypatch.setattr(Path, "open", open_with_failing_flush)
+    elif patch_target == "fsync":
+        monkeypatch.setattr(mps.os, "fsync", fail)
+    else:
+        monkeypatch.setattr(mps, "sha256_file", fail)
+    with pytest.raises(mps.MPSFeasibilityFailure) as caught:
+        mps._run_mps_optimizer_probe(
+            loader,
+            mps.torch.device("mps"),
+            tmp_path / "pretrained.pt",
+            optimizer_updates=1,
+            probe_name=failure_stage,
+            heartbeat_path=tmp_path / f"{failure_stage}.jsonl",
+        )
+    assert caught.value.evidence["failure_stage"] == "optimizer_step"
+    assert {row["stage"] for row in caught.value.evidence["failure_evidence_errors"]} >= {
+        failure_stage
+    }
+
+
 def test_transition_heartbeat_is_counted_when_callback_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

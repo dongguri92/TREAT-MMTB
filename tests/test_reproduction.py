@@ -339,6 +339,22 @@ def test_external_final_path_is_rejected_before_resolution(
     assert called is False
 
 
+@pytest.mark.parametrize(
+    "protected",
+    [
+        Path("external") / "final" / "validation",
+        Path("externalfinal") / "validation",
+        Path("final") / "test" / "validation",
+        Path("ExTeRnAl-FiNaL") / "validation",
+    ],
+)
+def test_external_final_path_rejects_split_and_concatenated_ancestry(
+    protected: Path,
+) -> None:
+    with pytest.raises(ValueError, match="external final"):
+        reproduction.reject_external_final_path(protected, "dataset")
+
+
 def test_pretrained_validation_pins_name_size_and_digest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -717,6 +717,45 @@ def test_supervise_rejects_protected_root_before_mkdir(tmp_path: Path) -> None:
     assert not protected.exists()
 
 
+@pytest.mark.parametrize(
+    "protected",
+    [
+        Path("external") / "final" / "validation",
+        Path("externalfinal") / "validation",
+        Path("final") / "test" / "validation",
+        Path("ExTeRnAl-FiNaL") / "validation",
+    ],
+)
+def test_bootstrap_rejects_protected_ancestry_before_loader_or_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    protected: Path,
+) -> None:
+    manifest = tmp_path / protected / "manifest.json"
+    monkeypatch.setattr(
+        bootstrap,
+        "_supervise",
+        lambda *_args, **_kwargs: pytest.fail("supervisor must not start"),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "_recompute_loader_start",
+        lambda *_args, **_kwargs: pytest.fail("loader verifier must not start"),
+    )
+    with pytest.raises(ValueError, match="external final"):
+        bootstrap.main([
+            "--execute",
+            "--acceptance-soak-only",
+            "--attempt-id",
+            "safe-attempt",
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--manifest",
+            str(manifest),
+        ])
+    assert not manifest.parent.exists()
+
+
 def test_bootstrap_rejects_symlink_to_protected_input_before_supervisor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
