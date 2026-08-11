@@ -42,6 +42,16 @@ SCIENCE_ARTIFACTS = {
     "best_checkpoint.pth", "checkpoint_receipt.json", "wandb_terminal.json",
     "run_record.json",
 }
+BF16_PRECISION_CONTRACT = {
+    "mode": "mixed_precision",
+    "autocast_device_type": "mps",
+    "autocast_dtype": "bfloat16",
+    "parameter_dtype": "float32",
+    "loss_compute_dtype": "float32",
+    "optimizer_master_state_dtype": "float32",
+    "gradient_scaler": False,
+    "fallback_policy": "fail_closed",
+}
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
@@ -207,6 +217,12 @@ def _validate_raw_gate_rows(
             update.get("distinct_microbatches") != GRADIENT_ACCUMULATION_STEPS
             or update.get("finite_losses") is not True
             or update.get("gradient_clip_completed") is not True
+            or update.get("precision") != BF16_PRECISION_CONTRACT
+            or update.get("master_state")
+            != {
+                "parameter_dtypes": ["torch.float32"],
+                "optimizer_state_dtypes": ["torch.float32"],
+            }
             or not isinstance(identities, list)
             or len(identities) != GRADIENT_ACCUMULATION_STEPS
             or len(set(identities)) != GRADIENT_ACCUMULATION_STEPS
@@ -230,7 +246,11 @@ def _validate_raw_gate_rows(
     sealed_loader_start = bootstrap.get("loader_start")
     probe_loader_components = probe.get("loader_start_components")
     if (
-        probe.get("status") != "passed"
+        resource.get("precision") != BF16_PRECISION_CONTRACT
+        or probe.get("precision") != BF16_PRECISION_CONTRACT
+        or probe.get("precision_runtime")
+        != {**BF16_PRECISION_CONTRACT, "runtime_probe": "passed"}
+        or probe.get("status") != "passed"
         or probe.get("probe") != FEASIBILITY_PROBE
         or probe.get("target_size") != TARGET_SIZE
         or probe.get("physical_batch_size") != PHYSICAL_BATCH_SIZE
@@ -308,6 +328,7 @@ def _validate_raw_gate_rows(
         _require_sha256(row.get("case_sha256"), "validation case")
         if (
             row.get("finite_loss") is not True
+            or row.get("precision") != BF16_PRECISION_CONTRACT
             or row.get("operation_events") != VALIDATION_OPERATION_EVENTS
         ):
             raise ValueError("validation resource proof is incomplete")
@@ -411,6 +432,7 @@ def validate_gate_artifacts(
         index.get("schema_version") != 2
         or index.get("attempt_id") != attempt_id
         or index.get("status") != "passed"
+        or index.get("precision") != BF16_PRECISION_CONTRACT
         or index.get("resource_evidence_sha256") != resource_sha256
         or index.get("heartbeat_sha256") != heartbeat_sha256
         or index.get("optimizer_updates") != TOTAL_UPDATES

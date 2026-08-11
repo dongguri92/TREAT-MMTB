@@ -63,6 +63,11 @@ def test_mps_protocol_is_distinct_and_preregistered() -> None:
     assert protocol["gradient_accumulation_steps"] == 8
     assert protocol["effective_batch_size"] == 8
     assert protocol["batch_dice"] is True
+    assert protocol["precision"] == mps.BF16_PRECISION_CONTRACT
+    assert protocol["precision"]["autocast_dtype"] == "bfloat16"
+    assert protocol["precision"]["parameter_dtype"] == "float32"
+    assert protocol["precision"]["optimizer_master_state_dtype"] == "float32"
+    assert protocol["precision"]["fallback_policy"] == "fail_closed"
     assert (
         protocol["loss_accumulation_semantics"]
         == "mean_of_8_microbatch_multitask_losses"
@@ -97,6 +102,7 @@ def test_worker_bootstrap_proof_binds_launcher_and_exact_child_command(
         "schema_version": 1,
         "role": "resource_gate",
         "allocator": contract["allocator"],
+        "precision": contract["precision"],
         "host": contract["host"],
         "contract_sha256": reproduction.sha256_file(
             mps.MPS_RESOURCE_CONTRACT_PATH
@@ -292,6 +298,11 @@ def test_probe_seals_model_construction_and_transfer_resource_failures(
     failure_factory: Callable[[], object],
 ) -> None:
     monkeypatch.setattr(mps.torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(
+        mps,
+        "_verify_mps_bf16_support",
+        lambda _device: {**mps.BF16_PRECISION_CONTRACT, "runtime_probe": "passed"},
+    )
     monkeypatch.setattr(mps, "_memory_snapshot", _healthy_memory_snapshot)
     monkeypatch.setattr(mps.torch.mps, "empty_cache", lambda: None, raising=False)
     monkeypatch.setattr(mps, "modeltype", lambda *_args, **_kwargs: failure_factory())
@@ -358,6 +369,11 @@ def test_probe_seals_forward_and_backward_resource_failures(
             return object(), object()
 
     monkeypatch.setattr(mps.torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(
+        mps,
+        "_verify_mps_bf16_support",
+        lambda _device: {**mps.BF16_PRECISION_CONTRACT, "runtime_probe": "passed"},
+    )
     monkeypatch.setattr(mps, "_memory_snapshot", _healthy_memory_snapshot)
     monkeypatch.setattr(mps.torch.mps, "empty_cache", lambda: None, raising=False)
     monkeypatch.setattr(mps, "modeltype", lambda *_args, **_kwargs: ProbeModel())
@@ -717,6 +733,9 @@ def _mock_successful_optimizer_probe(
         def cpu(self) -> "Tensor":
             return self
 
+        def float(self) -> "Tensor":
+            return self
+
         def argmax(self, _dimension: int) -> "Tensor":
             return self
 
@@ -766,6 +785,7 @@ def _mock_successful_optimizer_probe(
     class Optimizer:
         def __init__(self) -> None:
             self.param_groups = [{"lr": 5e-5}]
+            self.state: dict[object, object] = {}
 
         def zero_grad(self, *, set_to_none: bool) -> None:
             assert set_to_none is True
@@ -778,6 +798,20 @@ def _mock_successful_optimizer_probe(
     monkeypatch.setattr(mps.torch.mps, "empty_cache", lambda: None, raising=False)
     monkeypatch.setattr(mps.torch.mps, "synchronize", lambda: None, raising=False)
     monkeypatch.setattr(mps, "_memory_snapshot", _healthy_memory_snapshot)
+    monkeypatch.setattr(
+        mps,
+        "_verify_mps_bf16_support",
+        lambda _device: {**mps.BF16_PRECISION_CONTRACT, "runtime_probe": "passed"},
+    )
+    monkeypatch.setattr(
+        mps,
+        "_validate_fp32_master_state",
+        lambda *_args: {
+            "parameter_dtypes": ["torch.float32"],
+            "optimizer_state_dtypes": ["torch.float32"],
+        },
+    )
+    monkeypatch.setattr(training, "_autocast_context", lambda *_args: training._nullctx())
     monkeypatch.setattr(mps, "modeltype", lambda *_args, **_kwargs: ProbeModel())
     monkeypatch.setattr(mps, "make_optimizer", lambda *_args, **_kwargs: Optimizer())
     monkeypatch.setattr(mps, "DiceCELoss", lambda **_kwargs: lambda *_args: Loss())
@@ -809,6 +843,53 @@ def _mock_successful_optimizer_probe(
         }
         for index in range(mps.ACCEPTANCE_SOAK_MICRO_STEPS)
     ]
+
+
+def test_mps_bf16_autocast_selection_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class Context:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    def fake_autocast(
+        device_type: str, *, dtype: object, enabled: bool
+    ) -> Context:
+        observed.update(
+            device_type=device_type, dtype=dtype, enabled=enabled
+        )
+        return Context()
+
+    monkeypatch.setattr(training.torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(training, "autocast", fake_autocast)
+    with training._autocast_context(
+        training.torch.device("mps"), True, training.torch.bfloat16
+    ):
+        pass
+    assert observed == {
+        "device_type": "mps",
+        "dtype": training.torch.bfloat16,
+        "enabled": True,
+    }
+
+
+def test_mps_bf16_request_fails_closed_when_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(training.torch.backends.mps, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="MPS BF16"):
+        training._autocast_context(
+            training.torch.device("mps"), True, training.torch.bfloat16
+        )
+    with pytest.raises(RuntimeError, match="explicit torch.bfloat16"):
+        training._autocast_context(
+            training.torch.device("mps"), True, training.torch.float16
+        )
 
 
 def test_no_wandb_acceptance_soak_covers_full_lifecycle(
@@ -1240,6 +1321,7 @@ def test_mps_public_wandb_config_excludes_case_identity_values() -> None:
         "attempt_id": "mps-health-001",
         "protocol": mps.mps_protocol_contract(),
         "protocol_sha256": "protocol",
+        "precision": mps.BF16_PRECISION_CONTRACT,
         "source": {"git_commit": "commit", "git_tree_sha1": "tree"},
         "pretrained": {"sha256": "pretrained"},
         "dataset_scope": reproduction.DATASET_SCOPE,

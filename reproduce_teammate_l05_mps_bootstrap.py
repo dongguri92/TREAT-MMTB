@@ -239,6 +239,7 @@ def _sealed_environment(
         "schema_version": 1,
         "role": role,
         "allocator": allocator,
+        "precision": contract["precision"],
         "host": host,
         "contract_sha256": _sha256_file(CONTRACT_PATH),
         "launcher_sha256": _sha256_file(Path(__file__).resolve()),

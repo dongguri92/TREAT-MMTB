@@ -106,6 +106,16 @@ MPS_ARTIFACT_NAMES = (
     "wandb_terminal.json",
     "run_record.json",
 )
+BF16_PRECISION_CONTRACT = {
+    "mode": "mixed_precision",
+    "autocast_device_type": "mps",
+    "autocast_dtype": "bfloat16",
+    "parameter_dtype": "float32",
+    "loss_compute_dtype": "float32",
+    "optimizer_master_state_dtype": "float32",
+    "gradient_scaler": False,
+    "fallback_policy": "fail_closed",
+}
 
 
 class MPSFeasibilityFailure(RuntimeError):
@@ -164,6 +174,7 @@ def mps_protocol_contract() -> dict[str, Any]:
         "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
         "effective_batch_size": EFFECTIVE_BATCH_SIZE,
         "batch_dice": True,
+        "precision": BF16_PRECISION_CONTRACT,
         "loss_accumulation_semantics": "mean_of_8_microbatch_multitask_losses",
         "train_micro_steps_per_epoch": TRAIN_MICRO_STEPS,
         "train_optimizer_steps_per_epoch": TRAIN_OPTIMIZER_STEPS,
@@ -228,6 +239,51 @@ def _memory_snapshot() -> dict[str, int | None]:
     }
 
 
+def _verify_mps_bf16_support(device: torch.device) -> dict[str, Any]:
+    """Prove that the requested MPS BF16 autocast path is actually active."""
+    if device.type != "mps" or not torch.backends.mps.is_available():
+        raise RuntimeError("requested MPS BF16 but MPS is unavailable")
+    try:
+        left = torch.ones((2, 2), device=device, dtype=torch.float32)
+        right = torch.ones((2, 2), device=device, dtype=torch.float32)
+        with torch.autocast("mps", dtype=torch.bfloat16, enabled=True):
+            observed = torch.mm(left, right)
+        if observed.dtype is not torch.bfloat16:
+            raise RuntimeError(
+                f"MPS BF16 autocast produced {observed.dtype}, not torch.bfloat16"
+            )
+    except (RuntimeError, TypeError) as error:
+        raise RuntimeError("MPS BF16 autocast is unsupported") from error
+    finally:
+        if "left" in locals():
+            del left, right
+        if "observed" in locals():
+            del observed
+    return {**BF16_PRECISION_CONTRACT, "runtime_probe": "passed"}
+
+
+def _validate_fp32_master_state(
+    model: torch.nn.Module, optimizer: torch.optim.Optimizer
+) -> dict[str, Any]:
+    parameter_dtypes = {
+        str(parameter.dtype) for parameter in model.parameters()
+    }
+    state_dtypes = {
+        str(value.dtype)
+        for state in optimizer.state.values()
+        for value in state.values()
+        if isinstance(value, torch.Tensor) and value.is_floating_point()
+    }
+    if parameter_dtypes != {"torch.float32"}:
+        raise RuntimeError("BF16 soak requires FP32 master parameters")
+    if state_dtypes and state_dtypes != {"torch.float32"}:
+        raise RuntimeError("BF16 soak requires FP32 AdamW master state")
+    return {
+        "parameter_dtypes": sorted(parameter_dtypes),
+        "optimizer_state_dtypes": sorted(state_dtypes or {"torch.float32"}),
+    }
+
+
 def _load_mps_resource_contract() -> dict[str, Any]:
     with MPS_RESOURCE_CONTRACT_PATH.open(encoding="utf-8") as stream:
         contract = json.load(stream)
@@ -255,6 +311,7 @@ def _validate_bootstrap_proof(expected_role: str) -> dict[str, Any]:
         proof.get("schema_version") != 1
         or proof.get("role") != expected_role
         or proof.get("allocator") != contract["allocator"]
+        or proof.get("precision") != contract["precision"]
         or proof.get("host") != contract["host"]
         or proof.get("contract_sha256") != sha256_file(MPS_RESOURCE_CONTRACT_PATH)
         or proof.get("launcher_sha256") != sha256_file(MPS_BOOTSTRAP_PATH)
@@ -435,6 +492,7 @@ def _run_mps_optimizer_probe(
         "requested_micro_steps": optimizer_updates
         * GRADIENT_ACCUMULATION_STEPS,
         "wandb_started": False,
+        "precision": BF16_PRECISION_CONTRACT,
         "updates": [],
         "validation": [],
     }
@@ -491,6 +549,8 @@ def _run_mps_optimizer_probe(
         )
         stage = "device_transfer"
         model = cast(torch.nn.Module, model.to(device))
+        stage = "bf16_runtime_probe"
+        evidence["precision_runtime"] = _verify_mps_bf16_support(device)
         model.train()
         cast(Any, model).return_cls = True
         stage = "optimizer_construction"
@@ -536,10 +596,11 @@ def _run_mps_optimizer_probe(
                             segmentation_loss_fn,
                             0.5,
                             device,
-                            use_amp=False,
+                            use_amp=True,
                             materialize_log_loss=True,
                             native_case_materialization=True,
                             stage_callback=validation_events.append,
+                            amp_dtype=torch.bfloat16,
                         )
                         if not math.isfinite(float(validation_result["loss"])):
                             raise FloatingPointError(
@@ -552,6 +613,7 @@ def _run_mps_optimizer_probe(
                             "phase": "validation_resource",
                             "validation_step": validation_index,
                             "finite_loss": True,
+                            "precision": BF16_PRECISION_CONTRACT,
                             "case_sha256": _case_digest(validation_batch_ids[0]),
                             "operation_events": validation_events,
                             "elapsed_seconds": time.perf_counter() - started,
@@ -656,7 +718,7 @@ def _run_mps_optimizer_probe(
                 0.5,
                 device,
                 scaler=None,
-                use_amp=False,
+                use_amp=True,
                 critical_memory_observer=observe_critical_memory,
                 critical_memory_context={
                     "probe": probe_name,
@@ -666,7 +728,9 @@ def _run_mps_optimizer_probe(
                 accumulation=GRADIENT_ACCUMULATION_STEPS,
                 batch_observer=fingerprint_observer,
                 group_validator=validate_group,
+                amp_dtype=torch.bfloat16,
             )
+            master_state = _validate_fp32_master_state(model, optimizer)
             memory = _memory_snapshot()
             headroom = _validate_memory_headroom(memory)
             minimum_headroom = min(minimum_headroom, headroom)
@@ -688,6 +752,8 @@ def _run_mps_optimizer_probe(
                 ],
                 "finite_losses": True,
                 "gradient_clip_completed": True,
+                "precision": BF16_PRECISION_CONTRACT,
+                "master_state": master_state,
                 "last_microbatch_losses": step["microbatches"][-1],
                 "critical_memory": step["critical_memory"],
                 "elapsed_seconds": time.perf_counter() - started,
@@ -915,6 +981,7 @@ def _resource_evidence(
         "attempt_id": args.attempt_id,
         "reviewed_by": args.reviewed_by,
         "protocol_sha256": canonical_sha256(protocol),
+        "precision": protocol["precision"],
         "source": source,
         "manifest_sha256": manifest["manifest_sha256"],
         "combined_content_sha256": content["combined_content_sha256"],
@@ -973,6 +1040,7 @@ def _build_config(
         "resume_policy": "never",
         "protocol": protocol,
         "protocol_sha256": canonical_sha256(protocol),
+        "precision": protocol["precision"],
         "num_workers": args.num_workers,
         "device": "mps",
         "source": source,
@@ -1018,6 +1086,7 @@ def _wandb_public_config(config: dict[str, Any]) -> dict[str, Any]:
         "attempt_id": config["attempt_id"],
         "protocol": config["protocol"],
         "protocol_sha256": config["protocol_sha256"],
+        "precision": config["precision"],
         "source": config["source"],
         "pretrained": config["pretrained"],
         "dataset": {
@@ -1196,11 +1265,13 @@ def _load_resource_gate(
     resource = json.loads(gate_resource_path.read_text(encoding="utf-8"))
     if (
         gate_index.get("status") != "passed"
+        or gate_index.get("precision") != BF16_PRECISION_CONTRACT
         or gate_index.get("wandb_started") is not False
         or gate_index.get("scientific_training_started") is not False
         or gate_index.get("resource_evidence_sha256")
         != sha256_file(gate_resource_path)
         or resource.get("source") != source
+        or resource.get("precision") != BF16_PRECISION_CONTRACT
         or resource.get("case_identity_sha256") != identity_sha256
         or resource.get("pretrained_sha256") != pretrained_sha256
         or resource.get("acceptance_soak", {}).get("status") != "passed"
@@ -1244,6 +1315,7 @@ def _seal_resource_failure(
         "attempt_id": args.attempt_id,
         "phase": "health",
         "status": "resource_infeasible",
+        "precision": resource.get("precision", BF16_PRECISION_CONTRACT),
         "resource_evidence_sha256": resource_sha256,
         "artifacts": artifacts,
         "automatic_512_fallback_started": False,
@@ -1272,6 +1344,7 @@ def _safe_failure(
             "attempt_id": args.attempt_id,
             "phase": "health",
             "status": "failed",
+            "precision": BF16_PRECISION_CONTRACT,
             "stage": stage,
             "error_type": type(error).__name__,
             "external_final_test_untouched": True,
@@ -1557,6 +1630,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "attempt_id": args.attempt_id,
                 "phase": "acceptance_soak",
                 "status": "passed",
+                "precision": protocol["precision"],
                 "resource_evidence_sha256": resource_sha256,
                 "heartbeat_sha256": sha256_file(
                     artifact_dir / "acceptance_soak_heartbeat.jsonl"
@@ -1688,6 +1762,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 first_group_batch_observer=first_group_observer,
                 first_group_validator=first_group_validator,
+                amp_dtype=torch.bfloat16,
             ),
         )
 

@@ -103,6 +103,11 @@ def _seg_loss_on_output(seg_output, target, seg_loss_fn) -> torch.Tensor:
     return seg_loss_fn(seg_output, target)
 
 
+def _fp32_for_loss(value):
+    """Promote real tensor outputs while keeping lightweight test doubles valid."""
+    return value.float() if isinstance(value, torch.Tensor) else value
+
+
 def accumulated_train_step(
     model,
     batches,
@@ -118,6 +123,7 @@ def accumulated_train_step(
     accumulation=None,
     batch_observer=None,
     group_validator=None,
+    amp_dtype=None,
 ):
     """Run one historical attempt-4 accumulated optimizer sequence."""
     if accumulation is None:
@@ -148,17 +154,23 @@ def accumulated_train_step(
         img = batch['image'].to(device, non_blocking=True)
         mask = batch['mask'].to(device, non_blocking=True)
         cls = batch['cls'].to(device, non_blocking=True)
-        with autocast(device.type, enabled=use_amp) if device.type == 'cuda' else _nullctx():
+        with _autocast_context(device, use_amp, amp_dtype):
             model.return_cls = True
             if stage_callback is not None:
                 stage_callback("forward")
             seg_out, cls_logit = model(img)
-            if stage_callback is not None:
-                stage_callback("loss")
-            l_seg = _seg_loss_on_output(seg_out, mask, seg_loss_fn)
-            l_cls = bce(cls_logit, cls)
-            loss = l_seg + lambda_cls * l_cls
-            backward_loss = loss / accumulation
+        if stage_callback is not None:
+            stage_callback("loss")
+        # Loss math is deliberately outside autocast and uses FP32 outputs.
+        loss_seg_out = (
+            [_fp32_for_loss(value) for value in seg_out]
+            if isinstance(seg_out, (list, tuple))
+            else _fp32_for_loss(seg_out)
+        )
+        l_seg = _seg_loss_on_output(loss_seg_out, mask, seg_loss_fn)
+        l_cls = bce(_fp32_for_loss(cls_logit), _fp32_for_loss(cls))
+        loss = l_seg + lambda_cls * l_cls
+        backward_loss = loss / accumulation
         if scaler is not None:
             if stage_callback is not None:
                 stage_callback("backward")
@@ -227,7 +239,7 @@ def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
                     epoch=0, global_step=0, gradient_accumulation_steps=1,
                     progress_callback=None, critical_memory_observer=None,
                     first_group_batch_observer=None,
-                    first_group_validator=None):
+                    first_group_validator=None, amp_dtype=None):
     if gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be positive")
     usable_micro_steps = (
@@ -267,6 +279,7 @@ def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
             group_validator=(
                 first_group_validator if group_start == 0 else None
             ),
+            amp_dtype=amp_dtype,
         )
         global_step += 1
         for offset, row in enumerate(step['microbatches']):
@@ -304,7 +317,8 @@ def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
 
 def validation_step(model, batch, seg_loss_fn, lambda_cls, device,
                     use_amp=True, materialize_log_loss=False,
-                    native_case_materialization=False, stage_callback=None):
+                    native_case_materialization=False, stage_callback=None,
+                    amp_dtype=None):
     """Execute the scientific validation tensor/host boundary for one batch."""
     bce = torch.nn.BCEWithLogitsLoss()
     if stage_callback is not None:
@@ -312,15 +326,15 @@ def validation_step(model, batch, seg_loss_fn, lambda_cls, device,
     img = batch['image'].to(device, non_blocking=True)
     mask = batch['mask'].to(device, non_blocking=True)
     cls = batch['cls'].to(device, non_blocking=True)
-    with autocast(device.type, enabled=use_amp) if device.type == 'cuda' else _nullctx():
+    with _autocast_context(device, use_amp, amp_dtype):
         model.return_cls = True
         if stage_callback is not None:
             stage_callback('forward')
         seg_out, cls_logit = model(img)
         seg_main = seg_out[0] if isinstance(seg_out, (list, tuple)) else seg_out
-        l_seg = seg_loss_fn(seg_main, mask)
-        l_cls = bce(cls_logit, cls)
-        loss = l_seg + lambda_cls * l_cls
+    l_seg = seg_loss_fn(_fp32_for_loss(seg_main), mask)
+    l_cls = bce(_fp32_for_loss(cls_logit), _fp32_for_loss(cls))
+    loss = l_seg + lambda_cls * l_cls
     if stage_callback is not None:
         stage_callback('loss_item')
     loss_value = loss.item()
@@ -331,10 +345,10 @@ def validation_step(model, batch, seg_loss_fn, lambda_cls, device,
         log_loss_value = loss.item()
     if stage_callback is not None:
         stage_callback('prepared_masks_cpu')
-    pred = seg_main.argmax(1).cpu().numpy()
+    pred = seg_main.float().argmax(1).cpu().numpy()
     gt = mask.squeeze(1).cpu().numpy()
     dices = [dice_metric(pred[index], gt[index]) for index in range(pred.shape[0])]
-    cls_pred = (torch.sigmoid(cls_logit) > 0.5).float()
+    cls_pred = (torch.sigmoid(cls_logit.float()) > 0.5).float()
     if stage_callback is not None:
         stage_callback('classification_sum_item')
     cls_correct = (cls_pred == cls).sum().item()
@@ -349,8 +363,8 @@ def validation_step(model, batch, seg_loss_fn, lambda_cls, device,
             raise ValueError(f"native validation metadata missing: {missing_fields}")
         if stage_callback is not None:
             stage_callback('probabilities_cpu')
-        fg_prob = torch.softmax(seg_main, dim=1)[:, 1].cpu().numpy()
-        cls_prob = torch.sigmoid(cls_logit).flatten().cpu().numpy()
+        fg_prob = torch.softmax(seg_main.float(), dim=1)[:, 1].cpu().numpy()
+        cls_prob = torch.sigmoid(cls_logit.float()).flatten().cpu().numpy()
         for index, case_id in enumerate(batch['id']):
             if stage_callback is not None:
                 stage_callback('native_metadata_cpu')
@@ -373,7 +387,7 @@ def validation_step(model, batch, seg_loss_fn, lambda_cls, device,
 @torch.no_grad()
 def validate(model, loader, seg_loss_fn, lambda_cls, device, use_amp=True,
              wandb_run=None, epoch=0, native_combo_expected_ids=None,
-             progress_callback=None):
+             progress_callback=None, amp_dtype=None):
     model.eval()
     dices, cls_correct, cls_total = [], 0, 0
     native_cases = []
@@ -383,6 +397,7 @@ def validate(model, loader, seg_loss_fn, lambda_cls, device, use_amp=True,
             model, batch, seg_loss_fn, lambda_cls, device, use_amp=use_amp,
             materialize_log_loss=wandb_run is not None,
             native_case_materialization=native_combo_expected_ids is not None,
+            amp_dtype=amp_dtype,
         )
         val_losses.append(row['loss'])
         if wandb_run is not None:
@@ -427,7 +442,8 @@ def fit(model, train_loader, val_loader, device,
         wandb_run=None, reproduction_expected_ids=None,
         return_details=False, gradient_accumulation_steps=1,
         progress_callback=None, critical_memory_observer=None,
-        first_group_batch_observer=None, first_group_validator=None):
+        first_group_batch_observer=None, first_group_validator=None,
+        amp_dtype=None):
 
     optimizer = make_optimizer(model, initial_lr=initial_lr,
                                optimizer_name=optimizer_name)
@@ -471,13 +487,13 @@ def fit(model, train_loader, val_loader, device,
             ),
             first_group_validator=(
                 first_group_validator if epoch == 0 else None
-            ))
+            ), amp_dtype=amp_dtype)
         validation_started = time.perf_counter()
         val_loss, val_dice, val_acc, native_metrics = validate(
             model, val_loader, seg_loss_fn, lambda_cls, device,
             wandb_run=wandb_run, epoch=epoch,
             native_combo_expected_ids=reproduction_expected_ids,
-            progress_callback=progress_callback)
+            progress_callback=progress_callback, amp_dtype=amp_dtype)
         if native_metrics is not None:
             val_dice = native_metrics['dice']
             val_acc = native_metrics['classification_accuracy']
@@ -593,3 +609,26 @@ import contextlib
 @contextlib.contextmanager
 def _nullctx():
     yield
+
+
+def _autocast_context(device, enabled, amp_dtype=None):
+    """Return an explicit autocast context; unsupported requests fail closed."""
+    if not enabled:
+        return _nullctx()
+    # Preserve the pre-existing non-CUDA full-precision behavior unless a
+    # precision dtype is explicitly requested by a sealed experiment.
+    if amp_dtype is None and device.type != 'cuda':
+        return _nullctx()
+    if device.type == 'cuda':
+        return autocast('cuda', dtype=amp_dtype, enabled=True)
+    if device.type == 'mps':
+        if amp_dtype is not torch.bfloat16:
+            raise RuntimeError(
+                'MPS mixed precision requires explicit torch.bfloat16'
+            )
+        if not torch.backends.mps.is_available():
+            raise RuntimeError('requested MPS BF16 but MPS is unavailable')
+        return autocast('mps', dtype=torch.bfloat16, enabled=True)
+    raise RuntimeError(
+        f'mixed precision is unsupported for device type {device.type!r}'
+    )

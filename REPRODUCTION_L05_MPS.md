@@ -11,6 +11,25 @@ The scientific configuration remains exact canonical 444 train / deterministic
 `lambda_cls=0.5`, and combo veto `t_veto=0.005`. The amendment is a fresh
 five-epoch health gate only. External-final data remains untouched.
 
+## BF16 resource-soak variant
+
+This branch is a separate resource-feasibility ablation after the FP32 1024
+soak exhausted the 16 GB unified-memory limit. It preserves 1024 input,
+physical batch 1, gradient accumulation 8, `lambda_cls=0.5`, segmentation
+loss, veto `0.005`, and the exact 444/111 identity gates.
+
+Forward activations use explicit
+`torch.autocast(device_type="mps", dtype=torch.bfloat16)`. Model parameters,
+loss computation, gradients, and AdamW master state remain FP32; no gradient
+scaler is used. The resource contract, bootstrap proof, probe records,
+heartbeat-bound gate evidence, and completion index all bind this precision
+choice. An unavailable or silently substituted dtype fails closed—there is no
+FP16, FP32, CPU, or 512 fallback.
+
+Passing this soak establishes resource feasibility only. It is not numerically
+equivalent to the historical CUDA/FP32 result, and a later BF16 scientific run
+requires its own reviewed approval and scored comparison.
+
 ## Locked MPS environment
 
 The reviewed target is CPython 3.14.7 on Darwin arm64 with Apple MPS,

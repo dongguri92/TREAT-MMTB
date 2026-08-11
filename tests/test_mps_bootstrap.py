@@ -126,6 +126,11 @@ def _write_valid_gate(tmp_path: Path, attempt_id: str) -> Path:
             "microbatch_case_sha256_ordered": identities,
             "finite_losses": True,
             "gradient_clip_completed": True,
+            "precision": mps_evidence.BF16_PRECISION_CONTRACT,
+            "master_state": {
+                "parameter_dtypes": ["torch.float32"],
+                "optimizer_state_dtypes": ["torch.float32"],
+            },
             "critical_memory": {
                 "phase": "backward_complete_pre_adamw_memory",
                 "tensor_scalar_materialized": False,
@@ -139,6 +144,7 @@ def _write_valid_gate(tmp_path: Path, attempt_id: str) -> Path:
             "phase": "validation_resource",
             "validation_step": index,
             "finite_loss": True,
+            "precision": mps_evidence.BF16_PRECISION_CONTRACT,
             "case_sha256": validation_ids[index - 1],
             "operation_events": mps_evidence.VALIDATION_OPERATION_EVENTS,
             **memory(),
@@ -182,11 +188,17 @@ def _write_valid_gate(tmp_path: Path, attempt_id: str) -> Path:
     _write_json(
         resource,
         {
+            "precision": mps_evidence.BF16_PRECISION_CONTRACT,
             "bootstrap": bootstrap_proof,
             "canonical_case_sha256": {
                 "train": train_ids, "validation": validation_ids,
             },
             "probe": {
+                "precision": mps_evidence.BF16_PRECISION_CONTRACT,
+                "precision_runtime": {
+                    **mps_evidence.BF16_PRECISION_CONTRACT,
+                    "runtime_probe": "passed",
+                },
                 "status": "passed",
                 "probe": "exact_8_microbatch_adamw_optimizer_update",
                 "target_size": 1024,
@@ -262,6 +274,7 @@ def _write_valid_gate(tmp_path: Path, attempt_id: str) -> Path:
             "schema_version": 2,
             "attempt_id": attempt_id,
             "status": "passed",
+            "precision": mps_evidence.BF16_PRECISION_CONTRACT,
             "resource_evidence_sha256": mps_evidence.sha256_file(resource),
             "heartbeat_sha256": mps_evidence.sha256_file(heartbeat),
             "optimizer_updates": 76,
@@ -928,6 +941,23 @@ def test_gate_rejects_invalid_feasibility_semantics_after_rehash(
     resource_path = tmp_path / "resource_evidence.json"
     resource = json.loads(resource_path.read_text())
     resource["probe"]["updates"][0]["finite_losses"] = False
+    _write_json(resource_path, resource)
+    index = json.loads(path.read_text())
+    index["resource_evidence_sha256"] = bootstrap._sha256_file(resource_path)
+    _write_json(path, index)
+    assert bootstrap._validate_child_completion(
+        path, "resource_gate", "sealed-attempt", 0, 0.1
+    ) == (False, None, None)
+
+
+def test_gate_rejects_precision_contract_drift_after_rehash(
+    tmp_path: Path,
+) -> None:
+    path = _write_valid_gate(tmp_path, "sealed-attempt")
+    resource_path = tmp_path / "resource_evidence.json"
+    resource = json.loads(resource_path.read_text())
+    resource["precision"]["autocast_dtype"] = "float16"
+    resource["probe"]["precision"]["autocast_dtype"] = "float16"
     _write_json(resource_path, resource)
     index = json.loads(path.read_text())
     index["resource_evidence_sha256"] = bootstrap._sha256_file(resource_path)

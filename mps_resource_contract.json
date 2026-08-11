@@ -15,6 +15,16 @@
   "memory": {
     "minimum_headroom_ratio": 0.1
   },
+  "precision": {
+    "mode": "mixed_precision",
+    "autocast_device_type": "mps",
+    "autocast_dtype": "bfloat16",
+    "parameter_dtype": "float32",
+    "loss_compute_dtype": "float32",
+    "optimizer_master_state_dtype": "float32",
+    "gradient_scaler": false,
+    "fallback_policy": "fail_closed"
+  },
   "approval": {
     "github_repository": "dongguri92/TREAT-MMTB",
     "allowed_reviewers": ["dongguri92"],
