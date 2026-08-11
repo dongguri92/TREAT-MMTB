@@ -24,6 +24,45 @@ def _epoch(
 def _health_approval(tmp_path: Path, *, allowed_to: str = "conv-001") -> Path:
     health = tmp_path / "health"
     health.mkdir()
+    protocol = convergence.engine.mps_protocol_contract()
+    source_payload = {"git_commit": "commit", "git_tree_sha1": "tree"}
+    config_payload = {
+        "protocol": protocol,
+        "num_workers": 0,
+        "device": "mps",
+        "source": source_payload,
+        "pretrained": {"sha256": "p" * 64, "byte_size": 1},
+        "dataset_scope": "train_plus_internal_validation_only",
+        "manifest": {
+            "manifest_sha256": "m" * 64,
+            "train_case_count": 444,
+            "validation_case_count": 111,
+        },
+        "content": {"combined_content_sha256": "c" * 64},
+        "baseline": {"score_sha256": "s" * 64, "run_record_sha256": "r" * 64},
+        "dependency": {"lock_sha256": "d" * 64},
+        "case_identity_sha256": "i" * 64,
+        "train_micro_steps_per_epoch": 440,
+        "train_optimizer_steps_per_epoch": 55,
+        "validation_steps_per_epoch": 111,
+        "external_final_isolation": {
+            "dataset_scope": "train_plus_internal_validation_only",
+            "canonical_bytes_verified": True,
+            "external_final_test_untouched": True,
+        },
+        "wandb": {
+            "entity": convergence.engine.WANDB_ENTITY,
+            "project": convergence.engine.WANDB_PROJECT,
+            "mode": "online",
+            "resume": "never",
+        },
+    }
+    (health / "config.json").write_text(json.dumps(config_payload))
+    (health / "source.json").write_text(json.dumps(source_payload))
+    for name in convergence.engine.MPS_ARTIFACT_NAMES:
+        path = health / name
+        if not path.exists() and name != "run_record.json":
+            path.write_bytes(b"checkpoint" if name == "best_checkpoint.pth" else b"{}")
     run_record = health / "run_record.json"
     artifact_index = health / "artifact_index.json"
     run_record.write_text(
@@ -43,8 +82,8 @@ def _health_approval(tmp_path: Path, *, allowed_to: str = "conv-001") -> Path:
                 "attempt_id": "health-003",
                 "status": "completed",
                 "artifacts": {
-                    "run_record.json": sha256_file(run_record),
-                    "best_checkpoint.pth": "a" * 64,
+                    name: sha256_file(health / name)
+                    for name in convergence.engine.MPS_ARTIFACT_NAMES
                 },
             }
         )
@@ -129,6 +168,40 @@ def test_queue_spec_is_fresh_single_attempt_and_no_resume(tmp_path: Path) -> Non
     assert spec["wandb"]["resume"] == "never"
     assert spec["gates"][0]["allowed_to"] == ["conv-001"]
     assert spec["external_final_accessed"] is False
+    assert spec["forbidden_initialization"]["sha256"] == sha256_file(
+        tmp_path / "health" / "best_checkpoint.pth"
+    )
+
+
+@pytest.mark.parametrize("name", list(convergence.engine.MPS_ARTIFACT_NAMES))
+def test_health_approval_rejects_every_indexed_artifact_substitution(
+    tmp_path: Path, name: str
+) -> None:
+    approval = _health_approval(tmp_path)
+    (tmp_path / "health" / name).write_bytes(b"substituted")
+    with pytest.raises(ValueError, match="bytes (do not match|differ)"):
+        convergence.validate_health_approval(approval, "conv-001")
+
+
+def test_contract_rejects_config_drift_and_health_checkpoint_initialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    approval_path = _health_approval(tmp_path)
+    approval = convergence.validate_health_approval(approval_path, "conv-001")
+    expected = approval["health_contract"]
+    pretrained = tmp_path / "pretrained.pt"
+    pretrained.write_bytes(b"pretrained")
+    args = argparse.Namespace(pretrained=pretrained)
+    monkeypatch.setattr(convergence, "_prospective_contract", lambda _args: expected)
+    assert convergence.validate_convergence_contract(args, approval) == expected
+    drifted = {**expected, "num_workers": 2}
+    monkeypatch.setattr(convergence, "_prospective_contract", lambda _args: drifted)
+    with pytest.raises(ValueError, match="differs from approved health"):
+        convergence.validate_convergence_contract(args, approval)
+    args.pretrained = tmp_path / "health" / "best_checkpoint.pth"
+    monkeypatch.setattr(convergence, "_prospective_contract", lambda _args: expected)
+    with pytest.raises(ValueError, match="must not initialize"):
+        convergence.validate_convergence_contract(args, approval)
 
 
 def test_completion_seals_decision_pending_handoff_and_final_index(

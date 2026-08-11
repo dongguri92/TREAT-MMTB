@@ -28,6 +28,101 @@ EXTENSION_COMPOSITE_SLOPE = 0.0002
 SHORT_BUDGET_NOISE_FLOOR = 0.01
 
 
+def _read_json_object(path: Path, label: str) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError(f"{label} must be a JSON object")
+    return payload
+
+
+def _indexed_health_artifacts(index_path: Path, index: Mapping[str, Any]) -> dict[str, Path]:
+    artifacts = index.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != set(engine.MPS_ARTIFACT_NAMES):
+        raise ValueError("health artifact index does not cover the exact artifact set")
+    root = index_path.parent.resolve()
+    resolved: dict[str, Path] = {}
+    for name in engine.MPS_ARTIFACT_NAMES:
+        expected = artifacts.get(name)
+        path = root / name
+        if (
+            not isinstance(expected, str)
+            or len(expected) != 64
+            or path.is_symlink()
+            or not path.is_file()
+            or path.resolve().parent != root
+            or sha256_file(path) != expected
+        ):
+            raise ValueError(f"health indexed artifact bytes differ: {name}")
+        resolved[name] = path
+    return resolved
+
+
+def _normalized_config_contract(config: Mapping[str, Any]) -> dict[str, Any]:
+    protocol = config.get("protocol")
+    wandb = config.get("wandb")
+    if not isinstance(protocol, dict) or not isinstance(wandb, dict):
+        raise TypeError("health config lacks protocol/W&B contract")
+    normalized_protocol = {
+        key: value for key, value in protocol.items() if key not in {"phase", "epochs"}
+    }
+    return {
+        "protocol": normalized_protocol,
+        "num_workers": config.get("num_workers"),
+        "device": config.get("device"),
+        "source": config.get("source"),
+        "pretrained": config.get("pretrained"),
+        "dataset_scope": config.get("dataset_scope"),
+        "manifest": config.get("manifest"),
+        "content": config.get("content"),
+        "baseline": config.get("baseline"),
+        "dependency": config.get("dependency"),
+        "case_identity_sha256": config.get("case_identity_sha256"),
+        "train_micro_steps_per_epoch": config.get("train_micro_steps_per_epoch"),
+        "train_optimizer_steps_per_epoch": config.get(
+            "train_optimizer_steps_per_epoch"
+        ),
+        "validation_steps_per_epoch": config.get("validation_steps_per_epoch"),
+        "external_final_isolation": config.get("external_final_isolation"),
+        "wandb_service": {
+            key: wandb.get(key) for key in ("entity", "project", "mode", "resume")
+        },
+    }
+
+
+def _prospective_contract(args: argparse.Namespace) -> dict[str, Any]:
+    source = engine.source_identity(engine.REPO_ROOT)
+    protocol = engine.mps_protocol_contract()
+    manifest = engine.load_canonical_manifest(args.manifest)
+    content = engine.validate_canonical_content(
+        manifest["identity"],
+        args.train_dcm_dir,
+        args.train_mask_dir,
+        args.val_dcm_dir,
+        args.val_mask_dir,
+    )
+    baseline = engine.load_pinned_baseline(
+        args.baseline_score,
+        args.baseline_run_record,
+        manifest["identity"]["validation"],
+    )
+    pretrained = engine.validate_pretrained(args.pretrained)
+    dependency = engine.validate_mps_runtime_dependencies(engine.MPS_LOCK_PATH)
+    dependency["lock_sha256"] = sha256_file(engine.MPS_LOCK_PATH)
+    config = engine._build_config(
+        args,
+        source,
+        protocol,
+        manifest,
+        content,
+        pretrained,
+        baseline,
+        dependency,
+        canonical_sha256(manifest["identity"]),
+        "prospective_resource_evidence",
+    )
+    return _normalized_config_contract(config)
+
+
 def _slope(values: Sequence[float]) -> float:
     if len(values) < 2 or any(not math.isfinite(value) for value in values):
         raise ValueError("slope requires at least two finite values")
@@ -135,12 +230,11 @@ def validate_health_approval(path: Path, expected_attempt_id: str) -> dict[str, 
             or sha256_file(evidence) != payload[f"{prefix}_sha256"]
         ):
             raise ValueError(f"{prefix} bytes do not match approval")
-    run_record = json.loads(
-        Path(payload["health_run_record_path"]).read_text(encoding="utf-8")
+    run_record = _read_json_object(
+        Path(payload["health_run_record_path"]), "health run record"
     )
-    index = json.loads(
-        Path(payload["health_artifact_index_path"]).read_text(encoding="utf-8")
-    )
+    index_path = Path(payload["health_artifact_index_path"])
+    index = _read_json_object(index_path, "health artifact index")
     if (
         run_record.get("attempt_id") != payload["health_attempt_id"]
         or index.get("attempt_id") != payload["health_attempt_id"]
@@ -157,17 +251,34 @@ def validate_health_approval(path: Path, expected_attempt_id: str) -> dict[str, 
         or index.get("status") != "completed"
     ):
         raise ValueError("health W&B/artifact completion is invalid")
-    artifacts = index.get("artifacts")
-    if (
-        not isinstance(artifacts, dict)
-        or artifacts.get("run_record.json") != payload["health_run_record_sha256"]
-    ):
+    artifact_paths = _indexed_health_artifacts(index_path, index)
+    artifacts = index["artifacts"]
+    if artifacts["run_record.json"] != payload["health_run_record_sha256"]:
         raise ValueError("health run record is not bound by artifact index")
-    checkpoint_hash = artifacts.get("best_checkpoint.pth")
-    if not isinstance(checkpoint_hash, str) or len(checkpoint_hash) != 64:
-        raise ValueError("health checkpoint lineage is missing")
-    payload["health_checkpoint_sha256"] = checkpoint_hash
+    config = _read_json_object(artifact_paths["config.json"], "health config")
+    source = _read_json_object(artifact_paths["source.json"], "health source")
+    if config.get("source") != source:
+        raise ValueError("health source artifact differs from health config")
+    payload["health_checkpoint_path"] = str(
+        artifact_paths["best_checkpoint.pth"].resolve()
+    )
+    payload["health_checkpoint_sha256"] = artifacts["best_checkpoint.pth"]
+    payload["health_contract"] = _normalized_config_contract(config)
     return payload
+
+
+def validate_convergence_contract(
+    args: argparse.Namespace, approval: Mapping[str, Any]
+) -> dict[str, Any]:
+    current = _prospective_contract(args)
+    if current != approval.get("health_contract"):
+        raise ValueError("prospective convergence contract differs from approved health")
+    health_checkpoint = Path(str(approval["health_checkpoint_path"])).resolve()
+    if args.pretrained.resolve() == health_checkpoint:
+        raise ValueError("convergence must not initialize from the health checkpoint")
+    if sha256_file(args.pretrained) == approval["health_checkpoint_sha256"]:
+        raise ValueError("convergence pretrained bytes equal the health checkpoint")
+    return current
 
 
 def queue_spec(args: argparse.Namespace, approval: Mapping[str, Any]) -> dict[str, Any]:
@@ -185,7 +296,10 @@ def queue_spec(args: argparse.Namespace, approval: Mapping[str, Any]) -> dict[st
         "cwd": str(Path(__file__).resolve().parent),
         "phase": "convergence_50e",
         "fresh_initialization": True,
-        "forbidden_initialization": approval["health_artifact_index_sha256"],
+        "forbidden_initialization": {
+            "path": approval["health_checkpoint_path"],
+            "sha256": approval["health_checkpoint_sha256"],
+        },
         "gates": [
             {
                 "type": "decision_receipt",
@@ -279,6 +393,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     approval = validate_health_approval(args.health_approval, args.attempt_id)
+    validate_convergence_contract(args, approval)
     spec = queue_spec(args, approval)
     if not args.execute:
         return {

@@ -10,6 +10,12 @@ classification-veto `0.005` contract.
 `reproduce_teammate_l05_mps_convergence.py` is dry-run by default. It requires
 an immutable, independently reviewed health approval receipt whose exact
 health run record and artifact index hashes are bound to the new attempt ID.
+Validation rehashes every file covered by that index, including the actual
+`best_checkpoint.pth` bytes. It rebuilds the prospective source,
+manifest/content, pretrained, baseline, dependency, and resource contract and
+requires exact equality after normalizing only attempt, phase, epoch, and W&B
+run identity. Both the health checkpoint path and its bytes are forbidden as
+initialization; the candidate must use the reviewed pretrained weights.
 The emitted queue specification is single-attempt (`max_attempts=1`), binds the
 review receipt, uses a distinct W&B identity with `resume=never`, and forbids
 external-final access. A retry is a new reviewed attempt and directory.
