@@ -38,7 +38,16 @@ def _health_approval(tmp_path: Path, *, allowed_to: str = "conv-001") -> Path:
         )
     )
     artifact_index.write_text(
-        json.dumps({"attempt_id": "health-003", "status": "completed"})
+        json.dumps(
+            {
+                "attempt_id": "health-003",
+                "status": "completed",
+                "artifacts": {
+                    "run_record.json": sha256_file(run_record),
+                    "best_checkpoint.pth": "a" * 64,
+                },
+            }
+        )
     )
     approval = tmp_path / "health-approval.json"
     approval.write_text(
@@ -134,15 +143,14 @@ def test_completion_seals_decision_pending_handoff_and_final_index(
         for epoch in range(1, 51)
     ]
     (artifact_dir / "epochs.json").write_text(json.dumps({"epochs": rows}))
-    (artifact_dir / "artifact_index.json").write_text(
-        json.dumps({"status": "completed"})
-    )
+    base = {"status": "completed", "attempt_id": "conv-001", "phase": "convergence_50e"}
+    (artifact_dir / "artifact_index.json").write_text(json.dumps(base))
     args = argparse.Namespace(
         attempt_id="conv-001",
         artifact_root=tmp_path / "artifacts",
         health_approval=approval_path,
     )
-    final = convergence._seal_completion(args, approval, {"status": "completed"})
+    final = convergence._seal_completion(args, approval, base)
     assert final["auto_launched_150"] is False
     handoff = json.loads(
         (artifact_dir / "issue93_champion_handoff.pending.json").read_text()
@@ -150,4 +158,24 @@ def test_completion_seals_decision_pending_handoff_and_final_index(
     assert handoff["launch_eligible"] is False
     assert handoff["review_state"] == "pending_independent_review"
     with pytest.raises(FileExistsError):
-        convergence._seal_completion(args, approval, {"status": "completed"})
+        convergence._seal_completion(args, approval, base)
+
+
+@pytest.mark.parametrize("count", [1, 4, 49])
+def test_partial_epochs_never_seal_completion(tmp_path: Path, count: int) -> None:
+    approval_path = _health_approval(tmp_path)
+    approval = convergence.validate_health_approval(approval_path, "conv-001")
+    artifact_dir = tmp_path / "artifacts" / "conv-001"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "epochs.json").write_text(
+        json.dumps({"epochs": [_epoch(i, 0.5, 1.0) for i in range(1, count + 1)]})
+    )
+    base = {"status": "completed", "attempt_id": "conv-001", "phase": "convergence_50e"}
+    (artifact_dir / "artifact_index.json").write_text(json.dumps(base))
+    args = argparse.Namespace(
+        attempt_id="conv-001",
+        artifact_root=tmp_path / "artifacts",
+        health_approval=approval_path,
+    )
+    with pytest.raises(ValueError):
+        convergence._seal_completion(args, approval, base)

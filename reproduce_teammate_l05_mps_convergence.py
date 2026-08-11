@@ -43,8 +43,8 @@ def _slope(values: Sequence[float]) -> float:
 def convergence_decision(
     epochs: Sequence[Mapping[str, Any]], *, health_gate_passed: bool
 ) -> dict[str, Any]:
-    if not epochs:
-        raise ValueError("convergence decision requires epoch evidence")
+    if len(epochs) < 5:
+        raise ValueError("convergence decision requires at least five epochs")
     ordered = sorted(epochs, key=lambda row: int(row["epoch"]))
     if [int(row["epoch"]) for row in ordered] != list(range(1, len(ordered) + 1)):
         raise ValueError("epoch evidence must be complete and contiguous")
@@ -128,6 +128,7 @@ def validate_health_approval(path: Path, expected_attempt_id: str) -> dict[str, 
         raise ValueError("health approval is not bound to this attempt")
     for prefix in ("health_run_record", "health_artifact_index"):
         evidence = Path(payload[f"{prefix}_path"])
+        engine.reject_external_final_path(evidence, prefix)
         if (
             not evidence.is_absolute()
             or evidence.is_symlink()
@@ -156,6 +157,16 @@ def validate_health_approval(path: Path, expected_attempt_id: str) -> dict[str, 
         or index.get("status") != "completed"
     ):
         raise ValueError("health W&B/artifact completion is invalid")
+    artifacts = index.get("artifacts")
+    if (
+        not isinstance(artifacts, dict)
+        or artifacts.get("run_record.json") != payload["health_run_record_sha256"]
+    ):
+        raise ValueError("health run record is not bound by artifact index")
+    checkpoint_hash = artifacts.get("best_checkpoint.pth")
+    if not isinstance(checkpoint_hash, str) or len(checkpoint_hash) != 64:
+        raise ValueError("health checkpoint lineage is missing")
+    payload["health_checkpoint_sha256"] = checkpoint_hash
     return payload
 
 
@@ -199,10 +210,22 @@ def _seal_completion(
     args: argparse.Namespace, approval: Mapping[str, Any], base_index: Mapping[str, Any]
 ) -> dict[str, Any]:
     artifact_dir = args.artifact_root / args.attempt_id
+    if (
+        base_index.get("status") != "completed"
+        or base_index.get("attempt_id") != args.attempt_id
+        or base_index.get("phase") != "convergence_50e"
+    ):
+        raise ValueError("base artifact index is not the completed convergence attempt")
+    index_path = artifact_dir / "artifact_index.json"
+    persisted_index = json.loads(index_path.read_text(encoding="utf-8"))
+    if persisted_index != dict(base_index):
+        raise ValueError("base artifact index bytes differ from returned index")
     epochs_payload = json.loads(
         (artifact_dir / "epochs.json").read_text(encoding="utf-8")
     )
     decision = convergence_decision(epochs_payload["epochs"], health_gate_passed=True)
+    if decision["completed_epochs"] != EPOCHS or decision["final_epoch"] != EPOCHS:
+        raise ValueError("completion sealing requires exact contiguous 50 epochs")
     write_json_once(artifact_dir / "convergence_decision.json", decision)
     handoff = {
         "schema_version": 2,
@@ -226,7 +249,7 @@ def _seal_completion(
         "attempt_id": args.attempt_id,
         "phase": "convergence_50e",
         "status": "completed_pending_independent_review",
-        "base_artifact_index_sha256": sha256_file(artifact_dir / "artifact_index.json"),
+        "base_artifact_index_sha256": sha256_file(index_path),
         "health_approval_sha256": sha256_file(args.health_approval),
         "convergence_decision_sha256": sha256_file(
             artifact_dir / "convergence_decision.json"
