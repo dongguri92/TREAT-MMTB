@@ -200,6 +200,74 @@ def test_resource_failure_emits_only_sealed_resource_evidence(tmp_path: Path) ->
         mps._seal_resource_failure(artifact_dir, args, resource)
 
 
+def test_persistent_heartbeat_hash_failure_still_seals_resource_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact_dir = tmp_path / "attempt"
+    artifact_dir.mkdir()
+    heartbeat = artifact_dir / "acceptance_soak_heartbeat.jsonl"
+    heartbeat.write_text('{"phase":"optimizer_update"}\n', encoding="utf-8")
+    args = argparse.Namespace(attempt_id="mps-health-hash-failure")
+    original_sha256_file = mps.sha256_file
+
+    def persistent_heartbeat_hash_failure(path: Path) -> str:
+        if Path(path) == heartbeat:
+            raise OSError("persistent heartbeat hash failure")
+        return original_sha256_file(path)
+
+    monkeypatch.setattr(mps, "sha256_file", persistent_heartbeat_hash_failure)
+    index = mps._seal_resource_failure(
+        artifact_dir,
+        args,
+        {
+            "attempt_id": args.attempt_id,
+            "probe": {
+                "status": "failed",
+                "failure_stage": "optimizer_step",
+            },
+        },
+    )
+    assert index["status"] == "resource_infeasible"
+    assert index["failure_evidence_errors"] == [
+        {
+            "stage": "resource_failure_heartbeat_hash",
+            "error_type": "OSError",
+        }
+    ]
+    assert "acceptance_soak_heartbeat.jsonl" not in index["artifacts"]
+    assert json.loads(
+        (artifact_dir / "resource_index.json").read_text(encoding="utf-8")
+    ) == index
+
+
+def test_persistent_heartbeat_hash_failure_still_writes_safe_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact_dir = tmp_path / "attempt"
+    artifact_dir.mkdir()
+    heartbeat = artifact_dir / "acceptance_soak_heartbeat.jsonl"
+    heartbeat.write_text('{"phase":"optimizer_update"}\n', encoding="utf-8")
+    args = argparse.Namespace(attempt_id="mps-health-safe-failure")
+
+    def persistent_heartbeat_hash_failure(_path: Path) -> str:
+        raise OSError("persistent heartbeat hash failure")
+
+    monkeypatch.setattr(mps, "sha256_file", persistent_heartbeat_hash_failure)
+    primary = mps.MPSFeasibilityFailure(
+        {"status": "failed", "failure_stage": "optimizer_step"}
+    )
+    mps._safe_failure(artifact_dir, args, "mps_1024_acceptance_soak", primary)
+    receipt = json.loads(
+        (artifact_dir / "failure.json").read_text(encoding="utf-8")
+    )
+    assert receipt["error_type"] == "MPSFeasibilityFailure"
+    assert receipt["partial_heartbeat_records"] == 1
+    assert "partial_heartbeat_sha256" not in receipt
+    assert receipt["failure_evidence_errors"] == [
+        {"stage": "safe_failure_heartbeat_hash", "error_type": "OSError"}
+    ]
+
+
 @pytest.mark.parametrize(
     ("failure_stage", "failure_factory"),
     [

@@ -1216,27 +1216,42 @@ def _seal_resource_failure(
     artifact_dir: Path, args: argparse.Namespace, resource: dict[str, Any]
 ) -> dict[str, Any]:
     write_json_once(artifact_dir / "resource_evidence.json", resource)
-    artifacts = {
-        "resource_evidence.json": sha256_file(
-            artifact_dir / "resource_evidence.json"
+    evidence_errors: list[dict[str, str]] = []
+    resource_path = artifact_dir / "resource_evidence.json"
+    resource_sha256: str | None = None
+    try:
+        resource_sha256 = sha256_file(resource_path)
+    except BaseException as error:
+        evidence_errors.append(
+            {"stage": "resource_evidence_hash", "error_type": type(error).__name__}
         )
-    }
+    artifacts = {}
+    if resource_sha256 is not None:
+        artifacts[resource_path.name] = resource_sha256
     heartbeat_path = artifact_dir / "acceptance_soak_heartbeat.jsonl"
     if heartbeat_path.exists():
-        artifacts[heartbeat_path.name] = sha256_file(heartbeat_path)
+        try:
+            artifacts[heartbeat_path.name] = sha256_file(heartbeat_path)
+        except BaseException as error:
+            evidence_errors.append(
+                {
+                    "stage": "resource_failure_heartbeat_hash",
+                    "error_type": type(error).__name__,
+                }
+            )
     index = {
         "schema_version": 1,
         "attempt_id": args.attempt_id,
         "phase": "health",
         "status": "resource_infeasible",
-        "resource_evidence_sha256": sha256_file(
-            artifact_dir / "resource_evidence.json"
-        ),
+        "resource_evidence_sha256": resource_sha256,
         "artifacts": artifacts,
         "automatic_512_fallback_started": False,
         "wandb_started": False,
         "external_final_test_untouched": True,
     }
+    if evidence_errors:
+        index["failure_evidence_errors"] = evidence_errors
     write_json_once(artifact_dir / "resource_index.json", index)
     return index
 
@@ -1275,10 +1290,29 @@ def _safe_failure(
             receipt["wandb_finish_error_type"] = type(wandb_finish_error).__name__
         heartbeat = artifact_dir / "acceptance_soak_heartbeat.jsonl"
         if heartbeat.exists():
-            receipt["partial_heartbeat_sha256"] = sha256_file(heartbeat)
-            receipt["partial_heartbeat_records"] = len(
-                heartbeat.read_text(encoding="utf-8").splitlines()
-            )
+            evidence_errors: list[dict[str, str]] = []
+            try:
+                receipt["partial_heartbeat_sha256"] = sha256_file(heartbeat)
+            except BaseException as evidence_error:
+                evidence_errors.append(
+                    {
+                        "stage": "safe_failure_heartbeat_hash",
+                        "error_type": type(evidence_error).__name__,
+                    }
+                )
+            try:
+                receipt["partial_heartbeat_records"] = len(
+                    heartbeat.read_text(encoding="utf-8").splitlines()
+                )
+            except BaseException as evidence_error:
+                evidence_errors.append(
+                    {
+                        "stage": "safe_failure_heartbeat_read",
+                        "error_type": type(evidence_error).__name__,
+                    }
+                )
+            if evidence_errors:
+                receipt["failure_evidence_errors"] = evidence_errors
         write_json_once(path, receipt)
 
 
