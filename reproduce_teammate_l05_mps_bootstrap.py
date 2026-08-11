@@ -17,6 +17,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from github_approval import verify_scientific_approval
 from mps_evidence import validate_gate_artifacts, validate_scientific_artifacts
 
 ROOT = Path(__file__).resolve().parent
@@ -113,6 +114,29 @@ def _sealed_environment(
     host = _host_receipt()
     if host != contract["host"]:
         raise RuntimeError("host resource identity differs from reviewed contract")
+    manifest_identity = None
+    if "--manifest" in child_argv:
+        manifest_path = Path(_flag_value(child_argv, "--manifest")).resolve()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        identity = manifest.get("identity") if isinstance(manifest, dict) else None
+        if (
+            not isinstance(identity, dict)
+            or not isinstance(identity.get("train"), list)
+            or not isinstance(identity.get("validation"), list)
+            or len(identity["train"]) != 444
+            or len(identity["validation"]) != 111
+        ):
+            raise RuntimeError("manifest identity differs from exact 444/111 contract")
+        manifest_identity = {
+            "manifest_file_sha256": _sha256_file(manifest_path),
+            "canonical_case_sha256": {
+                split: [
+                    _sha256_bytes(str(case_id).encode("utf-8"))
+                    for case_id in identity[split]
+                ]
+                for split in ("train", "validation")
+            },
+        }
     proof = {
         "schema_version": 1,
         "role": role,
@@ -127,6 +151,7 @@ def _sealed_environment(
         "nonce": secrets.token_hex(32),
         "torch_imported_in_bootstrap": "torch" in sys.modules,
         "soak_approval": soak_approval,
+        "dataset_identity": manifest_identity,
     }
     if proof["torch_imported_in_bootstrap"]:
         raise RuntimeError("stdlib bootstrap imported torch unexpectedly")
@@ -212,7 +237,10 @@ def _validate_child_completion(
             )
         else:
             chain = validate_scientific_artifacts(
-                completion_path.parent, attempt_id
+                completion_path.parent,
+                attempt_id,
+                supervisor_progress_path,
+                expected_bootstrap_proof_sha256,
             )
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return False, None, None
@@ -226,17 +254,12 @@ def _supervise(
     attempt_id: str,
     soak_approval: dict[str, Any] | None = None,
 ) -> Path:
-    contract = _load_contract()
     supervisor_dir = artifact_root / ".supervisor" / attempt_id
-    supervisor_dir.mkdir(parents=True, exist_ok=False)
     heartbeat_path = supervisor_dir / "progress.jsonl"
-    read_fd, write_fd = os.pipe()
     child_command = [sys.executable, str(WORKER_PATH), *child_argv, "--internal-worker"]
-    environment, proof = _sealed_environment(
-        contract, role, child_command, soak_approval
-    )
-    environment[PROGRESS_FD_ENV] = str(write_fd)
-    _write_json_once(supervisor_dir / "bootstrap_proof.json", proof)
+    contract: dict[str, Any] | None = None
+    proof: dict[str, Any] | None = None
+    read_fd = write_fd = -1
     child: subprocess.Popen[str] | None = None
     selector: selectors.BaseSelector | None = None
     previous_handlers: dict[int, Any] = {}
@@ -253,6 +276,24 @@ def _supervise(
         for signum in (signal.SIGTERM, signal.SIGINT):
             previous_handlers[signum] = signal.getsignal(signum)
             signal.signal(signum, interrupt)
+        supervisor_dir.mkdir(parents=True, exist_ok=False)
+    except BaseException:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        raise
+
+    try:
+        if signal_events:
+            raise InterruptedError("supervisor interrupted before setup")
+        contract = _load_contract()
+        read_fd, write_fd = os.pipe()
+        environment, proof = _sealed_environment(
+            contract, role, child_command, soak_approval
+        )
+        environment[PROGRESS_FD_ENV] = str(write_fd)
+        _write_json_once(supervisor_dir / "bootstrap_proof.json", proof)
+        if signal_events:
+            raise InterruptedError("supervisor interrupted before child spawn")
         child = subprocess.Popen(
             child_command,
             cwd=ROOT,
@@ -285,7 +326,7 @@ def _supervise(
                         line, buffer = buffer.split(b"\n", 1)
                         row = json.loads(line)
                         if not isinstance(row, dict):
-                            raise ValueError("supervisor progress row must be an object")
+                            raise TypeError("supervisor progress row must be an object")
                         heartbeat.write(line.decode("utf-8") + "\n")
                         heartbeat.flush()
                         os.fsync(heartbeat.fileno())
@@ -309,7 +350,7 @@ def _supervise(
                         line, buffer = buffer.split(b"\n", 1)
                         row = json.loads(line)
                         if not isinstance(row, dict):
-                            raise ValueError(
+                            raise TypeError(
                                 "supervisor progress row must be an object"
                             )
                         heartbeat.write(line.decode("utf-8") + "\n")
@@ -318,19 +359,20 @@ def _supervise(
         if timed_out or supervisor_error is not None:
             try:
                 termination = _terminate_child(child, supervisor_dir, contract)
-            except BaseException as termination_error:
+            except BaseException as termination_error:  # noqa: BLE001
                 termination = {
                     "error_type": type(termination_error).__name__,
                     "returncode": child.poll(),
                 }
         elif child.poll() is None:
             child.wait()
-    except BaseException as error:
+    except BaseException as error:  # noqa: BLE001
         supervisor_error = error
         if child is not None and child.poll() is None:
             try:
-                termination = _terminate_child(child, supervisor_dir, contract)
-            except BaseException as termination_error:
+                if contract is not None:
+                    termination = _terminate_child(child, supervisor_dir, contract)
+            except BaseException as termination_error:  # noqa: BLE001
                 termination = {
                     "error_type": type(termination_error).__name__,
                     "returncode": child.poll(),
@@ -346,7 +388,7 @@ def _supervise(
             try:
                 child.kill()
                 child.wait(timeout=30)
-            except BaseException as reap_error:
+            except BaseException as reap_error:  # noqa: BLE001
                 supervisor_error = supervisor_error or reap_error
     if not heartbeat_path.exists():
         heartbeat_path.touch(exist_ok=False)
@@ -360,19 +402,24 @@ def _supervise(
         if role == "resource_gate"
         else artifact_root / attempt_id / "artifact_index.json"
     )
-    (
-        child_completion_valid,
-        child_completion_sha256,
-        evidence_chain,
-    ) = _validate_child_completion(
-        child_completion_path,
-        role,
-        attempt_id,
-        child.returncode if child is not None else None,
-        float(contract["memory"]["minimum_headroom_ratio"]),
-        heartbeat_path,
-        _sha256_bytes(_canonical_bytes(proof)),
-    )
+    child_completion_valid = False
+    child_completion_sha256 = None
+    evidence_chain = None
+    if contract is not None and proof is not None:
+        (
+            child_completion_valid,
+            child_completion_sha256,
+            evidence_chain,
+        ) = _validate_child_completion(
+            child_completion_path,
+            role,
+            attempt_id,
+            child.returncode if child is not None else None,
+            float(contract["memory"]["minimum_headroom_ratio"]),
+            heartbeat_path,
+            _sha256_bytes(_canonical_bytes(proof)),
+        )
+    proof_path = supervisor_dir / "bootstrap_proof.json"
     receipt = {
         "schema_version": 1,
         "attempt_id": attempt_id,
@@ -393,11 +440,11 @@ def _supervise(
             type(supervisor_error).__name__ if supervisor_error is not None else None
         ),
         "signals_received": [signal.Signals(value).name for value in signal_events],
-        "bootstrap_proof_sha256": _sha256_file(
-            supervisor_dir / "bootstrap_proof.json"
+        "bootstrap_proof_sha256": (
+            _sha256_file(proof_path) if proof_path.is_file() else None
         ),
-        "bootstrap_proof_canonical_sha256": _sha256_bytes(
-            _canonical_bytes(proof)
+        "bootstrap_proof_canonical_sha256": (
+            _sha256_bytes(_canonical_bytes(proof)) if proof is not None else None
         ),
         "progress_sha256": _sha256_file(heartbeat_path),
         "progress_records": len(
@@ -434,64 +481,14 @@ def _git_head() -> str:
 def _load_scientific_approval(
     comment_url: str, attempt_id: str, gate_receipt: Path
 ) -> dict[str, Any]:
-    contract = _load_contract()["approval"]
-    prefixes = tuple(
-        "https://github.com/"
-        f"{contract['github_repository']}/{kind}/"
-        for kind in ("issues", "pull")
+    return verify_scientific_approval(
+        comment_url,
+        attempt_id,
+        gate_receipt,
+        _git_head(),
+        _load_contract()["approval"],
+        urllib.request.urlopen,
     )
-    if not comment_url.startswith(prefixes) or "#issuecomment-" not in comment_url:
-        raise RuntimeError("scientific approval must be an exact GitHub issue comment")
-    comment_id = comment_url.rsplit("#issuecomment-", 1)[1]
-    if not comment_id.isdigit():
-        raise RuntimeError("scientific approval comment ID is invalid")
-    api_url = (
-        "https://api.github.com/repos/"
-        f"{contract['github_repository']}/issues/comments/{comment_id}"
-    )
-    request = urllib.request.Request(
-        api_url,
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "TREAT-MMTB"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            comment = json.loads(response.read().decode("utf-8"))
-    except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
-        raise RuntimeError("GitHub approval verification is unavailable") from error
-    if not isinstance(comment, dict):
-        raise RuntimeError("GitHub approval response is invalid")
-    marker = contract["body_marker"]
-    body = str(comment.get("body", ""))
-    marker_line = f"<!-- {marker} -->"
-    if marker_line not in body:
-        raise RuntimeError("GitHub approval marker is missing")
-    try:
-        approval = json.loads(body.split(marker_line, 1)[1].strip())
-    except json.JSONDecodeError as error:
-        raise RuntimeError("GitHub approval payload is invalid") from error
-    gate_id = f"{attempt_id}-resource-gate"
-    if (
-        not isinstance(approval, dict)
-        or approval.get("schema_version") != 1
-        or approval.get("status") != "approved"
-        or approval.get("attempt_id") != attempt_id
-        or approval.get("gate_attempt_id") != gate_id
-        or approval.get("source_git_commit") != _git_head()
-        or approval.get("resource_gate_receipt_sha256")
-        != _sha256_file(gate_receipt)
-        or comment.get("user", {}).get("login") not in contract["allowed_reviewers"]
-        or comment.get("author_association")
-        not in contract["required_author_associations"]
-        or approval.get("reviewed_by") != comment.get("user", {}).get("login")
-        or approval.get("review_url") != comment_url
-        or approval.get("external_final_test_untouched") is not True
-    ):
-        raise RuntimeError("scientific soak approval differs from reviewed gate")
-    return {
-        **approval,
-        "approval_sha256": _sha256_bytes(_canonical_bytes(comment)),
-        "github_api_url": api_url,
-    }
 
 
 def main(argv: list[str] | None = None) -> int:

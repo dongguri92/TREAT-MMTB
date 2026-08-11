@@ -54,6 +54,7 @@ def _load_weights_only_checkpoint(path):
     """Load the pinned EVA-X checkpoint with an exact safe-global allowlist."""
     numpy_safe_globals = [
         set,
+        importlib.import_module("numpy._core.multiarray").scalar,
         _numpy_scalar_safe_global(),
         np.dtype,
         type(np.dtype(np.float64)),

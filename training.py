@@ -113,6 +113,7 @@ def accumulated_train_step(
     scaler=None,
     use_amp=True,
     critical_memory_observer=None,
+    critical_memory_context=None,
     stage_callback=None,
     accumulation=None,
     batch_observer=None,
@@ -139,9 +140,6 @@ def accumulated_train_step(
             'segmentation_loss': float(segmentation.item()),
             'classification_loss': float(classification.item()),
         }
-    if stage_callback is not None:
-        stage_callback("optimizer_zero_grad_before")
-    optimizer.zero_grad(set_to_none=True)
     iterator = iter(batches)
     for microbatch_index in range(accumulation):
         batch = next(iterator)
@@ -182,14 +180,18 @@ def accumulated_train_step(
 
     if stage_callback is not None:
         stage_callback("critical_memory")
-    critical_memory = (
-        critical_memory_observer() if critical_memory_observer is not None else None
-    )
+    critical_memory = None
+    if critical_memory_observer is not None:
+        critical_memory = (
+            critical_memory_observer(critical_memory_context)
+            if critical_memory_context is not None
+            else critical_memory_observer()
+        )
     if stage_callback is not None:
         stage_callback("gradient_clip")
     if scaler is not None:
         scaler.unscale_(optimizer)
-    gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 12)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 12)
     if scaler is not None:
         if stage_callback is not None:
             stage_callback("optimizer_step")
@@ -208,16 +210,14 @@ def accumulated_train_step(
     if deferred_last is None:
         raise RuntimeError("accumulated step did not produce a final microbatch")
     rows.append(materialize_row(deferred_last))
-    gradient_norm_value = float(gradient_norm.item())
     if not all(
         math.isfinite(value)
         for row in rows
         for value in row.values()
-    ) or not math.isfinite(gradient_norm_value):
+    ):
         raise FloatingPointError("accumulated optimizer step produced non-finite values")
     return {
         'microbatches': rows,
-        'gradient_norm': gradient_norm_value,
         'critical_memory': critical_memory,
     }
 
@@ -238,6 +238,7 @@ def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
     model.train()
     losses = []
     iterator = iter(loader)
+    optimizer.zero_grad(set_to_none=True)
     for group_start in range(0, usable_micro_steps, gradient_accumulation_steps):
         batches = (
             next(iterator) for _ in range(gradient_accumulation_steps)
@@ -252,6 +253,13 @@ def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
             scaler=scaler,
             use_amp=use_amp,
             critical_memory_observer=critical_memory_observer,
+            critical_memory_context={
+                'epoch': epoch + 1,
+                'optimizer_step_in_epoch': (
+                    group_start // gradient_accumulation_steps + 1
+                ),
+                'global_optimizer_step': global_step + 1,
+            },
             accumulation=gradient_accumulation_steps,
             batch_observer=(
                 first_group_batch_observer if group_start == 0 else None

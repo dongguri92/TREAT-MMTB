@@ -104,9 +104,14 @@ def main() -> int:
         "set_before_mps_runtime_validation": True,
         "sha256": "allocator",
     }
-    mps._validate_bootstrap_proof = lambda _role: {  # type: ignore[assignment]
-        "proof_sha256": "bootstrap"
+    approval = {
+        "review_url": "https://github.com/dongguri92/TREAT-MMTB/pull/5#issuecomment-1",
+        "approval_sha256": "a" * 64,
     }
+    mps._validate_bootstrap_proof = lambda _role: {  # type: ignore[assignment]
+        "proof_sha256": "bootstrap", "soak_approval": approval
+    }
+    mps.verify_scientific_approval = lambda *_args, **_kwargs: approval  # type: ignore[assignment]
     mps.datasets.dataloader = lambda **_kwargs: (  # type: ignore[assignment]
         SizedLoader(444),
         SizedLoader(111),

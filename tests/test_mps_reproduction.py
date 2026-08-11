@@ -847,7 +847,7 @@ def test_accumulated_step_materializes_scalars_only_after_adamw(
         ["backward", "item", "item", "item", "item", "item"] * 7
         + [
             "backward", "critical", "adamw",
-            "item", "item", "item", "item", "item", "item",
+            "item", "item", "item", "item", "item",
         ]
     )
 
@@ -1011,3 +1011,44 @@ def test_mps_epoch_evidence_requires_440_microsteps() -> None:
     epochs[0]["micro_steps"] = 444
     with pytest.raises(ValueError, match="microstep"):
         mps._validate_mps_epochs(epochs)
+
+
+def test_scientific_worker_requeries_github_and_rejects_forged_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt = tmp_path / "gate-receipt.json"
+    receipt.write_text("{}\n", encoding="utf-8")
+    sealed = {"review_url": "https://github.com/dongguri92/TREAT-MMTB/pull/5#issuecomment-1"}
+    args = argparse.Namespace(attempt_id="sealed", resource_gate_receipt=receipt)
+    monkeypatch.setattr(
+        mps,
+        "verify_scientific_approval",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("GitHub approval verification is unavailable")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="unavailable"):
+        mps._revalidate_scientific_approval(
+            {"soak_approval": sealed}, args, "a" * 40
+        )
+
+
+def test_resource_probe_never_synchronizes_per_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loader = _mock_successful_optimizer_probe(monkeypatch)
+    calls = 0
+
+    def synchronize() -> None:
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(mps.torch.mps, "synchronize", synchronize, raising=False)
+    mps._run_mps_optimizer_probe(
+        loader,
+        mps.torch.device("mps"),
+        tmp_path / "pretrained.pt",
+        optimizer_updates=2,
+        probe_name="schedule-parity",
+    )
+    assert calls == 1  # final disposable-process cleanup only

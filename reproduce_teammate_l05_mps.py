@@ -27,6 +27,7 @@ import numpy as np
 import torch
 
 import datasets
+from github_approval import verify_scientific_approval
 from models import modeltype
 from mps_evidence import validate_gate_artifacts
 from reproduction import (
@@ -85,6 +86,7 @@ MPS_ARTIFACT_NAMES = (
     "config.json",
     "source.json",
     "case_identity.json",
+    "bootstrap_proof.json",
     "dependency.lock",
     "resource_evidence.json",
     "acceptance_soak_heartbeat.jsonl",
@@ -93,6 +95,8 @@ MPS_ARTIFACT_NAMES = (
     "regression.json",
     "score.json",
     "best_checkpoint.pth",
+    "checkpoint_receipt.json",
+    "wandb_terminal.json",
     "run_record.json",
 )
 
@@ -260,6 +264,26 @@ def _validate_bootstrap_proof(expected_role: str) -> dict[str, Any]:
     return {**proof, "proof_sha256": digest}
 
 
+def _revalidate_scientific_approval(
+    bootstrap: dict[str, Any],
+    args: argparse.Namespace,
+    source_git_commit: str,
+) -> dict[str, Any]:
+    sealed = bootstrap.get("soak_approval")
+    if not isinstance(sealed, dict) or args.resource_gate_receipt is None:
+        raise RuntimeError("scientific worker requires sealed GitHub approval")
+    authoritative = verify_scientific_approval(
+        str(sealed.get("review_url", "")),
+        args.attempt_id,
+        args.resource_gate_receipt,
+        source_git_commit,
+        _load_mps_resource_contract()["approval"],
+    )
+    if authoritative != sealed:
+        raise RuntimeError("GitHub approval changed after supervisor sealing")
+    return authoritative
+
+
 def _supervisor_progress(event: dict[str, Any]) -> None:
     descriptor = os.environ.get("TREAT_MMTB_MPS_PROGRESS_FD")
     if descriptor is None:
@@ -284,35 +308,39 @@ def _validate_memory_headroom(snapshot: dict[str, int | None]) -> float:
     return headroom
 
 
-def _batches_fingerprint(batches: list[dict[str, Any]]) -> str:
-    digest = hashlib.sha256()
-    for batch in batches:
-        _update_batch_fingerprint(digest, batch)
-    return digest.hexdigest()
+def _case_digest(case_id: str) -> str:
+    return hashlib.sha256(case_id.encode("utf-8")).hexdigest()
 
 
-def _update_batch_fingerprint(digest: Any, batch: dict[str, Any]) -> None:
+def _batch_fingerprint_component(batch: dict[str, Any]) -> dict[str, Any]:
     ids = [str(value) for value in batch.get("id", [])]
-    digest.update(json.dumps(ids, separators=(",", ":")).encode("utf-8"))
+    tensors: dict[str, Any] = {}
     for name in ("image", "mask", "cls"):
         tensor = batch[name].detach().cpu().contiguous()
-        digest.update(str(tuple(tensor.shape)).encode("ascii"))
-        digest.update(tensor.numpy().tobytes())
+        tensors[name] = {
+            "shape": list(tensor.shape),
+            "sha256": hashlib.sha256(tensor.numpy().tobytes()).hexdigest(),
+        }
+    return {
+        "case_sha256_ordered": [_case_digest(value) for value in ids],
+        "tensors": tensors,
+    }
+
+
+def _batches_fingerprint(batches: list[dict[str, Any]]) -> str:
+    return canonical_sha256([_batch_fingerprint_component(batch) for batch in batches])
 
 
 def _fingerprint_callbacks(expected: str) -> tuple[Any, Any]:
-    digest = hashlib.sha256()
-    observed = 0
+    components: list[dict[str, Any]] = []
 
     def observe(batch: dict[str, Any], _index: int) -> None:
-        nonlocal observed
-        _update_batch_fingerprint(digest, batch)
-        observed += 1
+        components.append(_batch_fingerprint_component(batch))
 
     def validate() -> None:
-        if observed != GRADIENT_ACCUMULATION_STEPS:
+        if len(components) != GRADIENT_ACCUMULATION_STEPS:
             raise ValueError("first optimizer group fingerprint is incomplete")
-        if digest.hexdigest() != expected:
+        if canonical_sha256(components) != expected:
             raise ValueError("first optimizer group differs from sealed preview")
 
     return observe, validate
@@ -341,6 +369,7 @@ def _cleanup_mps_boundary() -> dict[str, Any]:
 
 def _critical_memory_evidence(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     memory = _memory_snapshot()
     headroom = _validate_memory_headroom(memory)
@@ -350,6 +379,7 @@ def _critical_memory_evidence(
         "headroom_ratio": headroom,
         "tensor_scalar_materialized": False,
         "explicit_mps_synchronize_called": False,
+        **(context or {}),
     }
     if progress_callback is not None:
         progress_callback(evidence)
@@ -413,9 +443,9 @@ def _run_mps_optimizer_probe(
         emitted_records += 1
         evidence["heartbeat_records_written"] = emitted_records
 
-    def observe_critical_memory() -> dict[str, Any]:
+    def observe_critical_memory(context: dict[str, Any] | None) -> dict[str, Any]:
         nonlocal minimum_headroom
-        critical = _critical_memory_evidence(progress_callback)
+        critical = _critical_memory_evidence(progress_callback, context)
         minimum_headroom = min(
             minimum_headroom, critical["headroom_ratio"]
         )
@@ -465,6 +495,7 @@ def _run_mps_optimizer_probe(
         segmentation_loss_fn = DiceCELoss(batch_dice=True)
         classification_loss_fn = torch.nn.BCEWithLogitsLoss()
         iterator = iter(loader)
+        optimizer.zero_grad(set_to_none=True)
         started = time.perf_counter()
         completed_micro_steps = 0
         for update_index in range(optimizer_updates):
@@ -516,8 +547,6 @@ def _run_mps_optimizer_probe(
                         _ = segmentation_main.argmax(1).cpu()
                         _ = torch.softmax(segmentation_main, dim=1)[:, 1].cpu()
                         _ = torch.sigmoid(classification).cpu()
-                        if callable(synchronize):
-                            synchronize()
                         memory = _memory_snapshot()
                         headroom = _validate_memory_headroom(memory)
                         minimum_headroom = min(minimum_headroom, headroom)
@@ -525,6 +554,7 @@ def _run_mps_optimizer_probe(
                             "phase": "validation_resource",
                             "validation_step": validation_index,
                             "finite_loss": True,
+                            "case_sha256": _case_digest(validation_batch_ids[0]),
                             "elapsed_seconds": time.perf_counter() - started,
                             "memory": memory,
                             "headroom_ratio": headroom,
@@ -544,7 +574,7 @@ def _run_mps_optimizer_probe(
                         "validation resource traversal is not exact 111 unique cases"
                     )
                 evidence["validation_identity_sha256"] = canonical_sha256(
-                    sorted(validation_ids)
+                    sorted(_case_digest(value) for value in validation_ids)
                 )
                 evidence["completed_validation_steps"] = len(validation_ids)
                 model.train()
@@ -561,18 +591,26 @@ def _run_mps_optimizer_probe(
                     }
                 )
             update_case_ids: list[str] = []
+            update_components: list[dict[str, Any]] = []
             fingerprint_observer = fingerprint_validator = None
             if update_index == 0 and expected_start_fingerprint is not None:
                 fingerprint_observer, fingerprint_validator = _fingerprint_callbacks(
                     expected_start_fingerprint
                 )
 
-            def update_batches() -> Any:
+            bound_iterator = iterator
+
+            def update_batches(
+                iterator_: Any = bound_iterator,
+                case_ids: list[str] = update_case_ids,
+                components: list[dict[str, Any]] = update_components,
+                observer: Any = fingerprint_observer,
+            ) -> Any:
                 nonlocal completed_micro_steps, stage
                 for _ in range(GRADIENT_ACCUMULATION_STEPS):
                     stage = "microbatch_load"
                     try:
-                        current = next(iterator)
+                        current = next(iterator_)
                     except StopIteration as error:
                         raise ValueError(
                             "probe loader exhausted before required optimizer path"
@@ -581,7 +619,9 @@ def _run_mps_optimizer_probe(
                     batch_ids = [str(value) for value in current.get("id", [])]
                     if len(batch_ids) != PHYSICAL_BATCH_SIZE:
                         raise ValueError("probe microbatch identity is missing")
-                    update_case_ids.extend(batch_ids)
+                    case_ids.extend(batch_ids)
+                    if observer is not None:
+                        components.append(_batch_fingerprint_component(current))
                     if tuple(current["image"].shape) != (
                         1, 1, TARGET_SIZE, TARGET_SIZE
                     ):
@@ -589,16 +629,21 @@ def _run_mps_optimizer_probe(
                     completed_micro_steps += 1
                     yield current
 
-            def validate_group() -> None:
-                if len(set(update_case_ids)) != GRADIENT_ACCUMULATION_STEPS:
+            def validate_group(
+                case_ids: list[str] = update_case_ids,
+                validator: Any = fingerprint_validator,
+                components: list[dict[str, Any]] = update_components,
+            ) -> None:
+                if len(set(case_ids)) != GRADIENT_ACCUMULATION_STEPS:
                     raise ValueError(
                         "optimizer update did not use 8 distinct microbatches"
                     )
-                if fingerprint_validator is not None:
-                    fingerprint_validator()
+                if validator is not None:
+                    validator()
                     evidence["loader_start_fingerprint"] = (
                         expected_start_fingerprint
                     )
+                    evidence["loader_start_components"] = components
 
             step = accumulated_train_step(
                 model,
@@ -610,14 +655,15 @@ def _run_mps_optimizer_probe(
                 scaler=None,
                 use_amp=False,
                 critical_memory_observer=observe_critical_memory,
+                critical_memory_context={
+                    "probe": probe_name,
+                    "optimizer_update": update_index + 1,
+                },
                 stage_callback=set_stage,
                 accumulation=GRADIENT_ACCUMULATION_STEPS,
                 batch_observer=fingerprint_observer,
                 group_validator=validate_group,
             )
-            stage = "synchronize"
-            if callable(synchronize):
-                synchronize()
             memory = _memory_snapshot()
             headroom = _validate_memory_headroom(memory)
             minimum_headroom = min(minimum_headroom, headroom)
@@ -632,11 +678,13 @@ def _run_mps_optimizer_probe(
                 "completed_micro_steps": completed_micro_steps,
                 "distinct_microbatches": len(set(update_case_ids)),
                 "microbatch_identity_sha256": canonical_sha256(
-                    sorted(update_case_ids)
+                    sorted(_case_digest(value) for value in update_case_ids)
                 ),
+                "microbatch_case_sha256_ordered": [
+                    _case_digest(value) for value in update_case_ids
+                ],
                 "finite_losses": True,
-                "finite_gradient_norm": True,
-                "gradient_norm": step["gradient_norm"],
+                "gradient_clip_completed": True,
                 "last_microbatch_losses": step["microbatches"][-1],
                 "critical_memory": step["critical_memory"],
                 "elapsed_seconds": time.perf_counter() - started,
@@ -698,7 +746,7 @@ def _run_mps_optimizer_probe(
         if heartbeat_stream is not None:
             try:
                 heartbeat_stream.close()
-            except BaseException as cleanup_error:
+            except BaseException as cleanup_error:  # noqa: BLE001
                 cleanup_errors.append(
                     {
                         "stage": "heartbeat_close",
@@ -711,7 +759,7 @@ def _run_mps_optimizer_probe(
         if optimizer is not None:
             try:
                 optimizer.zero_grad(set_to_none=True)
-            except BaseException as cleanup_error:
+            except BaseException as cleanup_error:  # noqa: BLE001
                 cleanup_errors.append(
                     {
                         "stage": "optimizer_zero_grad",
@@ -723,7 +771,7 @@ def _run_mps_optimizer_probe(
             if callable(zero_grad):
                 try:
                     zero_grad(set_to_none=True)
-                except BaseException as cleanup_error:
+                except BaseException as cleanup_error:  # noqa: BLE001
                     cleanup_errors.append(
                         {
                             "stage": "model_zero_grad",
@@ -735,14 +783,14 @@ def _run_mps_optimizer_probe(
             del optimizer
         try:
             gc.collect()
-        except BaseException as cleanup_error:
+        except BaseException as cleanup_error:  # noqa: BLE001
             cleanup_errors.append(
                 {"stage": "gc_collect", "error_type": type(cleanup_error).__name__}
             )
         if callable(empty_cache):
             try:
                 empty_cache()
-            except BaseException as cleanup_error:
+            except BaseException as cleanup_error:  # noqa: BLE001
                 cleanup_errors.append(
                     {
                         "stage": "empty_cache",
@@ -752,7 +800,7 @@ def _run_mps_optimizer_probe(
         if callable(synchronize):
             try:
                 synchronize()
-            except BaseException as cleanup_error:
+            except BaseException as cleanup_error:  # noqa: BLE001
                 cleanup_errors.append(
                     {
                         "stage": "synchronize_cleanup",
@@ -784,6 +832,7 @@ def _resource_evidence(
     baseline: dict[str, Any],
     dependency: dict[str, Any],
     identity_sha256: str,
+    identity: dict[str, Any],
     probe: dict[str, Any],
     acceptance_soak: dict[str, Any],
     allocator: dict[str, Any],
@@ -800,6 +849,12 @@ def _resource_evidence(
         "manifest_sha256": manifest["manifest_sha256"],
         "combined_content_sha256": content["combined_content_sha256"],
         "case_identity_sha256": identity_sha256,
+        "canonical_case_sha256": {
+            "train": [_case_digest(value) for value in identity["train"]],
+            "validation": [
+                _case_digest(value) for value in identity["validation"]
+            ],
+        },
         "pretrained_sha256": pretrained["sha256"],
         "baseline_score_sha256": baseline["score_sha256"],
         "baseline_run_record_sha256": baseline["run_record_sha256"],
@@ -946,6 +1001,31 @@ def _start_wandb(config: dict[str, Any]) -> Any:
     run.define_metric("epoch")
     run.define_metric("epoch/*", step_metric="epoch")
     return run
+
+
+def _verify_wandb_terminal(attempt_id: str) -> dict[str, Any]:
+    """Query the authoritative W&B API after finish before sealing completion."""
+    import wandb
+
+    api = wandb.Api(timeout=30)
+    remote = None
+    state = ""
+    for _ in range(12):
+        remote = api.run(f"{WANDB_ENTITY}/{WANDB_PROJECT}/{attempt_id}")
+        state = str(remote.state).lower()
+        if str(remote.id) == attempt_id and state == "finished":
+            break
+        time.sleep(5)
+    if remote is None or str(remote.id) != attempt_id or state != "finished":
+        raise RuntimeError("W&B run is not authoritatively finished")
+    return {
+        "schema_version": 1,
+        "id": str(remote.id),
+        "entity": WANDB_ENTITY,
+        "project": WANDB_PROJECT,
+        "state": state,
+        "url": str(remote.url),
+    }
 
 
 def _validate_mps_epochs(epochs: list[dict[str, Any]]) -> None:
@@ -1200,6 +1280,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     baseline,
                     dependency,
                     identity_sha256,
+                    identity,
                     error.evidence,
                     {"status": "not_started"},
                     allocator,
@@ -1271,6 +1352,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     baseline,
                     dependency,
                     identity_sha256,
+                    identity,
                     probe,
                     error.evidence,
                     allocator,
@@ -1296,6 +1378,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 baseline,
                 dependency,
                 identity_sha256,
+                identity,
                 probe,
                 acceptance_soak,
                 allocator,
@@ -1397,7 +1480,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         write_json_once(artifact_dir / "config.json", config)
         write_json_once(artifact_dir / "source.json", source)
         write_json_once(artifact_dir / "case_identity.json", identity)
+        write_json_once(artifact_dir / "bootstrap_proof.json", bootstrap)
         shutil.copyfile(MPS_LOCK_PATH, artifact_dir / "dependency.lock")
+
+        stage = "authoritative_github_approval_revalidation"
+        _revalidate_scientific_approval(bootstrap, args, source["git_commit"])
 
         stage = "wandb_start"
         wandb_run = _start_wandb(config)
@@ -1428,8 +1515,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 return_details=True,
                 gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
                 progress_callback=_supervisor_progress,
-                critical_memory_observer=lambda: _critical_memory_evidence(
-                    _supervisor_progress
+                critical_memory_observer=lambda context: _critical_memory_evidence(
+                    _supervisor_progress, context
                 ),
                 first_group_batch_observer=first_group_observer,
                 first_group_validator=first_group_validator,
@@ -1457,6 +1544,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "case_identity_sha256": identity_sha256,
         }
         torch.save(checkpoint, checkpoint_path)
+        checkpoint_receipt = {
+            "schema_version": 1,
+            "attempt_id": args.attempt_id,
+            "selected_epoch": details["best_epoch"],
+            "source_git_commit": source["git_commit"],
+            "config_sha256": sha256_file(artifact_dir / "config.json"),
+            "resource_evidence_sha256": resource_sha256,
+            "pretrained_sha256": pretrained["sha256"],
+            "case_identity_sha256": identity_sha256,
+            "checkpoint_sha256": sha256_file(checkpoint_path),
+        }
+        write_json_once(
+            artifact_dir / "checkpoint_receipt.json", checkpoint_receipt
+        )
         write_json_once(artifact_dir / "epochs.json", {"epochs": epochs})
         write_json_once(
             artifact_dir / "best_epoch_cases.json", {"cases": best["cases"]}
@@ -1508,6 +1609,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ]
         wandb_run.finish()
         wandb_run = None
+        stage = "wandb_terminal_verification"
+        wandb_terminal = _verify_wandb_terminal(args.attempt_id)
+        if wandb_terminal["url"] != str(run_url):
+            raise RuntimeError("W&B terminal URL differs from sealed run")
+        write_json_once(artifact_dir / "wandb_terminal.json", wandb_terminal)
         run_record = {
             "schema_version": 1,
             "issue_url": ISSUE_URL,
@@ -1530,6 +1636,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "runtime_seconds": time.perf_counter() - started,
             "metrics": score["metrics"],
             "resource_evidence_sha256": resource_sha256,
+            "checkpoint_receipt_sha256": sha256_file(
+                artifact_dir / "checkpoint_receipt.json"
+            ),
+            "wandb_terminal_sha256": sha256_file(
+                artifact_dir / "wandb_terminal.json"
+            ),
             "wandb_finished": True,
             "wandb": {**config["wandb"], "url": run_url},
             "artifacts": list(MPS_ARTIFACT_NAMES),
@@ -1547,6 +1659,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             },
         }
         write_json_once(artifact_dir / "artifact_index.json", artifact_index)
+        _supervisor_progress(
+            {
+                "phase": "scientific_completion",
+                "attempt_id": args.attempt_id,
+                "artifact_index_sha256": sha256_file(
+                    artifact_dir / "artifact_index.json"
+                ),
+                "checkpoint_sha256": checkpoint_receipt["checkpoint_sha256"],
+                "selected_epoch": details["best_epoch"],
+                "wandb": wandb_terminal,
+            }
+        )
         return artifact_index
     except BaseException as error:
         finish_succeeded: bool | None = None
@@ -1555,7 +1679,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             try:
                 wandb_run.finish(exit_code=1)
                 finish_succeeded = True
-            except BaseException as caught_finish_error:
+            except BaseException as caught_finish_error:  # noqa: BLE001
                 finish_succeeded = False
                 finish_error = caught_finish_error
         _safe_failure(

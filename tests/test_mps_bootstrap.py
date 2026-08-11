@@ -80,16 +80,22 @@ def _write_valid_gate(tmp_path: Path, attempt_id: str) -> Path:
             "headroom_ratio": 0.25,
         }
 
+    train_ids = [f"{index + 1:064x}" for index in range(444)]
+    validation_ids = [f"{index + 1000:064x}" for index in range(111)]
     updates = []
     for index in range(1, 77):
+        identities = [train_ids[(index * 8 + offset) % 444] for offset in range(8)]
         updates.append({
             "phase": "first_epoch_train" if index <= 55 else "next_epoch_train",
             "optimizer_update": index,
             "completed_micro_steps": index * 8,
             "distinct_microbatches": 8,
-            "microbatch_identity_sha256": f"{index:064x}",
+            "microbatch_identity_sha256": mps_evidence.canonical_sha256(
+                sorted(identities)
+            ),
+            "microbatch_case_sha256_ordered": identities,
             "finite_losses": True,
-            "finite_gradient_norm": True,
+            "gradient_clip_completed": True,
             "critical_memory": {
                 "phase": "backward_complete_pre_adamw_memory",
                 "tensor_scalar_materialized": False,
@@ -103,6 +109,7 @@ def _write_valid_gate(tmp_path: Path, attempt_id: str) -> Path:
             "phase": "validation_resource",
             "validation_step": index,
             "finite_loss": True,
+            "case_sha256": validation_ids[index - 1],
             **memory(),
         }
         for index in range(1, 112)
@@ -116,10 +123,39 @@ def _write_valid_gate(tmp_path: Path, attempt_id: str) -> Path:
         encoding="utf-8",
     )
     resource = tmp_path / "resource_evidence.json"
+    loader_components = [
+        {
+            "case_sha256_ordered": [train_ids[index]],
+            "tensors": {
+                name: {"shape": [1], "sha256": f"{100 + index * 3 + offset:064x}"}
+                for offset, name in enumerate(("image", "mask", "cls"))
+            },
+        }
+        for index in range(8)
+    ]
+    probe_update = {**updates[0], "phase": "first_epoch_train"}
+    bootstrap_proof = {
+        "dataset_identity": {
+            "canonical_case_sha256": {
+                "train": train_ids, "validation": validation_ids,
+            }
+        }
+    }
+    bootstrap_proof["proof_sha256"] = mps_evidence.canonical_sha256(
+        bootstrap_proof
+    )
     _write_json(
         resource,
         {
-            "bootstrap": {"proof_sha256": "b" * 64},
+            "bootstrap": bootstrap_proof,
+            "canonical_case_sha256": {
+                "train": train_ids, "validation": validation_ids,
+            },
+            "probe": {
+                "status": "passed", "completed_optimizer_updates": 1,
+                "completed_micro_steps": 8, "updates": [probe_update],
+                "cleanup": {"status": "passed"},
+            },
             "acceptance_soak": {
                 "status": "passed",
                 "completed_optimizer_updates": 76,
@@ -137,8 +173,13 @@ def _write_valid_gate(tmp_path: Path, attempt_id: str) -> Path:
                     "recommended_max_bytes": 100,
                 },
                 "memory_after_headroom_ratio": 0.25,
-                "validation_identity_sha256": "a" * 64,
-                "loader_start_fingerprint": "c" * 64,
+                "validation_identity_sha256": mps_evidence.canonical_sha256(
+                    sorted(validation_ids)
+                ),
+                "loader_start_components": loader_components,
+                "loader_start_fingerprint": mps_evidence.canonical_sha256(
+                    loader_components
+                ),
                 "updates": updates,
                 "validation": validation,
             },
@@ -165,7 +206,7 @@ def _write_valid_gate(tmp_path: Path, attempt_id: str) -> Path:
                 "gc_collected": True,
                 "empty_cache_completed": True,
                 "synchronize_completed": True,
-                "headroom_ratio": 0.25,
+                **memory(),
             },
         },
     )
@@ -177,28 +218,94 @@ def _write_valid_science(tmp_path: Path, attempt_id: str) -> Path:
         "expected": 111, "observed": 111, "unique": 111,
         "duplicates": 0, "missing": [], "unexpected": [],
     }
-    metrics = {
-        "classification_accuracy": 0.8, "dice": 0.3,
-        "weighted_composite": 0.65, "coverage": coverage,
-    }
+    expected_ids = sorted(f"case-{index}" for index in range(111))
+    accuracy = 89 / 111
+    dice = 0.3
+    weighted = 0.7 * accuracy + 0.3 * dice
+    metrics = {"classification_accuracy": accuracy, "dice": dice,
+               "weighted_composite": weighted, "coverage": coverage}
     artifacts = set(mps_evidence.SCIENCE_ARTIFACTS)
     for name in artifacts - {
         "run_record.json", "epochs.json", "score.json",
-        "best_epoch_cases.json", "best_checkpoint.pth",
+        "best_epoch_cases.json", "best_checkpoint.pth", "case_identity.json",
+        "source.json", "resource_evidence.json", "regression.json",
+        "checkpoint_receipt.json", "wandb_terminal.json", "bootstrap_proof.json",
     }:
         (tmp_path / name).write_text("{}\n", encoding="utf-8")
     (tmp_path / "best_checkpoint.pth").write_bytes(b"checkpoint")
+    source = {"git_commit": "a" * 40}
+    identity = {"train": [f"train-{index}" for index in range(444)],
+                "validation": expected_ids}
+    canonical_cases = {
+        split: [bootstrap._sha256_bytes(case_id.encode()) for case_id in identity[split]]
+        for split in ("train", "validation")
+    }
+    gate_receipt_sha = "c" * 64
+    bootstrap_body = {
+        "dataset_identity": {"canonical_case_sha256": canonical_cases},
+        "soak_approval": {
+            "resource_gate_receipt_sha256": gate_receipt_sha,
+            "source_git_commit": source["git_commit"],
+        },
+    }
+    bootstrap_proof = {
+        **bootstrap_body,
+        "proof_sha256": mps_evidence.canonical_sha256(bootstrap_body),
+    }
+    _write_json(tmp_path / "source.json", source)
+    _write_json(tmp_path / "case_identity.json", identity)
+    _write_json(tmp_path / "bootstrap_proof.json", bootstrap_proof)
+    _write_json(tmp_path / "config.json", {
+        "resource_gate_receipt_sha256": gate_receipt_sha,
+    })
+    _write_json(tmp_path / "resource_evidence.json", {
+        "pretrained_sha256": "b" * 64,
+        "canonical_case_sha256": canonical_cases,
+    })
     _write_json(tmp_path / "epochs.json", {"epochs": [
         {
             "epoch": epoch, "optimizer_steps": 55, "micro_steps": 440,
             "completed_train_steps": epoch * 55, "coverage": coverage,
+            "classification_accuracy": accuracy,
+            "dice": dice,
+            "weighted_composite": weighted if epoch == 3 else weighted - 0.01,
         }
         for epoch in range(1, 6)
     ]})
     _write_json(tmp_path / "score.json", {"selected_epoch": 3, "metrics": metrics})
-    _write_json(tmp_path / "best_epoch_cases.json", {"cases": [
-        {"case_id": f"case-{index}"} for index in range(111)
-    ]})
+    cases = [{"case_id": case_id, "correct": int(index < 89), "dice": dice}
+             for index, case_id in enumerate(expected_ids)]
+    _write_json(tmp_path / "best_epoch_cases.json", {"cases": cases})
+    regression_rows = [
+        {"case_id": row["case_id"],
+         "candidate_correct": bool(row["correct"]),
+         "baseline_correct": bool(row["correct"]),
+         "taxonomy": "unchanged_correct" if row["correct"] else "unchanged_error"}
+        for row in cases
+    ]
+    _write_json(tmp_path / "regression.json", {
+        "cases": regression_rows,
+        "taxonomy_counts": {"fixed": 0, "regressed": 0,
+                            "unchanged_correct": 89, "unchanged_error": 22},
+    })
+    checkpoint_receipt = {
+        "attempt_id": attempt_id, "selected_epoch": 3,
+        "source_git_commit": source["git_commit"],
+        "config_sha256": bootstrap._sha256_file(tmp_path / "config.json"),
+        "resource_evidence_sha256": bootstrap._sha256_file(
+            tmp_path / "resource_evidence.json"
+        ),
+        "pretrained_sha256": "b" * 64,
+        "case_identity_sha256": mps_evidence.canonical_sha256(identity),
+        "checkpoint_sha256": bootstrap._sha256_file(tmp_path / "best_checkpoint.pth"),
+    }
+    _write_json(tmp_path / "checkpoint_receipt.json", checkpoint_receipt)
+    wandb_terminal = {
+        "id": attempt_id, "entity": "kimhyeonwoo2431-individual",
+        "project": "treat-mmtb-task1", "state": "finished",
+        "url": f"https://wandb.ai/run/{attempt_id}",
+    }
+    _write_json(tmp_path / "wandb_terminal.json", wandb_terminal)
     run_record = tmp_path / "run_record.json"
     _write_json(
         run_record,
@@ -211,6 +318,12 @@ def _write_valid_science(tmp_path: Path, attempt_id: str) -> Path:
             "completed_optimizer_steps": 275,
             "selected_epoch": 3,
             "metrics": metrics,
+            "checkpoint_receipt_sha256": bootstrap._sha256_file(
+                tmp_path / "checkpoint_receipt.json"
+            ),
+            "wandb_terminal_sha256": bootstrap._sha256_file(
+                tmp_path / "wandb_terminal.json"
+            ),
             "artifacts": sorted(artifacts),
             "wandb": {
                 "id": attempt_id,
@@ -282,34 +395,26 @@ def test_supervisor_recomputes_raw_progress_chain(tmp_path: Path) -> None:
         .read_text(encoding="utf-8")
         .splitlines()
     ]
-    critical = {
-        "phase": "backward_complete_pre_adamw_memory",
-        "memory": {
-            "driver_allocated_bytes": 75,
-            "recommended_max_bytes": 100,
-        },
-        "headroom_ratio": 0.25,
-    }
-    progress_rows = [critical]
+    resource = json.loads((tmp_path / "resource_evidence.json").read_text())
+    progress_rows = [
+        resource["probe"]["updates"][0]["critical_memory"],
+        resource["probe"]["updates"][0],
+    ]
     for row in heartbeat_rows:
         if row.get("phase") in {"first_epoch_train", "next_epoch_train"}:
             progress_rows.append(row["critical_memory"])
         progress_rows.append(row)
-    progress_rows.append({
-        "phase": "resource_process_cleanup",
-        "memory": {
-            "driver_allocated_bytes": 75,
-            "recommended_max_bytes": 100,
-        },
-        "headroom_ratio": 0.25,
-    })
+    gate_index = json.loads(path.read_text())
+    progress_rows.append({"phase": "resource_process_cleanup",
+                          **gate_index["cleanup"]})
     progress = tmp_path / "progress.jsonl"
     progress.write_text(
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in progress_rows),
         encoding="utf-8",
     )
     valid, _digest, chain = bootstrap._validate_child_completion(
-        path, "resource_gate", "sealed-attempt", 0, 0.1, progress, "b" * 64
+        path, "resource_gate", "sealed-attempt", 0, 0.1, progress,
+        resource["bootstrap"]["proof_sha256"],
     )
     assert valid is True
     assert chain is not None
@@ -473,7 +578,8 @@ def test_execute_never_auto_chains_gate_and_science(
     )
     gate_receipt.parent.mkdir(parents=True)
     _write_json(gate_receipt, {"status": "completed"})
-    monkeypatch.setattr(bootstrap, "_git_head", lambda: "reviewed-head")
+    reviewed_head = "d" * 40
+    monkeypatch.setattr(bootstrap, "_git_head", lambda: reviewed_head)
     comment_url = (
         "https://github.com/dongguri92/TREAT-MMTB/pull/5#issuecomment-123"
     )
@@ -482,7 +588,7 @@ def test_execute_never_auto_chains_gate_and_science(
             "status": "approved",
             "attempt_id": "sealed",
             "gate_attempt_id": "sealed-resource-gate",
-            "source_git_commit": "reviewed-head",
+            "source_git_commit": reviewed_head,
             "resource_gate_receipt_sha256": bootstrap._sha256_file(gate_receipt),
             "reviewed_by": "dongguri92",
             "review_url": comment_url,
@@ -490,7 +596,7 @@ def test_execute_never_auto_chains_gate_and_science(
     }
 
     class Response:
-        def __enter__(self) -> "Response":
+        def __enter__(self) -> "Response":  # noqa: PYI034
             return self
 
         def __exit__(self, *_args: object) -> None:
@@ -509,3 +615,126 @@ def test_execute_never_auto_chains_gate_and_science(
         common + ["--scientific-run", "--soak-approval", comment_url]
     ) == 0
     assert [role for role, _ in calls] == ["resource_gate", "scientific_run"]
+
+
+def test_gate_rejects_rehashed_raw_identity_forgery(tmp_path: Path) -> None:
+    path = _write_valid_gate(tmp_path, "sealed-attempt")
+    heartbeat = tmp_path / "acceptance_soak_heartbeat.jsonl"
+    rows = [json.loads(line) for line in heartbeat.read_text().splitlines()]
+    rows[55]["case_sha256"] = "f" * 64
+    heartbeat.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    resource_path = tmp_path / "resource_evidence.json"
+    resource = json.loads(resource_path.read_text())
+    sealed_proof_sha = resource["bootstrap"]["proof_sha256"]
+    resource["acceptance_soak"]["validation"] = rows[55:166]
+    resource["acceptance_soak"]["validation_identity_sha256"] = (
+        mps_evidence.canonical_sha256(
+            sorted(row["case_sha256"] for row in rows[55:166])
+        )
+    )
+    resource["canonical_case_sha256"]["validation"][0] = "f" * 64
+    resource["bootstrap"]["dataset_identity"]["canonical_case_sha256"] = (
+        resource["canonical_case_sha256"]
+    )
+    proof_body = {
+        key: value for key, value in resource["bootstrap"].items()
+        if key != "proof_sha256"
+    }
+    resource["bootstrap"]["proof_sha256"] = mps_evidence.canonical_sha256(
+        proof_body
+    )
+    _write_json(resource_path, resource)
+    index = json.loads(path.read_text())
+    index["resource_evidence_sha256"] = bootstrap._sha256_file(resource_path)
+    index["heartbeat_sha256"] = bootstrap._sha256_file(heartbeat)
+    _write_json(path, index)
+    assert bootstrap._validate_child_completion(
+        path, "resource_gate", "sealed-attempt", 0, 0.1, None, sealed_proof_sha
+    ) == (False, None, None)
+
+
+def test_science_rejects_rehashed_raw_case_forgery(tmp_path: Path) -> None:
+    path = _write_valid_science(tmp_path, "sealed-attempt")
+    cases_path = tmp_path / "best_epoch_cases.json"
+    cases = json.loads(cases_path.read_text())
+    cases["cases"][0]["correct"] = 0
+    _write_json(cases_path, cases)
+    index = json.loads(path.read_text())
+    index["artifacts"]["best_epoch_cases.json"] = bootstrap._sha256_file(cases_path)
+    _write_json(path, index)
+    assert bootstrap._validate_child_completion(
+        path, "scientific_run", "sealed-attempt", 0, 0.1
+    ) == (False, None, None)
+
+
+def test_supervisor_requires_exact_scientific_progress_sequence(tmp_path: Path) -> None:
+    path = _write_valid_science(tmp_path, "sealed-attempt")
+    checkpoint_sha = bootstrap._sha256_file(tmp_path / "best_checkpoint.pth")
+    terminal = json.loads((tmp_path / "wandb_terminal.json").read_text())
+    rows: list[dict[str, object]] = []
+    global_step = 0
+    for epoch in range(1, 6):
+        for optimizer_step in range(1, 56):
+            global_step += 1
+            rows.append({
+                "phase": "backward_complete_pre_adamw_memory",
+                "epoch": epoch,
+                "optimizer_step_in_epoch": optimizer_step,
+                "global_optimizer_step": global_step,
+                "memory": {"driver_allocated_bytes": 75,
+                           "recommended_max_bytes": 100},
+                "headroom_ratio": 0.25,
+            })
+            for offset in range(1, 9):
+                rows.append({
+                    "phase": "scientific_train", "epoch": epoch,
+                    "micro_step": (optimizer_step - 1) * 8 + offset,
+                    "optimizer_step": global_step,
+                    "optimizer_step_completed": offset == 8,
+                })
+        rows.extend({
+            "phase": "scientific_validation", "epoch": epoch,
+            "validation_step": step,
+        } for step in range(1, 112))
+    rows.append({
+        "phase": "scientific_completion", "attempt_id": "sealed-attempt",
+        "artifact_index_sha256": bootstrap._sha256_file(path),
+        "checkpoint_sha256": checkpoint_sha, "selected_epoch": 3,
+        "wandb": terminal,
+    })
+    progress = tmp_path / "science-progress.jsonl"
+    progress.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    assert bootstrap._validate_child_completion(
+        path, "scientific_run", "sealed-attempt", 0, 0.1, progress
+    )[0] is True
+    rows[1]["micro_step"] = 2
+    progress.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    assert bootstrap._validate_child_completion(
+        path, "scientific_run", "sealed-attempt", 0, 0.1, progress
+    ) == (False, None, None)
+
+
+def test_supervisor_seals_setup_failure_after_attempt_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        bootstrap,
+        "_load_contract",
+        lambda: (_ for _ in ()).throw(RuntimeError("broken contract")),
+    )
+    with pytest.raises(RuntimeError, match="supervised resource_gate child failed"):
+        bootstrap._supervise([], "resource_gate", tmp_path, "setup-failure")
+    supervisor = tmp_path / ".supervisor" / "setup-failure"
+    receipt = json.loads((supervisor / "supervisor_receipt.json").read_text())
+    assert receipt["status"] == "failed"
+    assert receipt["supervisor_error_type"] == "RuntimeError"
+    assert (supervisor / "supervisor_index.json").is_file()

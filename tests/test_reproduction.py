@@ -221,6 +221,7 @@ def test_numpy2_scalar_uses_legacy_serialized_name_override(
         numpy2_scalar,
         models_evax.LEGACY_NUMPY_SCALAR_GLOBAL,
     ) in captured
+    assert numpy2_scalar in captured
     assert loaded["weights_only"] is True
 
 

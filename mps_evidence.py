@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -15,11 +17,27 @@ TOTAL_MICROSTEPS = TOTAL_UPDATES * GRADIENT_ACCUMULATION_STEPS
 VALIDATION_STEPS = 111
 HEARTBEAT_ROWS = TOTAL_UPDATES + VALIDATION_STEPS + 1
 SCIENCE_ARTIFACTS = {
-    "config.json", "source.json", "case_identity.json", "dependency.lock",
+    "config.json", "source.json", "case_identity.json", "bootstrap_proof.json",
+    "dependency.lock",
     "resource_evidence.json", "acceptance_soak_heartbeat.jsonl", "epochs.json",
     "best_epoch_cases.json", "regression.json", "score.json",
-    "best_checkpoint.pth", "run_record.json",
+    "best_checkpoint.pth", "checkpoint_receipt.json", "wandb_terminal.json",
+    "run_record.json",
 }
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _require_sha256(value: Any, label: str) -> str:
+    if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
+        raise ValueError(f"{label} is not a canonical SHA-256 digest")
+    return value
 
 
 def sha256_file(path: Path) -> str:
@@ -33,7 +51,7 @@ def sha256_file(path: Path) -> str:
 def _read_object(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
-        raise ValueError(f"{path.name} must contain an object")
+        raise TypeError(f"{path.name} must contain an object")
     return value
 
 
@@ -42,7 +60,7 @@ def _read_heartbeat(path: Path) -> list[dict[str, Any]]:
     for line in path.read_text(encoding="utf-8").splitlines():
         row = json.loads(line)
         if not isinstance(row, dict):
-            raise ValueError("heartbeat rows must contain objects")
+            raise TypeError("heartbeat rows must contain objects")
         rows.append(row)
     return rows
 
@@ -106,7 +124,7 @@ def _validate_phase_order(rows: list[dict[str, Any]]) -> None:
 def _headroom(record: dict[str, Any]) -> float:
     memory = record.get("memory", record)
     if not isinstance(memory, dict):
-        raise ValueError("memory evidence is incomplete")
+        raise TypeError("memory evidence is incomplete")
     driver = memory.get("driver_allocated_bytes")
     recommended = memory.get("recommended_max_bytes")
     if not isinstance(driver, int) or not isinstance(recommended, int) or recommended <= 0:
@@ -125,9 +143,35 @@ def _validate_raw_gate_rows(
     updates = soak.get("updates")
     validation = soak.get("validation")
     if not isinstance(updates, list) or not isinstance(validation, list):
-        raise ValueError("raw gate update/validation evidence is missing")
+        raise TypeError("raw gate update/validation evidence is missing")
     if len(updates) != TOTAL_UPDATES or len(validation) != VALIDATION_STEPS:
         raise ValueError("raw gate evidence count differs from contract")
+    canonical = resource.get("canonical_case_sha256", {})
+    bootstrap = resource.get("bootstrap")
+    if not isinstance(bootstrap, dict):
+        raise TypeError("bootstrap evidence is missing")
+    proof_sha256 = bootstrap.get("proof_sha256")
+    proof_body = {key: value for key, value in bootstrap.items() if key != "proof_sha256"}
+    if (
+        _require_sha256(proof_sha256, "bootstrap proof")
+        != canonical_sha256(proof_body)
+        or bootstrap.get("dataset_identity", {}).get("canonical_case_sha256")
+        != canonical
+    ):
+        raise ValueError("canonical case digests differ from sealed bootstrap source")
+    train_ids = canonical.get("train")
+    validation_ids = canonical.get("validation")
+    if (
+        not isinstance(train_ids, list)
+        or len(train_ids) != 444
+        or len(set(train_ids)) != 444
+        or not isinstance(validation_ids, list)
+        or len(validation_ids) != VALIDATION_STEPS
+        or len(set(validation_ids)) != VALIDATION_STEPS
+    ):
+        raise ValueError("canonical case digest source is incomplete")
+    for digest in [*train_ids, *validation_ids]:
+        _require_sha256(digest, "case identity")
     if rows[:FIRST_EPOCH_UPDATES] != updates[:FIRST_EPOCH_UPDATES]:
         raise ValueError("first-epoch heartbeat does not bind raw updates")
     if rows[FIRST_EPOCH_UPDATES:FIRST_EPOCH_UPDATES + VALIDATION_STEPS] != validation:
@@ -135,6 +179,19 @@ def _validate_raw_gate_rows(
     if rows[-NEXT_EPOCH_UPDATES:] != updates[-NEXT_EPOCH_UPDATES:]:
         raise ValueError("next-epoch heartbeat does not bind raw updates")
     headrooms: list[float] = []
+    probe = resource.get("probe")
+    if not isinstance(probe, dict):
+        raise TypeError("feasibility probe evidence is missing")
+    probe_updates = probe.get("updates")
+    if (
+        probe.get("status") != "passed"
+        or probe.get("completed_optimizer_updates") != 1
+        or probe.get("completed_micro_steps") != GRADIENT_ACCUMULATION_STEPS
+        or not isinstance(probe_updates, list)
+        or len(probe_updates) != 1
+        or probe.get("cleanup", {}).get("status") != "passed"
+    ):
+        raise ValueError("feasibility probe differs from exact contract")
     for memory_key, ratio_key in (
         ("memory_before", "memory_before_headroom_ratio"),
         ("memory_after_optimizer_path", "memory_after_headroom_ratio"),
@@ -145,11 +202,17 @@ def _validate_raw_gate_rows(
         }))
     for update in updates:
         critical = update.get("critical_memory")
+        identities = update.get("microbatch_case_sha256_ordered")
         if (
             update.get("distinct_microbatches") != GRADIENT_ACCUMULATION_STEPS
             or update.get("finite_losses") is not True
-            or update.get("finite_gradient_norm") is not True
-            or len(str(update.get("microbatch_identity_sha256", ""))) != 64
+            or update.get("gradient_clip_completed") is not True
+            or not isinstance(identities, list)
+            or len(identities) != GRADIENT_ACCUMULATION_STEPS
+            or len(set(identities)) != GRADIENT_ACCUMULATION_STEPS
+            or any(value not in train_ids for value in identities)
+            or update.get("microbatch_identity_sha256")
+            != canonical_sha256(sorted(identities))
             or not isinstance(critical, dict)
             or critical.get("phase") != "backward_complete_pre_adamw_memory"
             or critical.get("tensor_scalar_materialized") is not False
@@ -158,13 +221,42 @@ def _validate_raw_gate_rows(
             raise ValueError("optimizer proof is incomplete")
         headrooms.extend((_headroom(critical), _headroom(update)))
     for row in validation:
+        _require_sha256(row.get("case_sha256"), "validation case")
         if row.get("finite_loss") is not True:
             raise ValueError("validation resource proof is incomplete")
         headrooms.append(_headroom(row))
-    if len(str(soak.get("validation_identity_sha256", ""))) != 64:
-        raise ValueError("validation identity digest is missing")
-    if len(str(soak.get("loader_start_fingerprint", ""))) != 64:
-        raise ValueError("loader fingerprint is missing")
+    observed_validation = [row["case_sha256"] for row in validation]
+    if observed_validation != validation_ids:
+        raise ValueError("validation identity order differs from canonical source")
+    if soak.get("validation_identity_sha256") != canonical_sha256(
+        sorted(observed_validation)
+    ):
+        raise ValueError("validation identity digest does not recompute")
+    loader_components = soak.get("loader_start_components")
+    if (
+        not isinstance(loader_components, list)
+        or len(loader_components) != GRADIENT_ACCUMULATION_STEPS
+        or soak.get("loader_start_fingerprint")
+        != canonical_sha256(loader_components)
+    ):
+        raise ValueError("loader fingerprint does not recompute")
+    for component in loader_components:
+        if not isinstance(component, dict):
+            raise TypeError("loader component is invalid")
+        component_ids = component.get("case_sha256_ordered")
+        tensors = component.get("tensors")
+        if (
+            not isinstance(component_ids, list)
+            or len(component_ids) != 1
+            or component_ids[0] not in train_ids
+            or not isinstance(tensors, dict)
+            or set(tensors) != {"image", "mask", "cls"}
+        ):
+            raise ValueError("loader component source is incomplete")
+        for tensor in tensors.values():
+            if not isinstance(tensor, dict) or not isinstance(tensor.get("shape"), list):
+                raise TypeError("loader tensor component is incomplete")
+            _require_sha256(tensor.get("sha256"), "loader tensor")
     recomputed = min(headrooms)
     if recomputed < minimum or abs(
         float(soak.get("minimum_headroom_ratio", -1)) - recomputed
@@ -174,25 +266,26 @@ def _validate_raw_gate_rows(
 
 
 def _validate_supervisor_progress(
-    progress_path: Path, heartbeat_rows: list[dict[str, Any]]
+    progress_path: Path,
+    heartbeat_rows: list[dict[str, Any]],
+    resource: dict[str, Any],
+    cleanup: dict[str, Any],
 ) -> str:
     progress = _read_heartbeat(progress_path)
-    cursor = 0
-    cleanup_index = None
-    critical_count = 0
-    for index, row in enumerate(progress):
-        if row.get("phase") == "backward_complete_pre_adamw_memory":
+    probe_update = resource["probe"]["updates"][0]
+    expected = [probe_update["critical_memory"], probe_update]
+    for row in heartbeat_rows:
+        if row.get("phase") in {"first_epoch_train", "next_epoch_train"}:
+            expected.append(row["critical_memory"])
+        expected.append(row)
+    expected.append({"phase": "resource_process_cleanup", **cleanup})
+    if progress != expected:
+        raise ValueError("supervisor progress differs from exact gate sequence")
+    for row in progress:
+        if row.get("phase") in {
+            "backward_complete_pre_adamw_memory", "resource_process_cleanup"
+        }:
             _headroom(row)
-            critical_count += 1
-        if row.get("phase") == "resource_process_cleanup":
-            _headroom(row)
-            cleanup_index = index
-        if cursor < len(heartbeat_rows) and row == heartbeat_rows[cursor]:
-            cursor += 1
-    if cursor != len(heartbeat_rows):
-        raise ValueError("supervisor progress does not contain the gate heartbeat")
-    if cleanup_index is None or cleanup_index <= 0 or critical_count < TOTAL_UPDATES + 1:
-        raise ValueError("supervisor progress lifecycle evidence is incomplete")
     return sha256_file(progress_path)
 
 
@@ -245,7 +338,7 @@ def validate_gate_artifacts(
     progress_sha256 = None
     if supervisor_progress_path is not None:
         progress_sha256 = _validate_supervisor_progress(
-            supervisor_progress_path, rows
+            supervisor_progress_path, rows, resource, cleanup
         )
     bootstrap_sha256 = resource.get("bootstrap", {}).get("proof_sha256")
     if (
@@ -267,7 +360,84 @@ def validate_gate_artifacts(
     }
 
 
-def validate_scientific_artifacts(science_dir: Path, attempt_id: str) -> dict[str, Any]:
+def _same_number(left: Any, right: Any) -> bool:
+    return (
+        isinstance(left, (int, float))
+        and isinstance(right, (int, float))
+        and math.isfinite(float(left))
+        and math.isfinite(float(right))
+        and abs(float(left) - float(right)) <= 1e-12
+    )
+
+
+def _validate_scientific_progress(
+    progress_path: Path,
+    attempt_id: str,
+    artifact_index_sha256: str,
+    checkpoint_sha256: str,
+    selected_epoch: int,
+    wandb_terminal: dict[str, Any],
+) -> str:
+    rows = _read_heartbeat(progress_path)
+    cursor = 0
+    global_step = 0
+    for epoch in range(1, 6):
+        for optimizer_step in range(1, 56):
+            global_step += 1
+            critical = rows[cursor]
+            cursor += 1
+            if (
+                critical.get("phase") != "backward_complete_pre_adamw_memory"
+                or critical.get("epoch") != epoch
+                or critical.get("optimizer_step_in_epoch") != optimizer_step
+                or critical.get("global_optimizer_step") != global_step
+            ):
+                raise ValueError("scientific critical-memory sequence is invalid")
+            _headroom(critical)
+            for offset in range(1, 9):
+                train = rows[cursor]
+                cursor += 1
+                expected_micro = (optimizer_step - 1) * 8 + offset
+                if (
+                    train.get("phase") != "scientific_train"
+                    or train.get("epoch") != epoch
+                    or train.get("micro_step") != expected_micro
+                    or train.get("optimizer_step") != global_step
+                    or train.get("optimizer_step_completed") is not (offset == 8)
+                ):
+                    raise ValueError("scientific train progress sequence is invalid")
+        for validation_step in range(1, 112):
+            validation = rows[cursor]
+            cursor += 1
+            if (
+                validation.get("phase") != "scientific_validation"
+                or validation.get("epoch") != epoch
+                or validation.get("validation_step") != validation_step
+            ):
+                raise ValueError("scientific validation progress sequence is invalid")
+    if cursor >= len(rows):
+        raise ValueError("scientific completion progress is missing")
+    completion = rows[cursor]
+    cursor += 1
+    if (
+        cursor != len(rows)
+        or completion.get("phase") != "scientific_completion"
+        or completion.get("attempt_id") != attempt_id
+        or completion.get("artifact_index_sha256") != artifact_index_sha256
+        or completion.get("checkpoint_sha256") != checkpoint_sha256
+        or completion.get("selected_epoch") != selected_epoch
+        or completion.get("wandb") != wandb_terminal
+    ):
+        raise ValueError("scientific completion progress is invalid")
+    return sha256_file(progress_path)
+
+
+def validate_scientific_artifacts(
+    science_dir: Path,
+    attempt_id: str,
+    supervisor_progress_path: Path | None = None,
+    expected_bootstrap_proof_sha256: str | None = None,
+) -> dict[str, Any]:
     index_path = science_dir / "artifact_index.json"
     index = _read_object(index_path)
     artifacts = index.get("artifacts")
@@ -287,16 +457,77 @@ def validate_scientific_artifacts(science_dir: Path, attempt_id: str) -> dict[st
     epochs = _read_object(science_dir / "epochs.json").get("epochs")
     score = _read_object(science_dir / "score.json")
     cases = _read_object(science_dir / "best_epoch_cases.json").get("cases")
+    identity = _read_object(science_dir / "case_identity.json")
+    config = _read_object(science_dir / "config.json")
+    source = _read_object(science_dir / "source.json")
+    bootstrap = _read_object(science_dir / "bootstrap_proof.json")
+    resource = _read_object(science_dir / "resource_evidence.json")
+    regression = _read_object(science_dir / "regression.json")
+    checkpoint_receipt = _read_object(science_dir / "checkpoint_receipt.json")
+    wandb_terminal = _read_object(science_dir / "wandb_terminal.json")
+    bootstrap_sha = bootstrap.get("proof_sha256")
+    bootstrap_body = {
+        key: value for key, value in bootstrap.items() if key != "proof_sha256"
+    }
+    if (
+        _require_sha256(bootstrap_sha, "scientific bootstrap proof")
+        != canonical_sha256(bootstrap_body)
+        or (
+            expected_bootstrap_proof_sha256 is not None
+            and bootstrap_sha != expected_bootstrap_proof_sha256
+        )
+        or bootstrap.get("dataset_identity", {}).get("canonical_case_sha256")
+        != resource.get("canonical_case_sha256")
+        or config.get("resource_gate_receipt_sha256")
+        != bootstrap.get("soak_approval", {}).get("resource_gate_receipt_sha256")
+        or source.get("git_commit")
+        != bootstrap.get("soak_approval", {}).get("source_git_commit")
+    ):
+        raise ValueError("scientific artifacts differ from sealed bootstrap source")
     if not isinstance(epochs, list) or len(epochs) != 5:
         raise ValueError("scientific epoch evidence is incomplete")
     if not isinstance(cases, list) or len(cases) != 111:
         raise ValueError("scientific case evidence is incomplete")
     case_ids = [row.get("case_id") for row in cases if isinstance(row, dict)]
-    if len(case_ids) != 111 or len(set(case_ids)) != 111:
+    expected_ids = identity.get("validation")
+    expected_digests = [
+        hashlib.sha256(str(case_id).encode("utf-8")).hexdigest()
+        for case_id in expected_ids
+    ] if isinstance(expected_ids, list) else []
+    if (
+        not isinstance(expected_ids, list)
+        or len(expected_ids) != 111
+        or len(set(expected_ids)) != 111
+        or case_ids != expected_ids
+        or expected_digests != resource.get("canonical_case_sha256", {}).get(
+            "validation"
+        )
+    ):
         raise ValueError("scientific case identity coverage is incomplete")
+    correct = [row.get("correct") for row in cases]
+    dice_values = [row.get("dice") for row in cases if row.get("dice") is not None]
+    if (
+        any(value not in (0, 1) for value in correct)
+        or not dice_values
+        or any(not isinstance(value, (int, float)) for value in dice_values)
+    ):
+        raise ValueError("scientific raw case metrics are incomplete")
+    accuracy = sum(correct) / len(correct)
+    dice = sum(float(value) for value in dice_values) / len(dice_values)
+    weighted = 0.7 * accuracy + 0.3 * dice
+    metrics = score.get("metrics", {})
+    if not all(
+        _same_number(metrics.get(name), value)
+        for name, value in (
+            ("classification_accuracy", accuracy),
+            ("dice", dice),
+            ("weighted_composite", weighted),
+        )
+    ):
+        raise ValueError("scientific aggregate metrics do not recompute")
     for number, epoch in enumerate(epochs, start=1):
         if not isinstance(epoch, dict):
-            raise ValueError("scientific epoch evidence is incomplete")
+            raise TypeError("scientific epoch evidence is incomplete")
         coverage = epoch.get("coverage", {})
         if (
             epoch.get("epoch") != number
@@ -311,6 +542,48 @@ def validate_scientific_artifacts(science_dir: Path, attempt_id: str) -> dict[st
             or coverage.get("unexpected") != []
         ):
             raise ValueError("scientific epoch coverage is incomplete")
+    selected_epoch = score.get("selected_epoch")
+    best_epoch = max(epochs, key=lambda row: float(row["weighted_composite"]))
+    if (
+        not isinstance(selected_epoch, int)
+        or selected_epoch != best_epoch.get("epoch")
+        or not all(
+            _same_number(metrics.get(name), best_epoch.get(name))
+            for name in ("classification_accuracy", "dice", "weighted_composite")
+        )
+    ):
+        raise ValueError("scientific best epoch selection does not recompute")
+    regression_rows = regression.get("cases")
+    if not isinstance(regression_rows, list) or len(regression_rows) != 111:
+        raise ValueError("scientific regression rows are incomplete")
+    regression_ids = [
+        row.get("case_id") for row in regression_rows if isinstance(row, dict)
+    ]
+    if regression_ids != sorted(expected_ids) or len(set(regression_ids)) != 111:
+        raise ValueError("scientific regression identity coverage is invalid")
+    candidate = {row["case_id"]: row for row in cases}
+    taxonomy_counts = {
+        "fixed": 0, "regressed": 0, "unchanged_correct": 0, "unchanged_error": 0
+    }
+    for row in regression_rows:
+        if not isinstance(row, dict) or row.get("case_id") not in candidate:
+            raise ValueError("scientific regression identity is invalid")
+        child = candidate[row["case_id"]]
+        if row.get("candidate_correct") is not bool(child["correct"]):
+            raise ValueError("scientific regression correctness differs from raw case")
+        parent_correct = row.get("baseline_correct")
+        child_correct = bool(child["correct"])
+        expected_taxonomy = (
+            "fixed" if child_correct and parent_correct is False
+            else "regressed" if not child_correct and parent_correct is True
+            else "unchanged_correct" if child_correct
+            else "unchanged_error"
+        )
+        if row.get("taxonomy") != expected_taxonomy:
+            raise ValueError("scientific regression taxonomy does not recompute")
+        taxonomy_counts[expected_taxonomy] += 1
+    if regression.get("taxonomy_counts") != taxonomy_counts:
+        raise ValueError("scientific regression counts do not recompute")
     wandb = run_record.get("wandb", {})
     if (
         run_record.get("status") != "completed"
@@ -329,10 +602,49 @@ def validate_scientific_artifacts(science_dir: Path, attempt_id: str) -> dict[st
         or (science_dir / "best_checkpoint.pth").stat().st_size <= 0
     ):
         raise ValueError("scientific run record is incomplete")
+    checkpoint_sha256 = sha256_file(science_dir / "best_checkpoint.pth")
+    if (
+        checkpoint_receipt.get("attempt_id") != attempt_id
+        or checkpoint_receipt.get("selected_epoch") != selected_epoch
+        or checkpoint_receipt.get("source_git_commit") != source.get("git_commit")
+        or checkpoint_receipt.get("config_sha256")
+        != sha256_file(science_dir / "config.json")
+        or checkpoint_receipt.get("resource_evidence_sha256")
+        != sha256_file(science_dir / "resource_evidence.json")
+        or checkpoint_receipt.get("pretrained_sha256")
+        != resource.get("pretrained_sha256")
+        or checkpoint_receipt.get("case_identity_sha256")
+        != canonical_sha256(identity)
+        or checkpoint_receipt.get("checkpoint_sha256") != checkpoint_sha256
+        or run_record.get("checkpoint_receipt_sha256")
+        != sha256_file(science_dir / "checkpoint_receipt.json")
+    ):
+        raise ValueError("scientific checkpoint semantic binding is invalid")
+    if (
+        wandb_terminal.get("id") != attempt_id
+        or wandb_terminal.get("entity") != "kimhyeonwoo2431-individual"
+        or wandb_terminal.get("project") != "treat-mmtb-task1"
+        or wandb_terminal.get("state") != "finished"
+        or wandb_terminal.get("url") != wandb.get("url")
+        or run_record.get("wandb_terminal_sha256")
+        != sha256_file(science_dir / "wandb_terminal.json")
+    ):
+        raise ValueError("scientific W&B terminal evidence is invalid")
+    progress_sha256 = None
+    if supervisor_progress_path is not None:
+        progress_sha256 = _validate_scientific_progress(
+            supervisor_progress_path,
+            attempt_id,
+            sha256_file(index_path),
+            checkpoint_sha256,
+            selected_epoch,
+            wandb_terminal,
+        )
     return {
         "artifact_index_sha256": sha256_file(index_path),
         "run_record_sha256": sha256_file(science_dir / "run_record.json"),
-        "checkpoint_sha256": sha256_file(science_dir / "best_checkpoint.pth"),
+        "checkpoint_sha256": checkpoint_sha256,
         "score_sha256": sha256_file(science_dir / "score.json"),
         "case_evidence_sha256": sha256_file(science_dir / "best_epoch_cases.json"),
+        "supervisor_progress_sha256": progress_sha256,
     }
