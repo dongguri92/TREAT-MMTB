@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -944,16 +945,16 @@ def test_primary_probe_failure_survives_heartbeat_sealing_error(
         original_open = Path.open
 
         class FailingFlushStream:
-            def __init__(self, stream: object) -> None:
+            def __init__(self, stream: Any) -> None:
                 self.stream = stream
 
-            def __getattr__(self, name: str) -> object:
+            def __getattr__(self, name: str) -> Any:
                 return getattr(self.stream, name)
 
             def flush(self) -> None:
                 fail()
 
-        def open_with_failing_flush(path: Path, *args: object, **kwargs: object) -> object:
+        def open_with_failing_flush(path: Path, *args: Any, **kwargs: Any) -> Any:
             stream = original_open(path, *args, **kwargs)
             if path.name.endswith(".jsonl"):
                 return FailingFlushStream(stream)
