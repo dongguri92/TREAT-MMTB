@@ -63,6 +63,107 @@ def compute_lr(epoch, max_epochs, initial_lr, scheduler='poly', warmup_epochs=0)
     from utils import poly_lr
     return poly_lr(epoch, max_epochs, initial_lr)
 
+
+def build_continuation_scheduler_state(
+        scheduler, warmup_epochs, initial_lr, original_horizon_epochs,
+        completed_epochs,
+        last_learning_rates, target_total_epochs=150):
+    """Seal the completed schedule and an exact epoch-51+ continuation rule."""
+    if (
+        completed_epochs <= 0
+        or original_horizon_epochs != completed_epochs
+        or target_total_epochs <= completed_epochs
+    ):
+        raise ValueError('continuation scheduler horizons are invalid')
+    if scheduler != 'cosine':
+        raise ValueError('reviewed continuation supports only cosine scheduling')
+    rates = [float(value) for value in last_learning_rates]
+    if not rates or any(not math.isfinite(value) or value < 0 for value in rates):
+        raise ValueError('continuation scheduler learning rates are invalid')
+    return {
+        'schema_version': 1,
+        'kind': scheduler,
+        'warmup_epochs': warmup_epochs,
+        'initial_lr': initial_lr,
+        'original_horizon_epochs': original_horizon_epochs,
+        'next_epoch': completed_epochs,
+        'last_learning_rates': rates,
+        'continuation': {
+            'kind': 'cosine',
+            'start_epoch': completed_epochs,
+            'target_total_epochs': target_total_epochs,
+            'horizon_epochs': target_total_epochs - completed_epochs,
+            'warmup_epochs': 0,
+            'initial_learning_rates': rates,
+            'minimum_learning_rates': [0.0 for _ in rates],
+        },
+    }
+
+
+def continuation_learning_rates(scheduler_state, epoch):
+    """Return the sealed LR for a zero-based continuation epoch."""
+    continuation = scheduler_state['continuation']
+    start_epoch = int(continuation['start_epoch'])
+    target_total_epochs = int(continuation['target_total_epochs'])
+    horizon_epochs = int(continuation['horizon_epochs'])
+    if epoch < start_epoch or epoch >= target_total_epochs:
+        raise ValueError('epoch lies outside the sealed continuation horizon')
+    if horizon_epochs != target_total_epochs - start_epoch:
+        raise ValueError('continuation scheduler horizon is inconsistent')
+    progress = (epoch - start_epoch) / max(1, horizon_epochs)
+    scale = 0.5 * (1 + math.cos(math.pi * progress))
+    initial = continuation['initial_learning_rates']
+    minimum = continuation['minimum_learning_rates']
+    if len(initial) != len(minimum) or not initial:
+        raise ValueError('continuation scheduler parameter groups are invalid')
+    return [
+        float(floor) + (float(rate) - float(floor)) * scale
+        for rate, floor in zip(initial, minimum)
+    ]
+
+
+def restore_continuation_rng_state(continuation_state, train_loader, device):
+    """Restore every RNG stream used by the reviewed single-process loader."""
+    loader_state = continuation_state['train_loader_rng_state']
+    if (
+        loader_state.get('num_workers') != 0
+        or loader_state.get('persistent_workers') is not False
+        or loader_state.get('worker_rng_states') != []
+        or getattr(train_loader, 'num_workers', None) != 0
+        or getattr(train_loader, 'persistent_workers', None) is not False
+    ):
+        raise ValueError('exact continuation requires a zero-worker DataLoader')
+    generator = getattr(train_loader, 'generator', None)
+    if not isinstance(generator, torch.Generator):
+        raise TypeError('exact continuation requires the dedicated loader generator')
+    random.setstate(continuation_state['python_rng_state'])
+    np.random.set_state(continuation_state['numpy_rng_state'])
+    torch.set_rng_state(continuation_state['torch_rng_state'])
+    generator.set_state(loader_state['generator_state'])
+    if device.type == 'mps':
+        set_mps_rng_state = getattr(torch.mps, 'set_rng_state', None)
+        if not callable(set_mps_rng_state):
+            raise RuntimeError('MPS continuation requires RNG-state restore support')
+        set_mps_rng_state(continuation_state['mps_rng_state'])
+
+
+def restore_continuation_training_state(
+        continuation_state, model, optimizer, train_loader, device):
+    """Restore model, optimizer, scheduler phase, and all continuation RNG."""
+    model.load_state_dict(continuation_state['model'])
+    optimizer.load_state_dict(continuation_state['optimizer'])
+    restore_continuation_rng_state(continuation_state, train_loader, device)
+    next_epoch = int(continuation_state['completed_epochs'])
+    scheduler_state = continuation_state['scheduler']
+    if int(scheduler_state['next_epoch']) != next_epoch:
+        raise ValueError('continuation epoch and scheduler phase differ')
+    learning_rates = continuation_learning_rates(scheduler_state, next_epoch)
+    if len(learning_rates) != len(optimizer.param_groups):
+        raise ValueError('continuation optimizer parameter groups differ')
+    for group, learning_rate in zip(optimizer.param_groups, learning_rates):
+        group['lr'] = learning_rate
+    return {'next_epoch': next_epoch, 'learning_rates': learning_rates}
+
 def make_optimizer(model, initial_lr=1e-2, weight_decay=3e-5,
                    optimizer_name='sgd'):
     if optimizer_name == 'adamw':
@@ -402,6 +503,52 @@ def fit(model, train_loader, val_loader, device,
             raise RuntimeError("MPS continuation requires RNG-state support")
         if device.type == "mps" and callable(get_mps_rng_state):
             mps_rng = get_mps_rng_state()
+        loader_generator = getattr(train_loader, 'generator', None)
+        last_learning_rates = [
+            group['lr'] for group in optimizer.param_groups
+        ]
+        exact_loader_rng = (
+            isinstance(loader_generator, torch.Generator)
+            and getattr(train_loader, 'num_workers', None) == 0
+            and getattr(train_loader, 'persistent_workers', None) is False
+            and scheduler == 'cosine'
+        )
+        if exact_loader_rng:
+            assert isinstance(loader_generator, torch.Generator)
+            scheduler_state = build_continuation_scheduler_state(
+                scheduler,
+                warmup_epochs,
+                initial_lr,
+                max_epochs,
+                len(epoch_records),
+                last_learning_rates,
+            )
+            loader_rng_state = {
+                'generator_state': loader_generator.get_state(),
+                'num_workers': 0,
+                'persistent_workers': False,
+                'worker_rng_states': [],
+                'worker_rng_policy': 'single_process_no_worker_rng',
+            }
+        else:
+            scheduler_state = {
+                'kind': scheduler,
+                'warmup_epochs': warmup_epochs,
+                'initial_lr': initial_lr,
+                'original_horizon_epochs': max_epochs,
+                'next_epoch': len(epoch_records),
+                'last_learning_rates': last_learning_rates,
+                'continuation': None,
+            }
+            loader_rng_state = {
+                'generator_state': None,
+                'num_workers': getattr(train_loader, 'num_workers', None),
+                'persistent_workers': getattr(
+                    train_loader, 'persistent_workers', None
+                ),
+                'worker_rng_states': None,
+                'worker_rng_policy': 'not_exact_generic_fit',
+            }
         return {
             'best_score': best_score,
             'best_epoch': best_epoch + 1,
@@ -417,21 +564,14 @@ def fit(model, train_loader, val_loader, device,
             'continuation_state': {
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'scheduler': {
-                    'kind': scheduler,
-                    'warmup_epochs': warmup_epochs,
-                    'initial_lr': initial_lr,
-                    'next_epoch': len(epoch_records),
-                    'last_learning_rates': [
-                        group['lr'] for group in optimizer.param_groups
-                    ],
-                },
+                'scheduler': scheduler_state,
                 'completed_epochs': len(epoch_records),
                 'global_optimizer_updates': global_step,
                 'python_rng_state': random.getstate(),
                 'numpy_rng_state': np.random.get_state(),
                 'torch_rng_state': torch.get_rng_state(),
                 'mps_rng_state': mps_rng,
+                'train_loader_rng_state': loader_rng_state,
             },
         }
     return best_score, best_epoch

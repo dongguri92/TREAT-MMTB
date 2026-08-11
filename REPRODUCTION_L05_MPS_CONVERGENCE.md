@@ -11,7 +11,10 @@ classification-veto `0.005` contract.
 an immutable, independently reviewed health approval receipt whose exact
 health run record and artifact index hashes are bound to the new attempt ID.
 Validation rehashes every file covered by that index, including the actual
-`best_checkpoint.pth` bytes. It rebuilds the prospective source,
+`best_checkpoint.pth` bytes. Authorization files are opened once without
+following a final symlink, their opened descriptor identity is checked against
+the approved canonical path, and consumers parse or load the same captured
+bytes rather than reopening a path. It rebuilds the prospective source,
 manifest/content, pretrained, baseline, dependency, and resource contract and
 requires exact equality after normalizing only attempt, phase, epoch, and W&B
 run identity. The approved health head and convergence head differ, so a
@@ -24,6 +27,8 @@ review receipt, uses a distinct W&B identity with `resume=never`, and forbids
 external-final access. Dry-run writes that specification once under
 `<artifact-root>/queue_specs/`; execution requires a separate reviewer approval
 bound to its exact SHA-256. A retry is a new reviewed attempt and directory.
+The convergence protocol requires `num_workers=0`; this removes unobservable
+persistent-worker RNG from the continuation boundary.
 
 The successful 50-epoch path preserves the base runner's signal handling:
 SIGINT/SIGTERM finish active W&B with `exit_code=1`, write an immutable
@@ -35,6 +40,9 @@ config, run record, best checkpoint, exact epoch-50 continuation checkpoint,
 and convergence decision. The pending Issue #93 handoff then binds both indexes
 and both checkpoints. W&B name/group/job type are convergence-specific and the
 run record requires post-finish API verification of the complete identity.
+The exact reviewed queue-approval bytes are copied write-once into
+`queue_approval.json`, included in the base artifact index, and compared with
+the revalidated original approval again during final sealing.
 
 ## Conditional epoch-150 semantics
 
@@ -46,8 +54,12 @@ plateau. Eligibility produces only a request for fresh independent review.
 The safest preregistered extension semantics are an exact continuation from
 the distinct sealed epoch-50 checkpoint to total epoch 150. It contains model,
 optimizer, scheduler/LR phase, completed epoch/update counters, and
-Python/NumPy/Torch/MPS RNG state; the independently selected best checkpoint
-remains separate.
+Python/NumPy/Torch/MPS RNG state. It also contains the dedicated shuffled
+DataLoader generator state, an explicit empty worker-RNG set under the
+zero-worker policy, the completed 50-epoch scheduler horizon, and the exact
+cosine epoch-51-through-150 rule. Machine-readable continuation fields point
+only to `continuation_epoch_50.pth`; the independently selected best checkpoint
+remains separate and is never a continuation source.
 That continuation requires a new runner/spec/attempt/W&B ID and review receipt;
 this amendment deliberately contains no executable epoch-150 path.
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import shutil
@@ -90,6 +91,15 @@ class RunInterrupted(KeyboardInterrupt):
         self.signum = signum
         self.signal_name = signal.Signals(signum).name
         super().__init__(f"run interrupted by {self.signal_name}")
+
+
+def _write_bytes_once(path: Path, data: bytes) -> None:
+    if not isinstance(data, bytes):
+        raise TypeError("write-once artifact must be exact bytes")
+    with path.open("xb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _install_interrupt_handlers() -> dict[signal.Signals, Any]:
@@ -551,6 +561,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--execute requires a non-empty --reviewed-by attestation")
 
     artifact_dir.mkdir(parents=True, exist_ok=False)
+    execution_approval_bytes = getattr(args, "execution_approval_bytes", None)
+    if execution_approval_bytes is not None:
+        _write_bytes_once(
+            artifact_dir / "queue_approval.json", execution_approval_bytes
+        )
     wandb_run: Any = None
     stage = "source_identity"
     previous_handlers = _install_interrupt_handlers()

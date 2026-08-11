@@ -9,16 +9,22 @@ attempt ID, queue specification, and exact epoch-50 checkpoint receipt.
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
 import math
+import os
+import stat
 import subprocess
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import reproduce_teammate_l05_mps as engine
 from reproduction import canonical_sha256, sha256_file, write_json_once
+from training import continuation_learning_rates
 
 ISSUE_URL = "https://github.com/choco9966/TREAT-MMTB-2026/issues/95"
 EPOCHS = 50
@@ -28,8 +34,13 @@ PLATEAU_SLOPE_TOLERANCE = 0.0002
 EXTENSION_COMPOSITE_SLOPE = 0.0002
 SHORT_BUDGET_NOISE_FLOOR = 0.01
 CONTINUATION_CHECKPOINT = "continuation_epoch_50.pth"
+QUEUE_APPROVAL_ARTIFACT = "queue_approval.json"
 HEALTH_ARTIFACT_NAMES = tuple(engine.MPS_ARTIFACT_NAMES)
-CONVERGENCE_ARTIFACT_NAMES = (*HEALTH_ARTIFACT_NAMES, CONTINUATION_CHECKPOINT)
+CONVERGENCE_ARTIFACT_NAMES = (
+    *HEALTH_ARTIFACT_NAMES,
+    CONTINUATION_CHECKPOINT,
+    QUEUE_APPROVAL_ARTIFACT,
+)
 EXECUTION_SURFACE = (
     "datasets.py",
     "eva_x.py",
@@ -44,11 +55,120 @@ EXECUTION_SURFACE = (
 )
 
 
-def _read_json_object(path: Path, label: str) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+_AUTHORIZATION_READ_HOOK: Any = None
+
+
+def _descriptor_path(descriptor: int, label: str) -> Path:
+    if sys.platform == "darwin":
+        raw = fcntl.fcntl(descriptor, 50, b"\0" * 1024)
+        if isinstance(raw, bytes):
+            value = raw.split(b"\0", 1)[0].decode()
+            if value:
+                return Path(value).resolve()
+    proc_path = Path(f"/proc/self/fd/{descriptor}")
+    if proc_path.exists():
+        return proc_path.resolve()
+    raise RuntimeError(f"cannot verify opened identity for {label}")
+
+
+def _open_verified_descriptor(path: Path | str, label: str) -> tuple[int, os.stat_result]:
+    resolved = _safe_path(path, label)
+    hook = _AUTHORIZATION_READ_HOOK
+    if callable(hook):
+        hook(resolved)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(resolved, flags)
+    try:
+        opened_path = _descriptor_path(descriptor, label)
+        engine.reject_external_final_path(opened_path, label)
+        if opened_path != resolved:
+            raise ValueError(f"{label} opened identity differs from approved path")
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"{label} must be a regular file")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, before
+
+
+def _stable_descriptor(descriptor: int, before: os.stat_result, label: str) -> None:
+    after = os.fstat(descriptor)
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise ValueError(f"{label} changed while being read")
+
+
+def _read_verified_bytes(
+    path: Path | str, label: str, expected_sha256: str | None = None
+) -> tuple[bytes, str]:
+    descriptor, before = _open_verified_descriptor(path, label)
+    try:
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            data = handle.read()
+        _stable_descriptor(descriptor, before, label)
+    finally:
+        os.close(descriptor)
+    digest = hashlib.sha256(data).hexdigest()
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise ValueError(f"{label} bytes do not match approval/index")
+    return data, digest
+
+
+def _read_verified_json(
+    path: Path | str, label: str, expected_sha256: str | None = None
+) -> tuple[dict[str, Any], bytes, str]:
+    data, digest = _read_verified_bytes(path, label, expected_sha256)
+    payload = json.loads(data)
     if not isinstance(payload, dict):
         raise TypeError(f"{label} must be a JSON object")
-    return payload
+    return payload, data, digest
+
+
+def _hash_verified_file(
+    path: Path | str, label: str, expected_sha256: str | None = None
+) -> str:
+    descriptor, before = _open_verified_descriptor(path, label)
+    hasher = hashlib.sha256()
+    try:
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        _stable_descriptor(descriptor, before, label)
+    finally:
+        os.close(descriptor)
+    digest = hasher.hexdigest()
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise ValueError(f"{label} bytes do not match approval/index")
+    return digest
+
+
+def _load_verified_torch(
+    path: Path | str, label: str, expected_sha256: str
+) -> tuple[Any, str]:
+    descriptor, before = _open_verified_descriptor(path, label)
+    hasher = hashlib.sha256()
+    try:
+        with tempfile.TemporaryFile(mode="w+b") as snapshot:
+            with os.fdopen(descriptor, "rb", closefd=False) as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+                    snapshot.write(chunk)
+            _stable_descriptor(descriptor, before, label)
+            digest = hasher.hexdigest()
+            if digest != expected_sha256:
+                raise ValueError(f"{label} bytes do not match approval/index")
+            snapshot.seek(0)
+            payload = engine.torch.load(
+                snapshot, map_location="cpu", weights_only=False
+            )
+    finally:
+        os.close(descriptor)
+    return payload, digest
 
 
 def _safe_path(path: Path | str, label: str, *, require_absolute: bool = True) -> Path:
@@ -82,10 +202,9 @@ def _head_source() -> dict[str, str]:
 def _validate_source_delta(
     path: Path, expected_sha256: str, health_source: Mapping[str, Any]
 ) -> dict[str, Any]:
-    resolved = _safe_path(path, "source_delta")
-    if resolved.is_symlink() or sha256_file(resolved) != expected_sha256:
-        raise ValueError("source-delta receipt bytes do not match approval")
-    delta = _read_json_object(resolved, "source-delta receipt")
+    delta, _, _ = _read_verified_json(
+        path, "source-delta receipt", expected_sha256
+    )
     current_source = _head_source()
     if (
         set(delta)
@@ -110,27 +229,35 @@ def _validate_source_delta(
 
 
 def _indexed_health_artifacts(
-    index_path: Path, index: Mapping[str, Any]
-) -> dict[str, Path]:
+    index_path: Path,
+    index: Mapping[str, Any],
+    preverified: Mapping[str, tuple[bytes, str]],
+) -> tuple[dict[str, Path], dict[str, bytes]]:
     artifacts = index.get("artifacts")
     if not isinstance(artifacts, dict) or set(artifacts) != set(HEALTH_ARTIFACT_NAMES):
         raise ValueError("health artifact index does not cover the exact artifact set")
     root = _safe_path(index_path.parent, "health artifact root")
     resolved: dict[str, Path] = {}
+    captured: dict[str, bytes] = {}
     for name in HEALTH_ARTIFACT_NAMES:
         expected = artifacts.get(name)
         path = _safe_path(root / name, f"health artifact {name}")
-        if (
-            not isinstance(expected, str)
-            or len(expected) != 64
-            or path.is_symlink()
-            or not path.is_file()
-            or path.parent != root
-            or sha256_file(path) != expected
-        ):
+        if not isinstance(expected, str) or len(expected) != 64 or path.parent != root:
             raise ValueError(f"health indexed artifact bytes differ: {name}")
+        if name in preverified:
+            data, digest = preverified[name]
+            if digest != expected:
+                raise ValueError(f"health indexed artifact bytes differ: {name}")
+            captured[name] = data
+        elif name in {"config.json", "source.json"}:
+            data, _ = _read_verified_bytes(
+                path, f"health artifact {name}", expected
+            )
+            captured[name] = data
+        else:
+            _hash_verified_file(path, f"health artifact {name}", expected)
         resolved[name] = path
-    return resolved
+    return resolved, captured
 
 
 def _normalized_config_contract(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -262,14 +389,16 @@ def convergence_decision(
         if eligible
         else "stop_at_50",
         "auto_launch": False,
-        "extension_semantics": "continue_exact_epoch_50_best_checkpoint_with_optimizer_scheduler_and_rng_state",
+        "continuation_checkpoint": {
+            "path": CONTINUATION_CHECKPOINT,
+            "role": "exact_epoch_50_model_optimizer_scheduler_and_rng_state",
+        },
+        "extension_semantics": "continue_exact_continuation_epoch_50_checkpoint_with_optimizer_scheduler_and_rng_state_to_epoch_150",
     }
 
 
 def validate_health_approval(path: Path, expected_attempt_id: str) -> dict[str, Any]:
-    path = _safe_path(path, "health approval")
-    approval_sha256 = sha256_file(path)
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload, _, approval_sha256 = _read_verified_json(path, "health approval")
     required = {
         "schema_version",
         "issue",
@@ -302,21 +431,17 @@ def validate_health_approval(path: Path, expected_attempt_id: str) -> dict[str, 
         or payload["external_final_accessed"] is not False
     ):
         raise ValueError("health approval is not bound to this attempt")
-    for prefix in ("health_run_record", "health_artifact_index"):
-        evidence = _safe_path(payload[f"{prefix}_path"], prefix)
-        if (
-            evidence.is_symlink()
-            or sha256_file(evidence) != payload[f"{prefix}_sha256"]
-        ):
-            raise ValueError(f"{prefix} bytes do not match approval")
-    run_record = _read_json_object(
-        _safe_path(payload["health_run_record_path"], "health run record"),
+    run_record, run_record_bytes, run_record_sha256 = _read_verified_json(
+        payload["health_run_record_path"],
         "health run record",
+        str(payload["health_run_record_sha256"]),
     )
-    index_path = _safe_path(
-        payload["health_artifact_index_path"], "health artifact index"
+    index_path = _safe_path(payload["health_artifact_index_path"], "health artifact index")
+    index, _, _ = _read_verified_json(
+        index_path,
+        "health artifact index",
+        str(payload["health_artifact_index_sha256"]),
     )
-    index = _read_json_object(index_path, "health artifact index")
     if (
         run_record.get("attempt_id") != payload["health_attempt_id"]
         or index.get("attempt_id") != payload["health_attempt_id"]
@@ -333,12 +458,18 @@ def validate_health_approval(path: Path, expected_attempt_id: str) -> dict[str, 
         or index.get("status") != "completed"
     ):
         raise ValueError("health W&B/artifact completion is invalid")
-    artifact_paths = _indexed_health_artifacts(index_path, index)
+    artifact_paths, captured = _indexed_health_artifacts(
+        index_path,
+        index,
+        {"run_record.json": (run_record_bytes, run_record_sha256)},
+    )
     artifacts = index["artifacts"]
     if artifacts["run_record.json"] != payload["health_run_record_sha256"]:
         raise ValueError("health run record is not bound by artifact index")
-    config = _read_json_object(artifact_paths["config.json"], "health config")
-    source = _read_json_object(artifact_paths["source.json"], "health source")
+    config = json.loads(captured["config.json"])
+    source = json.loads(captured["source.json"])
+    if not isinstance(config, dict) or not isinstance(source, dict):
+        raise TypeError("health config/source artifacts must be JSON objects")
     if config.get("source") != source:
         raise ValueError("health source artifact differs from health config")
     source_delta = _validate_source_delta(
@@ -346,9 +477,7 @@ def validate_health_approval(path: Path, expected_attempt_id: str) -> dict[str, 
         str(payload["source_delta_sha256"]),
         source,
     )
-    payload["health_checkpoint_path"] = str(
-        artifact_paths["best_checkpoint.pth"].resolve()
-    )
+    payload["health_checkpoint_path"] = str(artifact_paths["best_checkpoint.pth"])
     payload["health_checkpoint_sha256"] = artifacts["best_checkpoint.pth"]
     payload["health_contract"] = _normalized_config_contract(config)
     payload["health_contract"]["source"] = source_delta["convergence_source"]
@@ -365,8 +494,12 @@ def validate_convergence_contract(
         raise ValueError(
             "prospective convergence contract differs from approved health"
         )
-    health_checkpoint = Path(str(approval["health_checkpoint_path"])).resolve()
-    if args.pretrained.resolve() == health_checkpoint:
+    if current.get("num_workers") != 0 or getattr(args, "num_workers", 0) != 0:
+        raise ValueError(
+            "exact continuation requires num_workers=0; worker RNG is not resumable"
+        )
+    health_checkpoint = Path(str(approval["health_checkpoint_path"]))
+    if args.pretrained == health_checkpoint:
         raise ValueError("convergence must not initialize from the health checkpoint")
     if sha256_file(args.pretrained) == approval["health_checkpoint_sha256"]:
         raise ValueError("convergence pretrained bytes equal the health checkpoint")
@@ -395,8 +528,8 @@ def queue_spec(args: argparse.Namespace, approval: Mapping[str, Any]) -> dict[st
         "gates": [
             {
                 "type": "decision_receipt",
-                "path": str(args.health_approval.resolve()),
-                "sha256": sha256_file(args.health_approval),
+                "path": str(args.health_approval),
+                "sha256": approval["approval_sha256"],
                 "expected_attempt_id": approval["health_attempt_id"],
                 "allowed_to": [args.attempt_id],
             }
@@ -433,21 +566,20 @@ def _bind_queue_receipt(
             raise FileNotFoundError(
                 "execute requires the immutable reviewed queue spec"
             )
-        persisted = _read_json_object(path, "queue spec receipt")
+        persisted, _, digest = _read_verified_json(path, "queue spec receipt")
         if persisted != dict(spec):
             raise ValueError("persisted queue spec differs from prospective execution")
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
         write_json_once(path, dict(spec))
-    return path, sha256_file(path)
+        _, _, digest = _read_verified_json(path, "queue spec receipt")
+    return path, digest
 
 
 def _validate_queue_approval(
     path: Path, *, attempt_id: str, queue_spec_sha256: str
-) -> str:
-    resolved = _safe_path(path, "queue approval")
-    digest = sha256_file(resolved)
-    payload = _read_json_object(resolved, "queue approval")
+) -> tuple[str, bytes, dict[str, Any]]:
+    payload, data, digest = _read_verified_json(path, "queue approval")
     if (
         set(payload)
         != {
@@ -465,7 +597,7 @@ def _validate_queue_approval(
         or payload.get("external_final_accessed") is not False
     ):
         raise ValueError("queue approval does not authorize this exact spec")
-    return digest
+    return digest, data, payload
 
 
 def _seal_completion(
@@ -495,31 +627,68 @@ def _seal_completion(
     ):
         raise ValueError("base artifact index is not the completed convergence attempt")
     index_path = artifact_dir / "artifact_index.json"
-    persisted_index = _read_json_object(index_path, "base artifact index")
+    persisted_index, _, base_index_sha256 = _read_verified_json(
+        index_path, "base artifact index"
+    )
     if persisted_index != dict(base_index):
         raise ValueError("base artifact index bytes differ from returned index")
     artifacts = persisted_index.get("artifacts")
     expected_artifacts = set(CONVERGENCE_ARTIFACT_NAMES)
     if not isinstance(artifacts, dict) or set(artifacts) != expected_artifacts:
         raise ValueError("base artifact index does not seal the exact artifact set")
-    artifact_paths: dict[str, Path] = {}
+    artifact_bytes: dict[str, bytes] = {}
+    continuation: Any = None
     for name in CONVERGENCE_ARTIFACT_NAMES:
         path = _safe_path(artifact_dir / name, f"base artifact {name}")
-        if (
-            not path.is_file()
-            or path.is_symlink()
-            or sha256_file(path) != artifacts[name]
-        ):
+        expected = artifacts.get(name)
+        if not isinstance(expected, str) or len(expected) != 64:
             raise ValueError(f"base indexed artifact bytes differ: {name}")
-        artifact_paths[name] = path
-    if sha256_file(args.health_approval) != approval["approval_sha256"]:
-        raise ValueError("health approval changed during convergence execution")
-    if sha256_file(_queue_receipt_path(args)) != queue_receipt_sha256:
-        raise ValueError("queue spec changed during convergence execution")
-    config = _read_json_object(artifact_paths["config.json"], "convergence config")
-    run_record = _read_json_object(
-        artifact_paths["run_record.json"], "convergence run record"
+        if name == CONTINUATION_CHECKPOINT:
+            continuation, _ = _load_verified_torch(
+                path, f"base artifact {name}", expected
+            )
+        elif name in {
+            "config.json",
+            "run_record.json",
+            "epochs.json",
+            QUEUE_APPROVAL_ARTIFACT,
+        }:
+            data, _ = _read_verified_bytes(
+                path, f"base artifact {name}", expected
+            )
+            artifact_bytes[name] = data
+        else:
+            _hash_verified_file(path, f"base artifact {name}", expected)
+    _, health_approval_digest = _read_verified_bytes(
+        args.health_approval,
+        "health approval final revalidation",
+        str(approval["approval_sha256"]),
     )
+    if health_approval_digest != approval["approval_sha256"]:
+        raise ValueError("health approval changed during convergence execution")
+    _, queue_receipt_digest = _read_verified_bytes(
+        _queue_receipt_path(args),
+        "queue spec final revalidation",
+        queue_receipt_sha256,
+    )
+    if queue_receipt_digest != queue_receipt_sha256:
+        raise ValueError("queue spec changed during convergence execution")
+    queue_approval_sha256, queue_approval_bytes, _ = _validate_queue_approval(
+        args.queue_approval,
+        attempt_id=args.attempt_id,
+        queue_spec_sha256=queue_receipt_sha256,
+    )
+    if (
+        queue_approval_sha256 != args.execution_approval_sha256
+        or artifact_bytes[QUEUE_APPROVAL_ARTIFACT] != queue_approval_bytes
+        or artifact_bytes[QUEUE_APPROVAL_ARTIFACT]
+        != args.execution_approval_bytes
+    ):
+        raise ValueError("queue approval changed or was substituted before final seal")
+    config = json.loads(artifact_bytes["config.json"])
+    run_record = json.loads(artifact_bytes["run_record.json"])
+    if not isinstance(config, dict) or not isinstance(run_record, dict):
+        raise TypeError("convergence config/run record must be JSON objects")
     if (
         config.get("execution_receipt_sha256") != queue_receipt_sha256
         or run_record.get("execution_receipt_sha256") != queue_receipt_sha256
@@ -547,9 +716,6 @@ def _seal_completion(
         )
     ):
         raise ValueError("durable W&B completion identity is invalid")
-    continuation = engine.torch.load(
-        artifact_paths[CONTINUATION_CHECKPOINT], map_location="cpu", weights_only=False
-    )
     required_continuation = {
         "model",
         "optimizer",
@@ -560,6 +726,7 @@ def _seal_completion(
         "numpy_rng_state",
         "torch_rng_state",
         "mps_rng_state",
+        "train_loader_rng_state",
     }
     scheduler = (
         continuation.get("scheduler") if isinstance(continuation, dict) else None
@@ -570,9 +737,22 @@ def _seal_completion(
         or not isinstance(continuation.get("model"), dict)
         or not isinstance(continuation.get("optimizer"), dict)
         or not isinstance(scheduler, dict)
+        or set(scheduler)
+        != {
+            "schema_version",
+            "kind",
+            "warmup_epochs",
+            "initial_lr",
+            "original_horizon_epochs",
+            "next_epoch",
+            "last_learning_rates",
+            "continuation",
+        }
+        or scheduler.get("schema_version") != 1
         or scheduler.get("kind") != "cosine"
         or scheduler.get("warmup_epochs") != 5
         or scheduler.get("initial_lr") != 5e-5
+        or scheduler.get("original_horizon_epochs") != EPOCHS
         or scheduler.get("next_epoch") != EPOCHS
         or not isinstance(scheduler.get("last_learning_rates"), list)
         or not scheduler["last_learning_rates"]
@@ -589,31 +769,82 @@ def _seal_completion(
         != EPOCHS * engine.TRAIN_OPTIMIZER_STEPS
     ):
         raise ValueError("epoch-50 continuation state is incomplete")
-    epochs_payload = _read_json_object(artifact_paths["epochs.json"], "epochs")
+    loader_rng = continuation["train_loader_rng_state"]
+    continuation_schedule = scheduler["continuation"]
+    if (
+        not isinstance(loader_rng, dict)
+        or set(loader_rng)
+        != {
+            "generator_state",
+            "num_workers",
+            "persistent_workers",
+            "worker_rng_states",
+            "worker_rng_policy",
+        }
+        or not isinstance(loader_rng.get("generator_state"), engine.torch.Tensor)
+        or loader_rng.get("num_workers") != 0
+        or loader_rng.get("persistent_workers") is not False
+        or loader_rng.get("worker_rng_states") != []
+        or loader_rng.get("worker_rng_policy") != "single_process_no_worker_rng"
+        or not isinstance(continuation_schedule, dict)
+        or set(continuation_schedule)
+        != {
+            "kind",
+            "start_epoch",
+            "target_total_epochs",
+            "horizon_epochs",
+            "warmup_epochs",
+            "initial_learning_rates",
+            "minimum_learning_rates",
+        }
+        or continuation_schedule.get("kind") != "cosine"
+        or continuation_schedule.get("start_epoch") != EPOCHS
+        or continuation_schedule.get("target_total_epochs") != 150
+        or continuation_schedule.get("horizon_epochs") != 100
+        or continuation_schedule.get("warmup_epochs") != 0
+        or continuation_schedule.get("initial_learning_rates")
+        != scheduler["last_learning_rates"]
+        or continuation_schedule.get("minimum_learning_rates")
+        != [0.0 for _ in scheduler["last_learning_rates"]]
+    ):
+        raise ValueError("epoch-50 continuation scheduler/loader state is incomplete")
+    epoch_51_lrs = continuation_learning_rates(scheduler, EPOCHS)
+    if epoch_51_lrs != scheduler["last_learning_rates"]:
+        raise ValueError("epoch-51 continuation learning rate is not exact")
+    epochs_payload = json.loads(artifact_bytes["epochs.json"])
+    if not isinstance(epochs_payload, dict):
+        raise TypeError("epochs artifact must be a JSON object")
     decision = convergence_decision(epochs_payload["epochs"], health_gate_passed=True)
     if decision["completed_epochs"] != EPOCHS or decision["final_epoch"] != EPOCHS:
         raise ValueError("completion sealing requires exact contiguous 50 epochs")
+    decision["continuation_checkpoint"]["sha256"] = artifacts[
+        CONTINUATION_CHECKPOINT
+    ]
     write_json_once(artifact_dir / "convergence_decision.json", decision)
+    decision_sha256 = _hash_verified_file(
+        artifact_dir / "convergence_decision.json", "convergence decision"
+    )
     final = {
         "schema_version": 2,
         "attempt_id": args.attempt_id,
         "phase": "convergence_50e",
         "status": "completed_pending_independent_review",
-        "base_artifact_index_sha256": sha256_file(index_path),
+        "base_artifact_index_sha256": base_index_sha256,
         "health_approval_sha256": approval["approval_sha256"],
         "queue_spec_sha256": queue_receipt_sha256,
-        "queue_approval_sha256": args.execution_approval_sha256,
+        "queue_approval_sha256": queue_approval_sha256,
         "config_sha256": artifacts["config.json"],
         "run_record_sha256": artifacts["run_record.json"],
         "best_checkpoint_sha256": artifacts["best_checkpoint.pth"],
         "continuation_checkpoint_sha256": artifacts[CONTINUATION_CHECKPOINT],
-        "convergence_decision_sha256": sha256_file(
-            artifact_dir / "convergence_decision.json"
-        ),
+        "convergence_decision_sha256": decision_sha256,
         "auto_launched_150": False,
         "external_final_accessed": False,
     }
     write_json_once(artifact_dir / "convergence_index.json", final)
+    convergence_index_sha256 = _hash_verified_file(
+        artifact_dir / "convergence_index.json", "convergence index"
+    )
     handoff = {
         "schema_version": 3,
         "selection_issue": 95,
@@ -623,16 +854,13 @@ def _seal_completion(
         "model_id": "evax-small-multitask-l05-veto005-mps",
         "selected_budget": decision["best_epoch"],
         "selection_receipt_ref": "convergence_decision.json",
-        "selection_receipt_sha256": sha256_file(
-            artifact_dir / "convergence_decision.json"
-        ),
+        "selection_receipt_sha256": decision_sha256,
         "base_artifact_index_sha256": final["base_artifact_index_sha256"],
-        "convergence_index_sha256": sha256_file(
-            artifact_dir / "convergence_index.json"
-        ),
+        "convergence_index_sha256": convergence_index_sha256,
         "config_sha256": final["config_sha256"],
         "best_checkpoint_sha256": final["best_checkpoint_sha256"],
         "continuation_checkpoint_sha256": final["continuation_checkpoint_sha256"],
+        "continuation_checkpoint_path": CONTINUATION_CHECKPOINT,
         "initialization_policy": "fresh_from_reviewed_pretrained",
         "external_final_accessed": False,
         "launch_eligible": False,
@@ -714,7 +942,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
     if args.queue_approval is None:
         raise ValueError("execute requires an independent exact queue approval")
-    args.execution_approval_sha256 = _validate_queue_approval(
+    (
+        args.execution_approval_sha256,
+        args.execution_approval_bytes,
+        _,
+    ) = _validate_queue_approval(
         args.queue_approval,
         attempt_id=args.attempt_id,
         queue_spec_sha256=queue_sha256,
