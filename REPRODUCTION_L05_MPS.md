@@ -57,9 +57,12 @@ are rejected.
 - Before W&B initialization, eight distinct real 1×1×1024×1024 microbatches
   must complete the exact accumulated optimizer path used by scientific
   training: all eight loss/8 backward calls, a backward-complete/pre-AdamW
-  memory snapshot with no tensor scalar materialization or explicit MPS sync,
-  gradient clipping at 12, unchanged AdamW step, zero-grad, and only then loss
-  and gradient scalar materialization. The post-step evidence path may call
+  memory snapshot with no new tensor scalar materialization or explicit MPS
+  sync at that boundary, gradient clipping at 12, unchanged AdamW step,
+  zero-grad, and then the eighth loss plus gradient scalar materialization.
+  As in approved attempt-4, microbatches one through seven materialize their
+  loss scalars immediately after their backward call and before loading the
+  next microbatch. The post-step evidence path may call
   `torch.mps.synchronize()`; the critical-window snapshot may not.
 - A mandatory no-W&B resource child completes a full first epoch of 55
   optimizer updates / 440 microsteps, traverses all 111 deterministic
@@ -129,11 +132,14 @@ separate `<attempt-id>-resource-gate` child plus supervisor receipt:
   --execute --reviewed-by <gate-review-url> --acceptance-soak-only
 ```
 
-The supervisor validates exact 76 optimizer updates, 608 microsteps, 111
-validation steps, 188 ordered heartbeat rows, cleanup, headroom, and all linked
-SHA-256 hashes. A reviewer then creates an external immutable approval JSON:
+The supervisor recomputes exact 76 optimizer updates, 608 microsteps, 111
+validation steps, 188 ordered heartbeat rows, per-update pre-AdamW and post-step
+memory/headroom, validation memory/headroom, cleanup, and all linked SHA-256
+hashes from raw rows. A reviewer in the contract allowlist then posts an exact
+GitHub issue/PR comment whose body is the marker followed by JSON:
 
-```json
+```text
+<!-- TREAT_MMTB_SOAK_APPROVAL_V1 -->
 {
   "schema_version": 1,
   "status": "approved",
@@ -163,11 +169,14 @@ training:
   --val-dcm-dir /local/validation/CXR \
   --val-mask-dir /local/validation/CXR_label \
   --execute --reviewed-by <science-review-url> --scientific-run \
-  --soak-approval /local/immutable-soak-approval.json
+  --soak-approval https://github.com/dongguri92/TREAT-MMTB/pull/<n>#issuecomment-<id>
 ```
 
-The approval is bound to the exact source commit and supervisor receipt hash.
-Missing, malformed, stale, or forged approvals fail closed before W&B.
+The stdlib bootstrap fetches the authoritative comment through GitHub's API,
+requires the allowlisted GitHub identity and OWNER/MEMBER association, and
+binds the approval to the exact source commit and supervisor receipt hash.
+Offline verification, arbitrary local JSON, untrusted domains/reviewers, and
+missing, malformed, stale, or forged approvals all fail closed before W&B.
 
 Successful execution logs every microstep's total, segmentation, and
 classification loss, accumulation boundary, optimizer-step count, and every LR

@@ -12,11 +12,12 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
-from mps_evidence import sha256_file as _chain_sha256_file
-from mps_evidence import validate_gate_artifacts
+from mps_evidence import validate_gate_artifacts, validate_scientific_artifacts
 
 ROOT = Path(__file__).resolve().parent
 CONTRACT_PATH = ROOT / "mps_resource_contract.json"
@@ -195,47 +196,25 @@ def _validate_child_completion(
     attempt_id: str,
     returncode: int | None,
     minimum_headroom_ratio: float,
+    supervisor_progress_path: Path | None = None,
+    expected_bootstrap_proof_sha256: str | None = None,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
     if returncode != 0 or not completion_path.exists():
         return False, None, None
     try:
-        completion = json.loads(completion_path.read_text(encoding="utf-8"))
         if role == "resource_gate":
             chain = validate_gate_artifacts(
-                completion_path.parent, attempt_id, minimum_headroom_ratio
+                completion_path.parent,
+                attempt_id,
+                minimum_headroom_ratio,
+                supervisor_progress_path,
+                expected_bootstrap_proof_sha256,
             )
         else:
-            if (
-                completion.get("schema_version") != 1
-                or completion.get("attempt_id") != attempt_id
-                or completion.get("status") != "completed"
-            ):
-                raise ValueError("scientific completion index is invalid")
-            artifacts = completion.get("artifacts")
-            if not isinstance(artifacts, dict) or not artifacts:
-                raise ValueError("scientific artifact index is empty")
-            for name, digest in artifacts.items():
-                artifact = completion_path.parent / name
-                if not artifact.is_file() or _chain_sha256_file(artifact) != digest:
-                    raise ValueError("scientific artifact hash differs")
-            run_record = json.loads(
-                (completion_path.parent / "run_record.json").read_text(
-                    encoding="utf-8"
-                )
+            chain = validate_scientific_artifacts(
+                completion_path.parent, attempt_id
             )
-            if (
-                run_record.get("status") != "completed"
-                or run_record.get("wandb_finished") is not True
-                or run_record.get("external_final_test_untouched") is not True
-            ):
-                raise ValueError("scientific run record is incomplete")
-            chain = {
-                "artifact_index_sha256": _sha256_file(completion_path),
-                "run_record_sha256": _sha256_file(
-                    completion_path.parent / "run_record.json"
-                ),
-            }
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return False, None, None
     return True, _sha256_file(completion_path), chain
 
@@ -265,10 +244,15 @@ def _supervise(
     termination: dict[str, Any] | None = None
     supervisor_error: BaseException | None = None
 
+    signal_events: list[int] = []
+
     def interrupt(signum: int, _frame: Any) -> None:
-        raise InterruptedError(f"supervisor interrupted by {signal.Signals(signum).name}")
+        signal_events.append(signum)
 
     try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, interrupt)
         child = subprocess.Popen(
             child_command,
             cwd=ROOT,
@@ -278,15 +262,18 @@ def _supervise(
         )
         os.close(write_fd)
         write_fd = -1
-        for signum in (signal.SIGTERM, signal.SIGINT):
-            previous_handlers[signum] = signal.getsignal(signum)
-            signal.signal(signum, interrupt)
         selector = selectors.DefaultSelector()
         selector.register(read_fd, selectors.EVENT_READ)
         last_progress = time.monotonic()
         with heartbeat_path.open("x", encoding="utf-8") as heartbeat:
             buffer = b""
             while child.poll() is None:
+                if signal_events:
+                    supervisor_error = InterruptedError(
+                        "supervisor interrupted by "
+                        f"{signal.Signals(signal_events[0]).name}"
+                    )
+                    break
                 events = selector.select(timeout=1.0)
                 for key, _ in events:
                     chunk = os.read(key.fd, 65536)
@@ -308,20 +295,47 @@ def _supervise(
                 ]:
                     timed_out = True
                     break
-        if timed_out:
-            termination = _terminate_child(child, supervisor_dir, contract)
+            while selector.get_map():
+                events = selector.select(timeout=0)
+                if not events:
+                    break
+                for key, _ in events:
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        selector.unregister(key.fd)
+                        continue
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        row = json.loads(line)
+                        if not isinstance(row, dict):
+                            raise ValueError(
+                                "supervisor progress row must be an object"
+                            )
+                        heartbeat.write(line.decode("utf-8") + "\n")
+                        heartbeat.flush()
+                        os.fsync(heartbeat.fileno())
+        if timed_out or supervisor_error is not None:
+            try:
+                termination = _terminate_child(child, supervisor_dir, contract)
+            except BaseException as termination_error:
+                termination = {
+                    "error_type": type(termination_error).__name__,
+                    "returncode": child.poll(),
+                }
         elif child.poll() is None:
             child.wait()
     except BaseException as error:
         supervisor_error = error
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
-        previous_handlers.clear()
         if child is not None and child.poll() is None:
-            termination = _terminate_child(child, supervisor_dir, contract)
+            try:
+                termination = _terminate_child(child, supervisor_dir, contract)
+            except BaseException as termination_error:
+                termination = {
+                    "error_type": type(termination_error).__name__,
+                    "returncode": child.poll(),
+                }
     finally:
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
         if selector is not None:
             selector.close()
         if read_fd >= 0:
@@ -329,10 +343,18 @@ def _supervise(
         if write_fd >= 0:
             os.close(write_fd)
         if child is not None and child.poll() is None:
-            child.kill()
-            child.wait(timeout=30)
+            try:
+                child.kill()
+                child.wait(timeout=30)
+            except BaseException as reap_error:
+                supervisor_error = supervisor_error or reap_error
     if not heartbeat_path.exists():
         heartbeat_path.touch(exist_ok=False)
+    if signal_events and supervisor_error is None:
+        supervisor_error = InterruptedError(
+            "supervisor interrupted by "
+            f"{signal.Signals(signal_events[0]).name}"
+        )
     child_completion_path = (
         artifact_root / attempt_id / "acceptance_soak_index.json"
         if role == "resource_gate"
@@ -348,6 +370,8 @@ def _supervise(
         attempt_id,
         child.returncode if child is not None else None,
         float(contract["memory"]["minimum_headroom_ratio"]),
+        heartbeat_path,
+        _sha256_bytes(_canonical_bytes(proof)),
     )
     receipt = {
         "schema_version": 1,
@@ -368,6 +392,7 @@ def _supervise(
         "supervisor_error_type": (
             type(supervisor_error).__name__ if supervisor_error is not None else None
         ),
+        "signals_received": [signal.Signals(value).name for value in signal_events],
         "bootstrap_proof_sha256": _sha256_file(
             supervisor_dir / "bootstrap_proof.json"
         ),
@@ -393,6 +418,8 @@ def _supervise(
             "status": receipt["status"],
         },
     )
+    for signum, handler in previous_handlers.items():
+        signal.signal(signum, handler)
     if receipt["status"] != "completed":
         raise RuntimeError(f"supervised {role} child failed")
     return receipt_path
@@ -405,9 +432,43 @@ def _git_head() -> str:
 
 
 def _load_scientific_approval(
-    path: Path, attempt_id: str, gate_receipt: Path
+    comment_url: str, attempt_id: str, gate_receipt: Path
 ) -> dict[str, Any]:
-    approval = json.loads(path.read_text(encoding="utf-8"))
+    contract = _load_contract()["approval"]
+    prefixes = tuple(
+        "https://github.com/"
+        f"{contract['github_repository']}/{kind}/"
+        for kind in ("issues", "pull")
+    )
+    if not comment_url.startswith(prefixes) or "#issuecomment-" not in comment_url:
+        raise RuntimeError("scientific approval must be an exact GitHub issue comment")
+    comment_id = comment_url.rsplit("#issuecomment-", 1)[1]
+    if not comment_id.isdigit():
+        raise RuntimeError("scientific approval comment ID is invalid")
+    api_url = (
+        "https://api.github.com/repos/"
+        f"{contract['github_repository']}/issues/comments/{comment_id}"
+    )
+    request = urllib.request.Request(
+        api_url,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "TREAT-MMTB"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            comment = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+        raise RuntimeError("GitHub approval verification is unavailable") from error
+    if not isinstance(comment, dict):
+        raise RuntimeError("GitHub approval response is invalid")
+    marker = contract["body_marker"]
+    body = str(comment.get("body", ""))
+    marker_line = f"<!-- {marker} -->"
+    if marker_line not in body:
+        raise RuntimeError("GitHub approval marker is missing")
+    try:
+        approval = json.loads(body.split(marker_line, 1)[1].strip())
+    except json.JSONDecodeError as error:
+        raise RuntimeError("GitHub approval payload is invalid") from error
     gate_id = f"{attempt_id}-resource-gate"
     if (
         not isinstance(approval, dict)
@@ -418,14 +479,18 @@ def _load_scientific_approval(
         or approval.get("source_git_commit") != _git_head()
         or approval.get("resource_gate_receipt_sha256")
         != _sha256_file(gate_receipt)
-        or not str(approval.get("reviewed_by", "")).strip()
-        or not str(approval.get("review_url", "")).strip()
+        or comment.get("user", {}).get("login") not in contract["allowed_reviewers"]
+        or comment.get("author_association")
+        not in contract["required_author_associations"]
+        or approval.get("reviewed_by") != comment.get("user", {}).get("login")
+        or approval.get("review_url") != comment_url
         or approval.get("external_final_test_untouched") is not True
     ):
         raise RuntimeError("scientific soak approval differs from reviewed gate")
     return {
         **approval,
-        "approval_sha256": _sha256_file(path),
+        "approval_sha256": _sha256_bytes(_canonical_bytes(comment)),
+        "github_api_url": api_url,
     }
 
 
@@ -476,12 +541,12 @@ def main(argv: list[str] | None = None) -> int:
         print(gate_receipt)
         return 0
 
-    approval_path = Path(_flag_value(arguments, "--soak-approval")).resolve()
+    approval_url = _flag_value(arguments, "--soak-approval")
     gate_receipt = (
         artifact_root / ".supervisor" / gate_id / "supervisor_receipt.json"
     )
     approval = _load_scientific_approval(
-        approval_path, attempt_id, gate_receipt
+        approval_url, attempt_id, gate_receipt
     )
     scientific_arguments = []
     skip_next = False

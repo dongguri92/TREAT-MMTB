@@ -15,6 +15,12 @@
   "memory": {
     "minimum_headroom_ratio": 0.1
   },
+  "approval": {
+    "github_repository": "dongguri92/TREAT-MMTB",
+    "allowed_reviewers": ["dongguri92"],
+    "required_author_associations": ["OWNER", "MEMBER"],
+    "body_marker": "TREAT_MMTB_SOAK_APPROVAL_V1"
+  },
   "watchdog": {
     "progress_timeout_seconds": 1800,
     "sigterm_grace_seconds": 120,

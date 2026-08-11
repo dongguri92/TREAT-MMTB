@@ -114,17 +114,39 @@ def accumulated_train_step(
     use_amp=True,
     critical_memory_observer=None,
     stage_callback=None,
+    accumulation=None,
+    batch_observer=None,
+    group_validator=None,
 ):
-    """Run one accumulated optimizer step with one reviewed operation order."""
-    accumulation = len(batches)
+    """Run one historical attempt-4 accumulated optimizer sequence."""
+    if accumulation is None:
+        accumulation = len(batches)
     if accumulation < 1:
         raise ValueError("accumulated step requires at least one microbatch")
     bce = torch.nn.BCEWithLogitsLoss()
-    deferred = []
+    rows = []
+    deferred_last = None
+
+    def materialize_row(values):
+        total, segmentation, classification = values
+        total_value = float(total.item())
+        # Preserve attempt-4's W&B-backed scalar schedule exactly: the total
+        # loss was materialized once for history and twice for batch/total logs.
+        float(total.item())
+        float(total.item())
+        return {
+            'loss': total_value,
+            'segmentation_loss': float(segmentation.item()),
+            'classification_loss': float(classification.item()),
+        }
     if stage_callback is not None:
         stage_callback("optimizer_zero_grad_before")
     optimizer.zero_grad(set_to_none=True)
-    for batch in batches:
+    iterator = iter(batches)
+    for microbatch_index in range(accumulation):
+        batch = next(iterator)
+        if batch_observer is not None:
+            batch_observer(batch, microbatch_index)
         img = batch['image'].to(device, non_blocking=True)
         mask = batch['mask'].to(device, non_blocking=True)
         cls = batch['cls'].to(device, non_blocking=True)
@@ -147,7 +169,16 @@ def accumulated_train_step(
             if stage_callback is not None:
                 stage_callback("backward")
             backward_loss.backward()
-        deferred.append((loss.detach(), l_seg.detach(), l_cls.detach()))
+        detached = (loss.detach(), l_seg.detach(), l_cls.detach())
+        if microbatch_index < accumulation - 1:
+            if stage_callback is not None:
+                stage_callback("scalar_materialization_between_microbatches")
+            rows.append(materialize_row(detached))
+        else:
+            deferred_last = detached
+
+    if group_validator is not None:
+        group_validator()
 
     if stage_callback is not None:
         stage_callback("critical_memory")
@@ -174,14 +205,9 @@ def accumulated_train_step(
 
     if stage_callback is not None:
         stage_callback("scalar_materialization")
-    rows = [
-        {
-            'loss': float(loss.item()),
-            'segmentation_loss': float(seg.item()),
-            'classification_loss': float(cls.item()),
-        }
-        for loss, seg, cls in deferred
-    ]
+    if deferred_last is None:
+        raise RuntimeError("accumulated step did not produce a final microbatch")
+    rows.append(materialize_row(deferred_last))
     gradient_norm_value = float(gradient_norm.item())
     if not all(
         math.isfinite(value)
@@ -199,7 +225,9 @@ def accumulated_train_step(
 def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
                     device, scaler, use_amp=True, wandb_run=None,
                     epoch=0, global_step=0, gradient_accumulation_steps=1,
-                    progress_callback=None, critical_memory_observer=None):
+                    progress_callback=None, critical_memory_observer=None,
+                    first_group_batch_observer=None,
+                    first_group_validator=None):
     if gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be positive")
     usable_micro_steps = (
@@ -211,7 +239,9 @@ def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
     losses = []
     iterator = iter(loader)
     for group_start in range(0, usable_micro_steps, gradient_accumulation_steps):
-        batches = [next(iterator) for _ in range(gradient_accumulation_steps)]
+        batches = (
+            next(iterator) for _ in range(gradient_accumulation_steps)
+        )
         step = accumulated_train_step(
             model,
             batches,
@@ -222,6 +252,13 @@ def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
             scaler=scaler,
             use_amp=use_amp,
             critical_memory_observer=critical_memory_observer,
+            accumulation=gradient_accumulation_steps,
+            batch_observer=(
+                first_group_batch_observer if group_start == 0 else None
+            ),
+            group_validator=(
+                first_group_validator if group_start == 0 else None
+            ),
         )
         global_step += 1
         for offset, row in enumerate(step['microbatches']):
@@ -352,7 +389,8 @@ def fit(model, train_loader, val_loader, device,
         scheduler='poly', warmup_epochs=0, loss_name='dicece',
         wandb_run=None, reproduction_expected_ids=None,
         return_details=False, gradient_accumulation_steps=1,
-        progress_callback=None, critical_memory_observer=None):
+        progress_callback=None, critical_memory_observer=None,
+        first_group_batch_observer=None, first_group_validator=None):
 
     optimizer = make_optimizer(model, initial_lr=initial_lr,
                                optimizer_name=optimizer_name)
@@ -390,7 +428,13 @@ def fit(model, train_loader, val_loader, device,
             epoch=epoch, global_step=global_step,
             gradient_accumulation_steps=gradient_accumulation_steps,
             progress_callback=progress_callback,
-            critical_memory_observer=critical_memory_observer)
+            critical_memory_observer=critical_memory_observer,
+            first_group_batch_observer=(
+                first_group_batch_observer if epoch == 0 else None
+            ),
+            first_group_validator=(
+                first_group_validator if epoch == 0 else None
+            ))
         validation_started = time.perf_counter()
         val_loss, val_dice, val_acc, native_metrics = validate(
             model, val_loader, seg_loss_fn, lambda_cls, device,

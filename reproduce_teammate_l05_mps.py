@@ -27,8 +27,8 @@ import numpy as np
 import torch
 
 import datasets
-from mps_evidence import validate_gate_artifacts
 from models import modeltype
+from mps_evidence import validate_gate_artifacts
 from reproduction import (
     CLS_THRESHOLD,
     DATASET_SCOPE,
@@ -287,13 +287,35 @@ def _validate_memory_headroom(snapshot: dict[str, int | None]) -> float:
 def _batches_fingerprint(batches: list[dict[str, Any]]) -> str:
     digest = hashlib.sha256()
     for batch in batches:
-        ids = [str(value) for value in batch.get("id", [])]
-        digest.update(json.dumps(ids, separators=(",", ":")).encode("utf-8"))
-        for name in ("image", "mask", "cls"):
-            tensor = batch[name].detach().cpu().contiguous()
-            digest.update(str(tuple(tensor.shape)).encode("ascii"))
-            digest.update(tensor.numpy().tobytes())
+        _update_batch_fingerprint(digest, batch)
     return digest.hexdigest()
+
+
+def _update_batch_fingerprint(digest: Any, batch: dict[str, Any]) -> None:
+    ids = [str(value) for value in batch.get("id", [])]
+    digest.update(json.dumps(ids, separators=(",", ":")).encode("utf-8"))
+    for name in ("image", "mask", "cls"):
+        tensor = batch[name].detach().cpu().contiguous()
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(tensor.numpy().tobytes())
+
+
+def _fingerprint_callbacks(expected: str) -> tuple[Any, Any]:
+    digest = hashlib.sha256()
+    observed = 0
+
+    def observe(batch: dict[str, Any], _index: int) -> None:
+        nonlocal observed
+        _update_batch_fingerprint(digest, batch)
+        observed += 1
+
+    def validate() -> None:
+        if observed != GRADIENT_ACCUMULATION_STEPS:
+            raise ValueError("first optimizer group fingerprint is incomplete")
+        if digest.hexdigest() != expected:
+            raise ValueError("first optimizer group differs from sealed preview")
+
+    return observe, validate
 
 
 def _loader_start_fingerprint(loader: Any) -> str:
@@ -360,7 +382,7 @@ def _run_mps_optimizer_probe(
     heartbeat_stream: Any = None
     batch = image = mask = cls = None
     segmentation = classification = None
-    segmentation_loss = classification_loss = loss = gradient_norm = None
+    segmentation_loss = classification_loss = loss = None
     evidence: dict[str, Any] = {
         "schema_version": 1,
         "probe": probe_name,
@@ -539,37 +561,48 @@ def _run_mps_optimizer_probe(
                     }
                 )
             update_case_ids: list[str] = []
-            update_batches: list[dict[str, Any]] = []
-            for _ in range(GRADIENT_ACCUMULATION_STEPS):
-                stage = "microbatch_load"
-                try:
-                    batch = next(iterator)
-                except StopIteration as error:
-                    raise ValueError(
-                        "probe loader exhausted before required optimizer path"
-                    ) from error
-                stage = "microbatch_identity"
-                batch_ids = [str(value) for value in batch.get("id", [])]
-                if len(batch_ids) != PHYSICAL_BATCH_SIZE:
-                    raise ValueError("probe microbatch identity is missing")
-                update_case_ids.extend(batch_ids)
-                if tuple(batch["image"].shape) != (1, 1, TARGET_SIZE, TARGET_SIZE):
-                    raise ValueError("probe batch is not exact 1x1x1024x1024")
-                update_batches.append(batch)
-                completed_micro_steps += 1
-                batch = image = mask = cls = None
-                segmentation = classification = None
-                segmentation_loss = classification_loss = loss = None
-            if len(set(update_case_ids)) != GRADIENT_ACCUMULATION_STEPS:
-                raise ValueError("optimizer update did not use 8 distinct microbatches")
+            fingerprint_observer = fingerprint_validator = None
             if update_index == 0 and expected_start_fingerprint is not None:
-                observed_start_fingerprint = _batches_fingerprint(update_batches)
-                if observed_start_fingerprint != expected_start_fingerprint:
-                    raise ValueError("soak loader start differs from sealed preview")
-                evidence["loader_start_fingerprint"] = observed_start_fingerprint
+                fingerprint_observer, fingerprint_validator = _fingerprint_callbacks(
+                    expected_start_fingerprint
+                )
+
+            def update_batches() -> Any:
+                nonlocal completed_micro_steps, stage
+                for _ in range(GRADIENT_ACCUMULATION_STEPS):
+                    stage = "microbatch_load"
+                    try:
+                        current = next(iterator)
+                    except StopIteration as error:
+                        raise ValueError(
+                            "probe loader exhausted before required optimizer path"
+                        ) from error
+                    stage = "microbatch_identity"
+                    batch_ids = [str(value) for value in current.get("id", [])]
+                    if len(batch_ids) != PHYSICAL_BATCH_SIZE:
+                        raise ValueError("probe microbatch identity is missing")
+                    update_case_ids.extend(batch_ids)
+                    if tuple(current["image"].shape) != (
+                        1, 1, TARGET_SIZE, TARGET_SIZE
+                    ):
+                        raise ValueError("probe batch is not exact 1x1x1024x1024")
+                    completed_micro_steps += 1
+                    yield current
+
+            def validate_group() -> None:
+                if len(set(update_case_ids)) != GRADIENT_ACCUMULATION_STEPS:
+                    raise ValueError(
+                        "optimizer update did not use 8 distinct microbatches"
+                    )
+                if fingerprint_validator is not None:
+                    fingerprint_validator()
+                    evidence["loader_start_fingerprint"] = (
+                        expected_start_fingerprint
+                    )
+
             step = accumulated_train_step(
                 model,
-                update_batches,
+                update_batches(),
                 optimizer,
                 segmentation_loss_fn,
                 0.5,
@@ -578,6 +611,9 @@ def _run_mps_optimizer_probe(
                 use_amp=False,
                 critical_memory_observer=observe_critical_memory,
                 stage_callback=set_stage,
+                accumulation=GRADIENT_ACCUMULATION_STEPS,
+                batch_observer=fingerprint_observer,
+                group_validator=validate_group,
             )
             stage = "synchronize"
             if callable(synchronize):
@@ -671,7 +707,7 @@ def _run_mps_optimizer_probe(
                 )
         batch = image = mask = cls = None
         segmentation = classification = None
-        segmentation_loss = classification_loss = loss = gradient_norm = None
+        segmentation_loss = classification_loss = loss = None
         if optimizer is not None:
             try:
                 optimizer.zero_grad(set_to_none=True)
@@ -948,7 +984,11 @@ def _load_resource_gate(
         _load_mps_resource_contract()["memory"]["minimum_headroom_ratio"]
     )
     chain = validate_gate_artifacts(
-        gate_dir, expected_gate_id, minimum_headroom
+        gate_dir,
+        expected_gate_id,
+        minimum_headroom,
+        receipt_path.with_name("progress.jsonl"),
+        receipt.get("bootstrap_proof_canonical_sha256"),
     )
     approval = _validate_bootstrap_proof("scientific_run").get("soak_approval")
     if (
@@ -1326,10 +1366,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         if training_identity != identity or training_identity_sha256 != identity_sha256:
             raise RuntimeError("dataset identity changed after feasibility probe")
-        if _loader_start_fingerprint(train_loader) != loader_start_fingerprint:
-            raise RuntimeError(
-                "fresh scientific loader start differs from reviewed soak"
-            )
+        first_group_observer, first_group_validator = _fingerprint_callbacks(
+            loader_start_fingerprint
+        )
         model = modeltype(
             "evax_seg",
             in_channels=1,
@@ -1392,6 +1431,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 critical_memory_observer=lambda: _critical_memory_evidence(
                     _supervisor_progress
                 ),
+                first_group_batch_observer=first_group_observer,
+                first_group_validator=first_group_validator,
             ),
         )
 
@@ -1448,7 +1489,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "regression_sha256": sha256_file(artifact_dir / "regression.json"),
         }
         write_json_once(artifact_dir / "score.json", score)
-        run_url = wandb_run.get_url()
+        run_url = wandb_run.url
         if (
             not str(run_url).startswith("https://")
             or str(wandb_run.id) != args.attempt_id

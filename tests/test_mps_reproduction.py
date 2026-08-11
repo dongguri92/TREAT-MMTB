@@ -843,9 +843,91 @@ def test_accumulated_step_materializes_scalars_only_after_adamw(
         mps.torch.device("mps"), use_amp=False,
         critical_memory_observer=lambda: events.append("critical") or {},
     )
-    assert events[:8] == ["backward"] * 8
-    assert events[8:10] == ["critical", "adamw"]
-    assert events.index("item") > events.index("adamw")
+    assert events == (
+        ["backward", "item", "item", "item", "item", "item"] * 7
+        + [
+            "backward", "critical", "adamw",
+            "item", "item", "item", "item", "item", "item",
+        ]
+    )
+
+
+def test_first_scientific_group_is_observed_without_preview_advancement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[str] = []
+    iterator_calls = 0
+
+    class Tensor:
+        def __init__(self, case_id: str):
+            self.case_id = case_id
+
+        def to(self, _device: object, **_kwargs: object) -> "Tensor":
+            return self
+
+    class Loss:
+        def __add__(self, _other: object) -> "Loss":
+            return self
+
+        def __rmul__(self, _other: object) -> "Loss":
+            return self
+
+        def __truediv__(self, _other: object) -> "Loss":
+            return self
+
+        def backward(self) -> None:
+            return None
+
+        def detach(self) -> "Loss":
+            return self
+
+        def item(self) -> float:
+            return 1.0
+
+    class Loader:
+        def __len__(self) -> int:
+            return 8
+
+        def __iter__(self):
+            nonlocal iterator_calls
+            iterator_calls += 1
+            for index in range(8):
+                tensor = Tensor(f"case-{index}")
+                yield {"id": [tensor.case_id], "image": tensor, "mask": tensor, "cls": tensor}
+
+    class Model:
+        return_cls = False
+
+        def train(self) -> None:
+            return None
+
+        def __call__(self, image: Tensor) -> tuple[Tensor, Tensor]:
+            return image, image
+
+        def parameters(self) -> list[object]:
+            return []
+
+    class Optimizer:
+        def __init__(self) -> None:
+            self.param_groups = [{"lr": 1.0}]
+
+        def zero_grad(self, *, set_to_none: bool) -> None:
+            assert set_to_none
+
+        def step(self) -> None:
+            return None
+
+    monkeypatch.setattr(training.torch.nn, "BCEWithLogitsLoss", lambda: lambda *_: Loss())
+    monkeypatch.setattr(training.torch.nn.utils, "clip_grad_norm_", lambda *_a, **_k: Loss())
+    training.train_one_epoch(
+        Model(), Loader(), Optimizer(), lambda *_: Loss(), 0.5,
+        mps.torch.device("mps"), None, use_amp=False,
+        gradient_accumulation_steps=8,
+        first_group_batch_observer=lambda batch, _index: observed.append(batch["id"][0]),
+        first_group_validator=lambda: None,
+    )
+    assert iterator_calls == 1
+    assert observed == [f"case-{index}" for index in range(8)]
 
 
 def test_mps_lock_pins_verified_direct_environment() -> None:
