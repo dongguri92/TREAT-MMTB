@@ -372,10 +372,16 @@ def validation_step(model, batch, seg_loss_fn, lambda_cls, device,
         log_loss_value = loss.item()
     if stage_callback is not None:
         stage_callback('prepared_masks_cpu')
-    pred = seg_main.float().argmax(1).cpu().numpy()
+    metric_seg_main = (
+        _fp32_for_loss(seg_main) if explicit_mps_bf16 else seg_main
+    )
+    metric_cls_logit = (
+        _fp32_for_loss(cls_logit) if explicit_mps_bf16 else cls_logit
+    )
+    pred = metric_seg_main.argmax(1).cpu().numpy()
     gt = mask.squeeze(1).cpu().numpy()
     dices = [dice_metric(pred[index], gt[index]) for index in range(pred.shape[0])]
-    cls_pred = (torch.sigmoid(cls_logit.float()) > 0.5).float()
+    cls_pred = (torch.sigmoid(metric_cls_logit) > 0.5).float()
     if stage_callback is not None:
         stage_callback('classification_sum_item')
     cls_correct = (cls_pred == cls).sum().item()
@@ -390,8 +396,8 @@ def validation_step(model, batch, seg_loss_fn, lambda_cls, device,
             raise ValueError(f"native validation metadata missing: {missing_fields}")
         if stage_callback is not None:
             stage_callback('probabilities_cpu')
-        fg_prob = torch.softmax(seg_main.float(), dim=1)[:, 1].cpu().numpy()
-        cls_prob = torch.sigmoid(cls_logit.float()).flatten().cpu().numpy()
+        fg_prob = torch.softmax(metric_seg_main, dim=1)[:, 1].cpu().numpy()
+        cls_prob = torch.sigmoid(metric_cls_logit).flatten().cpu().numpy()
         for index, case_id in enumerate(batch['id']):
             if stage_callback is not None:
                 stage_callback('native_metadata_cpu')

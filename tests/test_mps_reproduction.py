@@ -984,6 +984,135 @@ def test_loss_autocast_boundary_is_scoped_to_explicit_mps_bf16(
     )
 
 
+@pytest.mark.parametrize(
+    ("device_type", "amp_dtype", "expected_dtype"),
+    [("cuda", None, "bfloat16"), ("mps", training.torch.bfloat16, "float32")],
+)
+def test_validation_probability_dtype_preserves_cuda_and_promotes_mps_bf16(
+    monkeypatch: pytest.MonkeyPatch,
+    device_type: str,
+    amp_dtype: object,
+    expected_dtype: str,
+) -> None:
+    observed: dict[str, list[object]] = {
+        "sigmoid": [], "softmax": [], "threshold": [], "native": []
+    }
+
+    class TraceTensor:
+        def __init__(self, dtype: str, array: object) -> None:
+            self.dtype = dtype
+            self.array = training.np.asarray(array)
+            self.shape = self.array.shape
+
+        def to(self, *_args: object, **_kwargs: object) -> "TraceTensor":
+            return self
+
+        def float(self) -> "TraceTensor":
+            return TraceTensor("float32", self.array.astype("float32"))
+
+        def argmax(self, axis: int) -> "TraceTensor":
+            return TraceTensor(self.dtype, self.array.argmax(axis))
+
+        def cpu(self) -> "TraceTensor":
+            return self
+
+        def numpy(self) -> object:
+            dtype = "float32" if self.dtype == "float32" else "float16"
+            return self.array.astype(dtype)
+
+        def squeeze(self, axis: int) -> "TraceTensor":
+            return TraceTensor(self.dtype, self.array.squeeze(axis))
+
+        def flatten(self) -> "TraceTensor":
+            return TraceTensor(self.dtype, self.array.flatten())
+
+        def __getitem__(self, key: object) -> "TraceTensor":
+            return TraceTensor(self.dtype, self.array[key])
+
+        def __gt__(self, threshold: float) -> "TraceTensor":
+            observed["threshold"].append((self.dtype, threshold))
+            return TraceTensor("bool", self.array > threshold)
+
+        def __eq__(self, _other: object) -> "TraceTensor":
+            return TraceTensor("bool", training.np.ones_like(self.array))
+
+        def sum(self) -> "TraceTensor":
+            return TraceTensor(self.dtype, training.np.asarray(self.array.sum()))
+
+        def item(self) -> float:
+            return float(self.array.item())
+
+        def numel(self) -> int:
+            return int(self.array.size)
+
+    class Loss:
+        def __add__(self, _other: object) -> "Loss":
+            return self
+
+        def __rmul__(self, _other: object) -> "Loss":
+            return self
+
+        def item(self) -> float:
+            return 1.0
+
+    class Model:
+        return_cls = False
+
+        def __call__(self, _image: TraceTensor) -> tuple[TraceTensor, TraceTensor]:
+            return (
+                TraceTensor("bfloat16", [[[[0]], [[1]]]]),
+                TraceTensor("bfloat16", [[1]]),
+            )
+
+    def sigmoid(value: TraceTensor) -> TraceTensor:
+        observed["sigmoid"].append(value.dtype)
+        return value
+
+    def softmax(value: TraceTensor, **_kwargs: object) -> TraceTensor:
+        observed["softmax"].append(value.dtype)
+        return value
+
+    def native_case_record(**kwargs: object) -> dict[str, object]:
+        foreground = training.np.asarray(kwargs["foreground_probability"])
+        classification = training.np.asarray(kwargs["cls_probability"])
+        observed["native"].append((foreground.dtype.name, classification.dtype.name))
+        return {"case_id": kwargs["case_id"]}
+
+    monkeypatch.setattr(training, "_autocast_context", lambda *_args: training._nullctx())
+    monkeypatch.setattr(training, "_fp32_for_loss", lambda value: value.float())
+    monkeypatch.setattr(training.torch.nn, "BCEWithLogitsLoss", lambda: lambda *_a: Loss())
+    monkeypatch.setattr(training.torch, "sigmoid", sigmoid)
+    monkeypatch.setattr(training.torch, "softmax", softmax)
+    monkeypatch.setattr(training, "dice_metric", lambda *_args: 1.0)
+    monkeypatch.setattr(reproduction, "native_case_record", native_case_record)
+    scalar = TraceTensor("bfloat16", [[1]])
+    result = training.validation_step(
+        Model(),
+        {
+            "image": scalar,
+            "mask": TraceTensor("bfloat16", [[[[1]]]]),
+            "cls": scalar,
+            "id": ["sealed-case"],
+            "native_mask": [scalar],
+            "native_shape": [scalar],
+            "crop_shape": [scalar],
+            "pad_info": [scalar],
+        },
+        lambda *_args: Loss(),
+        0.5,
+        SimpleNamespace(type=device_type),
+        use_amp=True,
+        native_case_materialization=True,
+        amp_dtype=amp_dtype,
+    )
+    assert result["native_cases"] == [{"case_id": "sealed-case"}]
+    assert observed["sigmoid"] == [expected_dtype, expected_dtype]
+    assert observed["softmax"] == [expected_dtype]
+    assert observed["threshold"] == [(expected_dtype, 0.5)]
+    expected_numpy_dtype = "float32" if expected_dtype == "float32" else "float16"
+    assert observed["native"] == [(expected_numpy_dtype, expected_numpy_dtype)]
+
+
 def test_no_wandb_acceptance_soak_covers_full_lifecycle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
