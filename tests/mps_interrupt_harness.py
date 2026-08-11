@@ -85,6 +85,14 @@ def main() -> int:
         "mps_available": True,
         "mps_cpu_fallback": False,
     }
+    mps.validate_mps_allocator_environment = lambda: {  # type: ignore[assignment]
+        "values": {
+            "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.9",
+            "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "1.0",
+        },
+        "set_before_mps_runtime_validation": True,
+        "sha256": "allocator",
+    }
     mps.datasets.dataloader = lambda **_kwargs: (  # type: ignore[assignment]
         SizedLoader(444),
         SizedLoader(111),
@@ -93,7 +101,7 @@ def main() -> int:
         identity,
         "identity-hash",
     )
-    mps._mps_feasibility_probe = lambda *_args: {  # type: ignore[assignment]
+    mps._run_mps_optimizer_probe = lambda *_args, **_kwargs: {  # type: ignore[assignment]
         "status": "passed",
         "finite_loss": True,
     }

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import shutil
@@ -43,11 +44,12 @@ from reproduction import (
     validate_canonical_content,
     validate_dataset_identity,
     validate_epoch_evidence,
+    validate_mps_allocator_environment,
     validate_mps_runtime_dependencies,
     validate_pretrained,
     write_json_once,
 )
-from training import fit
+from training import compute_lr, fit, make_optimizer
 from utils import DiceCELoss
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -61,12 +63,18 @@ GRADIENT_ACCUMULATION_STEPS = 8
 EFFECTIVE_BATCH_SIZE = 8
 TRAIN_MICRO_STEPS = 440
 TRAIN_OPTIMIZER_STEPS = 55
+FEASIBILITY_OPTIMIZER_STEPS = 1
+ACCEPTANCE_SOAK_OPTIMIZER_STEPS = 21
+ACCEPTANCE_SOAK_MICRO_STEPS = (
+    ACCEPTANCE_SOAK_OPTIMIZER_STEPS * GRADIENT_ACCUMULATION_STEPS
+)
 MPS_ARTIFACT_NAMES = (
     "config.json",
     "source.json",
     "case_identity.json",
     "dependency.lock",
     "resource_evidence.json",
+    "acceptance_soak_heartbeat.jsonl",
     "epochs.json",
     "best_epoch_cases.json",
     "regression.json",
@@ -149,10 +157,19 @@ def mps_protocol_contract() -> dict[str, Any]:
         "validation_space": "native",
         "feasibility": {
             "input_size": [TARGET_SIZE, TARGET_SIZE],
-            "probe": "one_training_microbatch_forward_backward",
+            "probe": "exact_8_microbatch_adamw_optimizer_update",
+            "optimizer_updates": FEASIBILITY_OPTIMIZER_STEPS,
             "must_pass_before_wandb": True,
             "failure_policy": "sealed_resource_evidence_only",
             "automatic_512_fallback": False,
+        },
+        "acceptance_soak": {
+            "probe": "exact_adamw_optimizer_path",
+            "optimizer_updates": ACCEPTANCE_SOAK_OPTIMIZER_STEPS,
+            "micro_steps": ACCEPTANCE_SOAK_MICRO_STEPS,
+            "wandb_forbidden": True,
+            "must_pass_before_scientific_run": True,
+            "disposable_model_discarded_before_training": True,
         },
         "inference": {
             "detection": "combo",
@@ -180,24 +197,42 @@ def _memory_snapshot() -> dict[str, int | None]:
     }
 
 
-def _mps_feasibility_probe(
-    loader: Any, device: torch.device, pretrained_path: Path
+def _run_mps_optimizer_probe(
+    loader: Any,
+    device: torch.device,
+    pretrained_path: Path,
+    *,
+    optimizer_updates: int,
+    probe_name: str,
+    heartbeat_path: Path | None = None,
 ) -> dict[str, Any]:
+    """Exercise the exact accumulated AdamW path without starting W&B."""
     if device.type != "mps" or not torch.backends.mps.is_available():
-        raise RuntimeError("feasibility probe requires the verified MPS device")
+        raise RuntimeError("optimizer probe requires the verified MPS device")
+    if optimizer_updates < 1:
+        raise ValueError("optimizer probe requires at least one update")
     empty_cache = getattr(torch.mps, "empty_cache", None)
     synchronize = getattr(torch.mps, "synchronize", None)
     stage = "cache_prepare"
     model: torch.nn.Module | None = None
+    optimizer: torch.optim.Optimizer | None = None
+    heartbeat_stream: Any = None
     evidence: dict[str, Any] = {
         "schema_version": 1,
-        "probe": "one_training_microbatch_forward_backward",
+        "probe": probe_name,
         "target_size": TARGET_SIZE,
         "physical_batch_size": PHYSICAL_BATCH_SIZE,
         "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
         "effective_batch_size": EFFECTIVE_BATCH_SIZE,
+        "requested_optimizer_updates": optimizer_updates,
+        "requested_micro_steps": optimizer_updates
+        * GRADIENT_ACCUMULATION_STEPS,
+        "wandb_started": False,
+        "updates": [],
     }
     try:
+        if heartbeat_path is not None:
+            heartbeat_stream = heartbeat_path.open("x", encoding="utf-8")
         if callable(empty_cache):
             empty_cache()
         evidence["memory_before"] = _memory_snapshot()
@@ -214,38 +249,120 @@ def _mps_feasibility_probe(
         )
         stage = "device_transfer"
         model = cast(torch.nn.Module, model.to(device))
-        stage = "microbatch_load"
-        batch = next(iter(loader))
-        stage = "microbatch_device_transfer"
-        image = batch["image"].to(device)
-        mask = batch["mask"].to(device)
-        cls = batch["cls"].to(device)
-        if tuple(image.shape) != (1, 1, TARGET_SIZE, TARGET_SIZE):
-            raise ValueError("feasibility batch is not exact 1x1x1024x1024")
-        stage = "forward"
         model.train()
         cast(Any, model).return_cls = True
-        segmentation, classification = model(image)
-        stage = "loss"
-        segmentation_loss = DiceCELoss(batch_dice=True)(segmentation, mask)
-        classification_loss = torch.nn.BCEWithLogitsLoss()(classification, cls)
-        loss = segmentation_loss + 0.5 * classification_loss
-        if not bool(torch.isfinite(loss).item()):
-            raise FloatingPointError("feasibility loss is non-finite")
-        stage = "backward"
-        (loss / GRADIENT_ACCUMULATION_STEPS).backward()
-        stage = "synchronize"
-        if callable(synchronize):
-            synchronize()
+        stage = "optimizer_construction"
+        optimizer = make_optimizer(model, initial_lr=5e-5, optimizer_name="adamw")
+        probe_lr = compute_lr(0, EPOCHS, 5e-5, "cosine", 5)
+        for group in optimizer.param_groups:
+            group["lr"] = probe_lr
+        evidence["optimizer"] = {
+            "name": "adamw",
+            "learning_rate": probe_lr,
+            "gradient_clip_norm": 12,
+        }
+        segmentation_loss_fn = DiceCELoss(batch_dice=True)
+        classification_loss_fn = torch.nn.BCEWithLogitsLoss()
+        optimizer.zero_grad(set_to_none=True)
+        iterator = iter(loader)
+        started = time.perf_counter()
+        completed_micro_steps = 0
+        for update_index in range(optimizer_updates):
+            update_case_ids: list[str] = []
+            last_losses: dict[str, float] = {}
+            for _ in range(GRADIENT_ACCUMULATION_STEPS):
+                stage = "microbatch_load"
+                try:
+                    batch = next(iterator)
+                except StopIteration as error:
+                    raise ValueError(
+                        "probe loader exhausted before required optimizer path"
+                    ) from error
+                stage = "microbatch_identity"
+                batch_ids = [str(value) for value in batch.get("id", [])]
+                if len(batch_ids) != PHYSICAL_BATCH_SIZE:
+                    raise ValueError("probe microbatch identity is missing")
+                update_case_ids.extend(batch_ids)
+                stage = "microbatch_device_transfer"
+                image = batch["image"].to(device)
+                mask = batch["mask"].to(device)
+                cls = batch["cls"].to(device)
+                if tuple(image.shape) != (1, 1, TARGET_SIZE, TARGET_SIZE):
+                    raise ValueError("probe batch is not exact 1x1x1024x1024")
+                stage = "forward"
+                segmentation, classification = model(image)
+                stage = "loss"
+                segmentation_loss = segmentation_loss_fn(segmentation, mask)
+                classification_loss = classification_loss_fn(classification, cls)
+                loss = segmentation_loss + 0.5 * classification_loss
+                if not all(
+                    bool(torch.isfinite(value).item())
+                    for value in (segmentation_loss, classification_loss, loss)
+                ):
+                    raise FloatingPointError("probe loss is non-finite")
+                last_losses = {
+                    "segmentation_loss": float(segmentation_loss.item()),
+                    "classification_loss": float(classification_loss.item()),
+                    "total_loss": float(loss.item()),
+                }
+                stage = "backward"
+                (loss / GRADIENT_ACCUMULATION_STEPS).backward()
+                completed_micro_steps += 1
+            if len(set(update_case_ids)) != GRADIENT_ACCUMULATION_STEPS:
+                raise ValueError("optimizer update did not use 8 distinct microbatches")
+            stage = "gradient_clip"
+            gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 12)
+            if not bool(torch.isfinite(gradient_norm).item()):
+                raise FloatingPointError("probe gradient norm is non-finite")
+            stage = "optimizer_step"
+            optimizer.step()
+            stage = "optimizer_zero_grad"
+            optimizer.zero_grad(set_to_none=True)
+            stage = "synchronize"
+            if callable(synchronize):
+                synchronize()
+            update_evidence = {
+                "optimizer_update": update_index + 1,
+                "completed_micro_steps": completed_micro_steps,
+                "distinct_microbatches": len(set(update_case_ids)),
+                "microbatch_identity_sha256": canonical_sha256(
+                    sorted(update_case_ids)
+                ),
+                "finite_losses": True,
+                "finite_gradient_norm": True,
+                "gradient_norm": float(gradient_norm.item()),
+                "last_microbatch_losses": last_losses,
+                "elapsed_seconds": time.perf_counter() - started,
+                "memory": _memory_snapshot(),
+            }
+            cast(list[dict[str, Any]], evidence["updates"]).append(update_evidence)
+            if heartbeat_stream is not None:
+                heartbeat_stream.write(
+                    json.dumps(update_evidence, sort_keys=True, separators=(",", ":"))
+                    + "\n"
+                )
+                heartbeat_stream.flush()
+                os.fsync(heartbeat_stream.fileno())
+                evidence["heartbeat_records_written"] = update_index + 1
         evidence.update(
             {
                 "status": "passed",
                 "finite_loss": True,
-                "memory_after_backward": _memory_snapshot(),
+                "completed_optimizer_updates": optimizer_updates,
+                "completed_micro_steps": completed_micro_steps,
+                "memory_after_optimizer_path": _memory_snapshot(),
             }
         )
+        if heartbeat_stream is not None:
+            heartbeat_stream.close()
+            heartbeat_stream = None
+            evidence["heartbeat_sha256"] = sha256_file(cast(Path, heartbeat_path))
         return evidence
     except Exception as error:
+        if heartbeat_stream is not None:
+            heartbeat_stream.flush()
+            os.fsync(heartbeat_stream.fileno())
+            evidence["heartbeat_sha256"] = sha256_file(cast(Path, heartbeat_path))
         evidence.update(
             {
                 "status": "failed",
@@ -257,6 +374,8 @@ def _mps_feasibility_probe(
         )
         raise MPSFeasibilityFailure(evidence) from error
     finally:
+        if heartbeat_stream is not None:
+            heartbeat_stream.close()
         if model is not None:
             zero_grad = getattr(model, "zero_grad", None)
             if callable(zero_grad):
@@ -265,6 +384,8 @@ def _mps_feasibility_probe(
                 except RuntimeError:
                     pass
             del model
+        if optimizer is not None:
+            del optimizer
         if callable(empty_cache):
             try:
                 empty_cache()
@@ -283,6 +404,8 @@ def _resource_evidence(
     dependency: dict[str, Any],
     identity_sha256: str,
     probe: dict[str, Any],
+    acceptance_soak: dict[str, Any],
+    allocator: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -310,6 +433,8 @@ def _resource_evidence(
             "mps_cpu_fallback": dependency["mps_cpu_fallback"],
         },
         "probe": probe,
+        "acceptance_soak": acceptance_soak,
+        "mps_allocator": allocator,
         "automatic_512_fallback_started": False,
         "wandb_started_before_probe_completion": False,
         "external_final_test_untouched": True,
@@ -327,6 +452,7 @@ def _build_config(
     dependency: dict[str, Any],
     identity_sha256: str,
     resource_sha256: str,
+    allocator: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "schema_version": 3,
@@ -353,6 +479,7 @@ def _build_config(
         "dependency": dependency,
         "case_identity_sha256": identity_sha256,
         "resource_evidence_sha256": resource_sha256,
+        "mps_allocator": allocator,
         "train_micro_steps_per_epoch": TRAIN_MICRO_STEPS,
         "train_optimizer_steps_per_epoch": TRAIN_OPTIMIZER_STEPS,
         "validation_steps_per_epoch": EXPECTED_VALIDATION_CASES,
@@ -404,6 +531,7 @@ def _wandb_public_config(config: dict[str, Any]) -> dict[str, Any]:
             "mps_cpu_fallback": dependency["mps_cpu_fallback"],
         },
         "resource_evidence_sha256": config["resource_evidence_sha256"],
+        "mps_allocator": config["mps_allocator"],
         "external_final_isolation": config["external_final_isolation"],
     }
 
@@ -519,6 +647,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     stage = "source_identity"
     previous_handlers = _install_interrupt_handlers()
     try:
+        stage = "mps_allocator_environment"
+        allocator = validate_mps_allocator_environment()
+        stage = "source_identity"
         source = source_identity(REPO_ROOT)
         protocol = mps_protocol_contract()
         stage = "canonical_inputs"
@@ -564,8 +695,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         stage = "mps_1024_feasibility"
         try:
-            probe = _mps_feasibility_probe(
-                probe_loader, torch.device("mps"), args.pretrained
+            probe = _run_mps_optimizer_probe(
+                probe_loader,
+                torch.device("mps"),
+                args.pretrained,
+                optimizer_updates=FEASIBILITY_OPTIMIZER_STEPS,
+                probe_name="exact_8_microbatch_adamw_optimizer_update",
             )
         except MPSFeasibilityFailure as error:
             resource = _resource_evidence(
@@ -579,6 +714,36 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 dependency,
                 identity_sha256,
                 error.evidence,
+                {"status": "not_started"},
+                allocator,
+            )
+            return _seal_resource_failure(artifact_dir, args, resource)
+
+        stage = "mps_1024_acceptance_soak"
+        _set_seed(protocol["seed"])
+        try:
+            acceptance_soak = _run_mps_optimizer_probe(
+                probe_loader,
+                torch.device("mps"),
+                args.pretrained,
+                optimizer_updates=ACCEPTANCE_SOAK_OPTIMIZER_STEPS,
+                probe_name="no_wandb_21_update_acceptance_soak",
+                heartbeat_path=artifact_dir / "acceptance_soak_heartbeat.jsonl",
+            )
+        except MPSFeasibilityFailure as error:
+            resource = _resource_evidence(
+                args,
+                source,
+                protocol,
+                manifest,
+                content,
+                pretrained,
+                baseline,
+                dependency,
+                identity_sha256,
+                probe,
+                error.evidence,
+                allocator,
             )
             return _seal_resource_failure(artifact_dir, args, resource)
 
@@ -593,9 +758,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             dependency,
             identity_sha256,
             probe,
+            acceptance_soak,
+            allocator,
         )
         write_json_once(artifact_dir / "resource_evidence.json", resource)
         resource_sha256 = sha256_file(artifact_dir / "resource_evidence.json")
+        if args.acceptance_soak_only:
+            index = {
+                "schema_version": 1,
+                "attempt_id": args.attempt_id,
+                "phase": "acceptance_soak",
+                "status": "passed",
+                "resource_evidence_sha256": resource_sha256,
+                "wandb_started": False,
+                "scientific_training_started": False,
+                "external_final_test_untouched": True,
+            }
+            write_json_once(artifact_dir / "acceptance_soak_index.json", index)
+            return index
 
         stage = "fresh_training_setup"
         _set_seed(protocol["seed"])
@@ -630,6 +810,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             dependency,
             identity_sha256,
             resource_sha256,
+            allocator,
         )
         config["parameter_count"] = sum(p.numel() for p in model.parameters())
         config["wandb"]["config_sha256"] = canonical_sha256(
@@ -824,6 +1005,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--reviewed-by")
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument(
+        "--acceptance-soak-only",
+        action="store_true",
+        help="run the mandatory no-W&B 21-update MPS acceptance gate and exit",
+    )
     args = parser.parse_args(argv)
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.attempt_id) is None:
         parser.error("--attempt-id must be a single safe path component")

@@ -63,6 +63,10 @@ EXPECTED_MPS_PLATFORM_SYSTEM = "Darwin"
 EXPECTED_MPS_PLATFORM_MACHINE = "arm64"
 EXPECTED_MPS_TORCH_VERSION = "2.13.0"
 EXPECTED_MPS_TORCHVISION_VERSION = "0.28.0"
+EXPECTED_MPS_ALLOCATOR_ENVIRONMENT = {
+    "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.9",
+    "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "1.0",
+}
 EXPECTED_PRETRAINED_NAME = "eva_x_small_patch16_merged520k_mim.pt"
 EXPECTED_PRETRAINED_SHA256 = (
     "135d70a6988b5aacfe4848e1c2a0d524b2c076536fcaccdce88b636d302316c2"
@@ -73,6 +77,25 @@ EXPECTED_PRETRAINED_SOURCE = (
     "35ddcd6dab6ca99bbdb6cb45c8d1b093aefbd0ee/"
     "eva_x_small_patch16_merged520k_mim.pt"
 )
+
+
+def validate_mps_allocator_environment() -> dict[str, Any]:
+    """Fail closed unless the reviewed allocator settings were pre-set."""
+    observed = {
+        name: os.environ.get(name) for name in EXPECTED_MPS_ALLOCATOR_ENVIRONMENT
+    }
+    if observed != EXPECTED_MPS_ALLOCATOR_ENVIRONMENT:
+        raise RuntimeError(
+            "MPS allocator environment must be set before MPS initialization: "
+            "PYTORCH_MPS_LOW_WATERMARK_RATIO=0.9 and "
+            "PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.0"
+        )
+    sealed = {
+        "values": dict(EXPECTED_MPS_ALLOCATOR_ENVIRONMENT),
+        "set_before_mps_runtime_validation": True,
+    }
+    sealed["sha256"] = canonical_sha256(sealed)
+    return sealed
 
 
 def sha256_file(path: Path | str) -> str:

@@ -34,6 +34,16 @@ Python patch version, operating system, architecture, PyTorch/torchvision
 version, and MPS availability match exactly. It also rejects
 `PYTORCH_ENABLE_MPS_FALLBACK=1`.
 
+Before starting the process, the reviewed allocator settings must be exported
+exactly. The runner fails before MPS runtime validation when either value is
+missing or altered, and seals both values and their canonical hash into the
+resource evidence and public aggregate W&B configuration:
+
+```bash
+export PYTORCH_MPS_LOW_WATERMARK_RATIO=0.9
+export PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.0
+```
+
 ## Preregistered resource contract
 
 - Input is attempted at 1024 first and only.
@@ -46,8 +56,16 @@ version, and MPS availability match exactly. It also rejects
 - Each epoch consumes 440 microsteps and 55 optimizer updates; the final four
   shuffled cases are dropped exactly as the physical-batch-8 CUDA loader drops
   an incomplete batch.
-- Before W&B initialization, a real 1×1×1024×1024 training microbatch must
-  complete forward, finite multitask loss, and backward on MPS.
+- Before W&B initialization, eight distinct real 1×1×1024×1024 microbatches
+  must complete the exact accumulated optimizer path: finite multitask loss,
+  loss/8 backward, gradient clipping at 12, unchanged AdamW step, zero-grad,
+  and `torch.mps.synchronize()`.
+- A mandatory no-W&B acceptance soak then repeats that exact path for 21
+  optimizer updates / 168 distinct microsteps. Every completed update records
+  a flushed and fsynced append-only heartbeat with elapsed time, finite
+  losses/gradient norm, privacy-safe identity hash, and MPS memory snapshot.
+  Its disposable model and optimizer are deleted; the seed, dataloaders, and
+  model are recreated before scientific training.
 - The probe records allocated, driver-allocated, and recommended maximum MPS
   memory when those runtime APIs are available.
 - Probe failure creates only immutable `resource_evidence.json` and
@@ -76,6 +94,10 @@ Execution additionally requires both `--execute` and
 has independent approval. W&B is fixed to entity
 `kimhyeonwoo2431-individual`, project `treat-mmtb-task1`, online mode,
 `resume=never`, and the fresh attempt ID.
+
+To run only the acceptance gate and exit before W&B or scientific training,
+add `--acceptance-soak-only`. This still requires `--execute`, independent
+review attestation, exact canonical inputs, and a fresh immutable attempt ID.
 
 Successful execution logs every microstep's total, segmentation, and
 classification loss, accumulation boundary, optimizer-step count, and every LR

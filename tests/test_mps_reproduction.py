@@ -164,8 +164,12 @@ def test_probe_seals_model_construction_and_transfer_resource_failures(
     monkeypatch.setattr(mps, "modeltype", lambda *_args, **_kwargs: failure_factory())
 
     with pytest.raises(mps.MPSFeasibilityFailure) as caught:
-        mps._mps_feasibility_probe(
-            object(), mps.torch.device("mps"), tmp_path / "pretrained.pt"
+        mps._run_mps_optimizer_probe(
+            object(),
+            mps.torch.device("mps"),
+            tmp_path / "pretrained.pt",
+            optimizer_updates=1,
+            probe_name="test",
         )
     assert caught.value.evidence["status"] == "failed"
     assert caught.value.evidence["failure_stage"] == failure_stage
@@ -197,6 +201,9 @@ def test_probe_seals_forward_and_backward_resource_failures(
         def backward(self) -> None:
             raise RuntimeError("MPS backend out of memory")
 
+        def item(self) -> float:
+            return 1.0
+
     class ProbeModel:
         return_cls = False
 
@@ -225,11 +232,27 @@ def test_probe_seals_forward_and_backward_resource_failures(
     monkeypatch.setattr(
         mps.torch, "isfinite", lambda _loss: SimpleNamespace(item=lambda: True)
     )
-    loader = [{"image": Tensor(), "mask": Tensor(), "cls": Tensor()}]
+    monkeypatch.setattr(
+        mps,
+        "make_optimizer",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            param_groups=[{"lr": 5e-5}],
+            zero_grad=lambda **_kwargs: None,
+            step=lambda: None,
+        ),
+    )
+    loader = [
+        {"image": Tensor(), "mask": Tensor(), "cls": Tensor(), "id": [f"case-{i}"]}
+        for i in range(8)
+    ]
 
     with pytest.raises(mps.MPSFeasibilityFailure) as caught:
-        mps._mps_feasibility_probe(
-            loader, mps.torch.device("mps"), tmp_path / "pretrained.pt"
+        mps._run_mps_optimizer_probe(
+            loader,
+            mps.torch.device("mps"),
+            tmp_path / "pretrained.pt",
+            optimizer_updates=1,
+            probe_name="test",
         )
     assert caught.value.evidence["failure_stage"] == failure_stage
     assert caught.value.evidence["out_of_memory"] is True
@@ -297,6 +320,15 @@ def test_execute_routes_failed_probe_to_resource_only_without_wandb(
             "mps_built": True,
             "mps_available": True,
             "mps_cpu_fallback": False,
+        },
+    )
+    monkeypatch.setattr(
+        mps,
+        "validate_mps_allocator_environment",
+        lambda: {
+            "values": dict(reproduction.EXPECTED_MPS_ALLOCATOR_ENVIRONMENT),
+            "set_before_mps_runtime_validation": True,
+            "sha256": "allocator",
         },
     )
     monkeypatch.setattr(mps, "sha256_file", lambda _path: "sealed-hash")
@@ -414,6 +446,164 @@ def test_mps_runtime_gate_is_exact_and_disables_cpu_fallback(
         reproduction.validate_mps_runtime_dependencies(lock)
 
 
+@pytest.mark.parametrize(
+    ("low", "high"),
+    [(None, None), ("0.8", "1.0"), ("0.9", "1.1")],
+)
+def test_mps_allocator_environment_rejects_missing_or_altered_values(
+    monkeypatch: pytest.MonkeyPatch, low: str | None, high: str | None
+) -> None:
+    for name, value in (
+        ("PYTORCH_MPS_LOW_WATERMARK_RATIO", low),
+        ("PYTORCH_MPS_HIGH_WATERMARK_RATIO", high),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    with pytest.raises(RuntimeError, match="allocator environment"):
+        reproduction.validate_mps_allocator_environment()
+
+
+def test_mps_allocator_environment_is_sealed_at_exact_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name, value in reproduction.EXPECTED_MPS_ALLOCATOR_ENVIRONMENT.items():
+        monkeypatch.setenv(name, value)
+    sealed = reproduction.validate_mps_allocator_environment()
+    assert sealed["values"] == reproduction.EXPECTED_MPS_ALLOCATOR_ENVIRONMENT
+    assert sealed["set_before_mps_runtime_validation"] is True
+    assert sealed["sha256"] == reproduction.canonical_sha256(
+        {
+            "values": reproduction.EXPECTED_MPS_ALLOCATOR_ENVIRONMENT,
+            "set_before_mps_runtime_validation": True,
+        }
+    )
+
+
+def _mock_successful_optimizer_probe(
+    monkeypatch: pytest.MonkeyPatch, *, fail_optimizer_step: bool = False
+) -> list[dict[str, object]]:
+    class Tensor:
+        shape = (1, 1, 1024, 1024)
+
+        def to(self, _device: object) -> "Tensor":
+            return self
+
+    class Loss:
+        def __add__(self, _other: object) -> "Loss":
+            return self
+
+        def __rmul__(self, _other: object) -> "Loss":
+            return self
+
+        def __truediv__(self, _other: object) -> "Loss":
+            return self
+
+        def backward(self) -> None:
+            pass
+
+        def item(self) -> float:
+            return 1.0
+
+    class ProbeModel:
+        return_cls = False
+
+        def to(self, _device: object) -> "ProbeModel":
+            return self
+
+        def train(self) -> None:
+            pass
+
+        def zero_grad(self, *, set_to_none: bool) -> None:
+            assert set_to_none is True
+
+        def parameters(self) -> list[object]:
+            return []
+
+        def __call__(self, _image: Tensor) -> tuple[object, object]:
+            return object(), object()
+
+    class Optimizer:
+        param_groups = [{"lr": 5e-5}]
+
+        def zero_grad(self, *, set_to_none: bool) -> None:
+            assert set_to_none is True
+
+        def step(self) -> None:
+            if fail_optimizer_step:
+                raise RuntimeError("MPS Metal optimizer command buffer failed")
+
+    monkeypatch.setattr(mps.torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(mps.torch.mps, "empty_cache", lambda: None, raising=False)
+    monkeypatch.setattr(mps.torch.mps, "synchronize", lambda: None, raising=False)
+    monkeypatch.setattr(mps, "_memory_snapshot", lambda: {"allocated": 1})
+    monkeypatch.setattr(mps, "modeltype", lambda *_args, **_kwargs: ProbeModel())
+    monkeypatch.setattr(mps, "make_optimizer", lambda *_args, **_kwargs: Optimizer())
+    monkeypatch.setattr(mps, "DiceCELoss", lambda **_kwargs: lambda *_args: Loss())
+    monkeypatch.setattr(
+        mps.torch.nn, "BCEWithLogitsLoss", lambda: lambda *_args: Loss()
+    )
+    monkeypatch.setattr(
+        mps.torch.nn.utils, "clip_grad_norm_", lambda *_args, **_kwargs: Loss()
+    )
+    monkeypatch.setattr(
+        mps.torch, "isfinite", lambda _value: SimpleNamespace(item=lambda: True)
+    )
+    return [
+        {
+            "image": Tensor(),
+            "mask": Tensor(),
+            "cls": Tensor(),
+            "id": [f"case-{index}"],
+        }
+        for index in range(mps.ACCEPTANCE_SOAK_MICRO_STEPS)
+    ]
+
+
+def test_no_wandb_acceptance_soak_covers_21_updates_and_168_microsteps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loader = _mock_successful_optimizer_probe(monkeypatch)
+    heartbeat = tmp_path / "acceptance.jsonl"
+    evidence = mps._run_mps_optimizer_probe(
+        loader,
+        mps.torch.device("mps"),
+        tmp_path / "pretrained.pt",
+        optimizer_updates=mps.ACCEPTANCE_SOAK_OPTIMIZER_STEPS,
+        probe_name="acceptance",
+        heartbeat_path=heartbeat,
+    )
+    assert evidence["status"] == "passed"
+    assert evidence["wandb_started"] is False
+    assert evidence["completed_optimizer_updates"] == 21
+    assert evidence["completed_micro_steps"] == 168
+    assert len(evidence["updates"]) == 21
+    assert all(update["distinct_microbatches"] == 8 for update in evidence["updates"])
+    assert all("memory" in update for update in evidence["updates"])
+    assert len(heartbeat.read_text(encoding="utf-8").splitlines()) == 21
+    assert evidence["heartbeat_records_written"] == 21
+    assert evidence["heartbeat_sha256"] == reproduction.sha256_file(heartbeat)
+
+
+def test_optimizer_path_failure_is_sealed_before_wandb(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loader = _mock_successful_optimizer_probe(
+        monkeypatch, fail_optimizer_step=True
+    )
+    with pytest.raises(mps.MPSFeasibilityFailure) as caught:
+        mps._run_mps_optimizer_probe(
+            loader,
+            mps.torch.device("mps"),
+            tmp_path / "pretrained.pt",
+            optimizer_updates=1,
+            probe_name="optimizer-failure",
+        )
+    assert caught.value.evidence["failure_stage"] == "optimizer_step"
+    assert caught.value.evidence["wandb_started"] is False
+
+
 def test_mps_lock_pins_verified_direct_environment() -> None:
     lock = Path(__file__).resolve().parents[1] / "requirements-reproduction-mps.lock"
     versions = reproduction.locked_versions(lock)
@@ -449,6 +639,11 @@ def test_mps_public_wandb_config_excludes_case_identity_values() -> None:
             "mps_cpu_fallback": False,
         },
         "resource_evidence_sha256": "resource",
+        "mps_allocator": {
+            "values": dict(reproduction.EXPECTED_MPS_ALLOCATOR_ENVIRONMENT),
+            "set_before_mps_runtime_validation": True,
+            "sha256": "allocator",
+        },
         "external_final_isolation": {"external_final_test_untouched": True},
     }
     public = mps._wandb_public_config(config)
