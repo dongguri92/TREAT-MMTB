@@ -34,15 +34,13 @@ Python patch version, operating system, architecture, PyTorch/torchvision
 version, and MPS availability match exactly. It also rejects
 `PYTORCH_ENABLE_MPS_FALLBACK=1`.
 
-Before starting the process, the reviewed allocator settings must be exported
-exactly. The runner fails before MPS runtime validation when either value is
-missing or altered, and seals both values and their canonical hash into the
-resource evidence and public aggregate W&B configuration:
-
-```bash
-export PYTORCH_MPS_LOW_WATERMARK_RATIO=0.9
-export PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.0
-```
+Execution must start through the stdlib-only
+`reproduce_teammate_l05_mps_bootstrap.py` launcher. Before importing PyTorch,
+the launcher sets missing allocator values to exactly low `0.9` / high `1.0`,
+rejects altered values, verifies the reviewed `Macmini9,1` host receipt, and
+seals the allocator, host, launcher, worker, contract, parent PID, and exact
+child command into the bootstrap proof. Direct `--execute` calls to the worker
+are rejected.
 
 ## Preregistered resource contract
 
@@ -60,14 +58,24 @@ export PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.0
   must complete the exact accumulated optimizer path: finite multitask loss,
   loss/8 backward, gradient clipping at 12, unchanged AdamW step, zero-grad,
   and `torch.mps.synchronize()`.
-- A mandatory no-W&B acceptance soak then repeats that exact path for 21
-  optimizer updates / 168 distinct microsteps. Every completed update records
-  a flushed and fsynced append-only heartbeat with elapsed time, finite
-  losses/gradient norm, privacy-safe identity hash, and MPS memory snapshot.
-  Its disposable model and optimizer are deleted; the seed, dataloaders, and
-  model are recreated before scientific training.
-- The probe records allocated, driver-allocated, and recommended maximum MPS
-  memory when those runtime APIs are available.
+- A mandatory no-W&B resource child completes a full first epoch of 55
+  optimizer updates / 440 microsteps, traverses all 111 deterministic
+  validation cases exactly once, applies the next-epoch LR transition, and
+  completes another 21 optimizer updates / 168 microsteps. Every update and
+  validation step records a flushed and fsynced append-only heartbeat.
+- The resource contract requires `num_workers=0`, Albumentations 2 Compose
+  seeds (`42` geometric, `43` intensity), no persistent workers, and at least
+  10% headroom relative to the MPS recommended maximum before and throughout
+  the gate. Missing memory APIs fail closed.
+- The supervisor enforces a 30-minute no-progress timeout. It captures a
+  process sample, sends SIGTERM, allows a 120-second cleanup grace, and only
+  then escalates. Child artifacts cannot mark supervisor completion: the
+  supervisor independently verifies and hashes the write-once completion
+  index and emits its own immutable receipt.
+- After the resource gate, all disposable tensors, model, optimizer, loaders,
+  and workers are destroyed, followed by GC, MPS cache clearing, and MPS
+  synchronization. Scientific training is a separate fresh child process and
+  must consume the supervisor-owned gate receipt.
 - Probe failure creates only immutable `resource_evidence.json` and
   `resource_index.json`. It never starts W&B or training and never changes to
   512. A 512 attempt requires a separate reviewed issue and fresh attempt.
@@ -77,7 +85,7 @@ export PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.0
 Dry-run is the default and does not inspect data or create artifacts:
 
 ```bash
-.venv-reproduction-mps/bin/python reproduce_teammate_l05_mps.py \
+.venv-reproduction-mps/bin/python reproduce_teammate_l05_mps_bootstrap.py \
   --attempt-id teammate-l05-mps-health-001 \
   --manifest /local/internal_validation_manifest.json \
   --baseline-score /local/baseline/score.json \
@@ -96,8 +104,11 @@ has independent approval. W&B is fixed to entity
 `resume=never`, and the fresh attempt ID.
 
 To run only the acceptance gate and exit before W&B or scientific training,
-add `--acceptance-soak-only`. This still requires `--execute`, independent
-review attestation, exact canonical inputs, and a fresh immutable attempt ID.
+add `--acceptance-soak-only`. The bootstrap creates a separate
+`<attempt-id>-resource-gate` child attempt and supervisor receipt. Without that
+flag, a passing gate is followed by a distinct scientific child. Both paths
+still require `--execute`, independent review attestation, exact canonical
+inputs, and a fresh immutable attempt ID.
 
 Successful execution logs every microstep's total, segmentation, and
 classification loss, accumulation boundary, optimizer-step count, and every LR
@@ -108,9 +119,10 @@ identity, feasibility, score, paired regression, checkpoint, W&B identity, and
 artifact hashes. W&B receives aggregate counts and hashes, never case IDs or
 local paths.
 
-`SIGTERM` and `SIGINT` are controlled cancellations. An active W&B run is
-finished with `exit_code=1`, a sanitized immutable `failure.json` receipt records
-the signal and finish outcome, and the prior process handlers are restored
-before exit.
+Resource and scientific children stream privacy-safe progress out of process to
+the supervisor. `SIGTERM` and `SIGINT` are controlled cancellations. An active
+W&B run is finished with `exit_code=1`; a sanitized immutable `failure.json`
+records the signal, finish outcome, and any partial-heartbeat hash/count; and
+the prior process handlers are restored before exit.
 
 No training or W&B run is authorized by this document alone.

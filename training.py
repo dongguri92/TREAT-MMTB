@@ -105,7 +105,8 @@ def _seg_loss_on_output(seg_output, target, seg_loss_fn) -> torch.Tensor:
 
 def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
                     device, scaler, use_amp=True, wandb_run=None,
-                    epoch=0, global_step=0, gradient_accumulation_steps=1):
+                    epoch=0, global_step=0, gradient_accumulation_steps=1,
+                    progress_callback=None):
     if gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be positive")
     usable_micro_steps = (
@@ -171,12 +172,21 @@ def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
                 for index, group in enumerate(optimizer.param_groups)
             })
             wandb_run.log(step_log)
+        if progress_callback is not None:
+            progress_callback({
+                'phase': 'scientific_train',
+                'epoch': epoch + 1,
+                'micro_step': batch_index + 1,
+                'optimizer_step': global_step,
+                'optimizer_step_completed': optimizer_step_completed,
+            })
     return float(np.mean(losses)), global_step
 
 
 @torch.no_grad()
 def validate(model, loader, seg_loss_fn, lambda_cls, device, use_amp=True,
-             wandb_run=None, epoch=0, native_combo_expected_ids=None):
+             wandb_run=None, epoch=0, native_combo_expected_ids=None,
+             progress_callback=None):
     model.eval()
     dices, cls_correct, cls_total = [], 0, 0
     native_cases = []
@@ -237,6 +247,12 @@ def validate(model, loader, seg_loss_fn, lambda_cls, device, use_amp=True,
                     crop_shape=batch['crop_shape'][index].cpu().numpy(),
                     native_shape=batch['native_shape'][index].cpu().numpy(),
                 ))
+        if progress_callback is not None:
+            progress_callback({
+                'phase': 'scientific_validation',
+                'epoch': epoch + 1,
+                'validation_step': batch_index + 1,
+            })
 
     mean_dice = float(np.nanmean(dices)) if len(dices) else 0.0
     cls_acc = cls_correct / max(cls_total, 1)
@@ -261,7 +277,8 @@ def fit(model, train_loader, val_loader, device,
         patience=None, batch_dice=True, optimizer_name='sgd',
         scheduler='poly', warmup_epochs=0, loss_name='dicece',
         wandb_run=None, reproduction_expected_ids=None,
-        return_details=False, gradient_accumulation_steps=1):
+        return_details=False, gradient_accumulation_steps=1,
+        progress_callback=None):
 
     optimizer = make_optimizer(model, initial_lr=initial_lr,
                                optimizer_name=optimizer_name)
@@ -297,12 +314,14 @@ def fit(model, train_loader, val_loader, device,
             model, train_loader, optimizer, seg_loss_fn,
             lambda_cls, device, scaler, wandb_run=wandb_run,
             epoch=epoch, global_step=global_step,
-            gradient_accumulation_steps=gradient_accumulation_steps)
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            progress_callback=progress_callback)
         validation_started = time.perf_counter()
         val_loss, val_dice, val_acc, native_metrics = validate(
             model, val_loader, seg_loss_fn, lambda_cls, device,
             wandb_run=wandb_run, epoch=epoch,
-            native_combo_expected_ids=reproduction_expected_ids)
+            native_combo_expected_ids=reproduction_expected_ids,
+            progress_callback=progress_callback)
         if native_metrics is not None:
             val_dice = native_metrics['dice']
             val_acc = native_metrics['classification_accuracy']

@@ -15,13 +15,14 @@ Inputs (original data):
     <mask_dir>/<id>.nii.gz
 """
 
-import os
 import glob
+import os
 import random
 from functools import partial
 from typing import Any
-import numpy as np
+
 import cv2
+import numpy as np
 import pydicom
 import SimpleITK as sitk
 import torch
@@ -81,7 +82,7 @@ def zscore(img):
     return (img - m) / (s + 1e-8)
 
 
-def build_geometric_aug():
+def build_geometric_aug(seed=None):
     """Spatial transforms on BOTH image and mask, on original resolution.
     Mirrors nnU-Net's spatial augmentation (rotation / scaling / elastic) plus
     mirroring. Probabilities/ranges chosen close to nnU-Net defaults."""
@@ -97,10 +98,10 @@ def build_geometric_aug():
                  mask_interpolation=cv2.INTER_NEAREST, p=0.5),
         # elastic deformation
         A.ElasticTransform(alpha=1, sigma=50, p=0.2),
-    ], additional_targets={'mask': 'mask'})
+    ], additional_targets={'mask': 'mask'}, seed=seed)
 
 
-def build_intensity_aug():
+def build_intensity_aug(seed=None):
     #Intensity transforms on IMAGE ONLY, after CLAHE.
     #Mirrors nnU-Net's intensity augmentation: gaussian noise, gaussian blur,
     #brightness (multiplicative), contrast, simulate-low-resolution, gamma.
@@ -121,7 +122,7 @@ def build_intensity_aug():
                     p=0.2),
         # gamma (both directions)
         A.RandomGamma(gamma_limit=(70, 150), p=0.3),
-    ])
+    ], seed=seed)
 
 """
 def build_intensity_aug():
@@ -168,15 +169,17 @@ VAL_MASK_DIR = os.environ.get(
 
 class CXRCavityDataset(Dataset):
     def __init__(self, dcm_dir, mask_dir, ids, train=True,
-                 target_size=1024, clahe_clip=2.0, crop_frac=LOWER_CROP_FRAC):
+                 target_size=1024, clahe_clip=2.0, crop_frac=LOWER_CROP_FRAC,
+                 seed=42):
         self.dcm_dir = dcm_dir
         self.mask_dir = mask_dir
         self.ids = list(ids)
         self.train = train
         self.target_size = target_size
         self.clahe_clip = clahe_clip
-        self.geo_aug = build_geometric_aug() if train else None
-        self.int_aug = build_intensity_aug() if train else None
+        self.geo_aug = build_geometric_aug(seed=seed) if train else None
+        self.int_aug = build_intensity_aug(seed=seed + 1) if train else None
+        self.seed = seed
         self.crop_frac = crop_frac
 
     def __len__(self):
@@ -283,10 +286,12 @@ def dataloader(batch_size=3, target_size=1024, clahe_clip=2.0,
 
     train_ds = CXRCavityDataset(TRAIN_DCM_DIR, TRAIN_MASK_DIR, train_ids,
                                 train=True, target_size=target_size,
-                                clahe_clip=clahe_clip, crop_frac=crop_frac)
+                                clahe_clip=clahe_clip, crop_frac=crop_frac,
+                                seed=seed)
     val_ds = CXRCavityDataset(VAL_DCM_DIR, VAL_MASK_DIR, val_ids,
                               train=False, target_size=target_size,
-                              clahe_clip=clahe_clip, crop_frac=crop_frac)
+                              clahe_clip=clahe_clip, crop_frac=crop_frac,
+                              seed=seed)
 
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -294,13 +299,13 @@ def dataloader(batch_size=3, target_size=1024, clahe_clip=2.0,
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True, drop_last=True,
-        persistent_workers=True if num_workers > 0 else False,
+        persistent_workers=num_workers > 0,
         generator=generator,
         worker_init_fn=partial(_seed_worker, base_seed=seed))
     val_loader = torch.utils.data.DataLoader(
         val_ds, batch_size=1, shuffle=False,
         num_workers=num_workers, pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False)
+        persistent_workers=num_workers > 0)
 
     return train_loader, val_loader
 

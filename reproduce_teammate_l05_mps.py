@@ -1,21 +1,24 @@
 """Review-gated Apple-MPS health amendment for Issue #106.
 
 This runner is separate from the sealed Linux/CUDA reproduction. Dry-run is
-the default. Execution requires independent review and always probes one
-1024x1024 MPS training microbatch before W&B or training can start.
+the default. Reviewed execution is bootstrap-only and requires a disposable
+1024x1024 train/validation/next-epoch resource gate before W&B can start.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import random
 import re
 import shutil
 import signal
+import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -54,6 +57,8 @@ from utils import DiceCELoss
 
 REPO_ROOT = Path(__file__).resolve().parent
 MPS_LOCK_PATH = REPO_ROOT / "requirements-reproduction-mps.lock"
+MPS_RESOURCE_CONTRACT_PATH = REPO_ROOT / "mps_resource_contract.json"
+MPS_BOOTSTRAP_PATH = REPO_ROOT / "reproduce_teammate_l05_mps_bootstrap.py"
 ISSUE_URL = "https://github.com/choco9966/TREAT-MMTB-2026/issues/106"
 PARENT_ISSUE_URL = "https://github.com/choco9966/TREAT-MMTB-2026/issues/95"
 EPOCHS = 5
@@ -64,10 +69,16 @@ EFFECTIVE_BATCH_SIZE = 8
 TRAIN_MICRO_STEPS = 440
 TRAIN_OPTIMIZER_STEPS = 55
 FEASIBILITY_OPTIMIZER_STEPS = 1
-ACCEPTANCE_SOAK_OPTIMIZER_STEPS = 21
+ACCEPTANCE_FIRST_EPOCH_OPTIMIZER_STEPS = 55
+ACCEPTANCE_TRANSITION_OPTIMIZER_STEPS = 21
+ACCEPTANCE_SOAK_OPTIMIZER_STEPS = (
+    ACCEPTANCE_FIRST_EPOCH_OPTIMIZER_STEPS
+    + ACCEPTANCE_TRANSITION_OPTIMIZER_STEPS
+)
 ACCEPTANCE_SOAK_MICRO_STEPS = (
     ACCEPTANCE_SOAK_OPTIMIZER_STEPS * GRADIENT_ACCUMULATION_STEPS
 )
+ACCEPTANCE_SOAK_VALIDATION_STEPS = EXPECTED_VALIDATION_CASES
 MPS_ARTIFACT_NAMES = (
     "config.json",
     "source.json",
@@ -164,9 +175,16 @@ def mps_protocol_contract() -> dict[str, Any]:
             "automatic_512_fallback": False,
         },
         "acceptance_soak": {
-            "probe": "exact_adamw_optimizer_path",
+            "probe": "train_validation_next_epoch_resource_lifecycle",
             "optimizer_updates": ACCEPTANCE_SOAK_OPTIMIZER_STEPS,
             "micro_steps": ACCEPTANCE_SOAK_MICRO_STEPS,
+            "first_epoch_optimizer_updates": (
+                ACCEPTANCE_FIRST_EPOCH_OPTIMIZER_STEPS
+            ),
+            "validation_resource_steps": ACCEPTANCE_SOAK_VALIDATION_STEPS,
+            "next_epoch_optimizer_updates": (
+                ACCEPTANCE_TRANSITION_OPTIMIZER_STEPS
+            ),
             "wandb_forbidden": True,
             "must_pass_before_scientific_run": True,
             "disposable_model_discarded_before_training": True,
@@ -197,6 +215,73 @@ def _memory_snapshot() -> dict[str, int | None]:
     }
 
 
+def _load_mps_resource_contract() -> dict[str, Any]:
+    with MPS_RESOURCE_CONTRACT_PATH.open(encoding="utf-8") as stream:
+        contract = json.load(stream)
+    if not isinstance(contract, dict) or contract.get("schema_version") != 1:
+        raise RuntimeError("invalid MPS resource contract")
+    return contract
+
+
+def _validate_bootstrap_proof(expected_role: str) -> dict[str, Any]:
+    encoded = os.environ.get("TREAT_MMTB_MPS_BOOTSTRAP_PROOF")
+    digest = os.environ.get("TREAT_MMTB_MPS_BOOTSTRAP_PROOF_SHA256")
+    if not encoded or not digest:
+        raise RuntimeError("execute requires the stdlib-only MPS bootstrap")
+    if canonical_sha256(json.loads(encoded)) != digest:
+        raise RuntimeError("MPS bootstrap proof digest is invalid")
+    proof = json.loads(encoded)
+    contract = _load_mps_resource_contract()
+    expected_child_argv = [
+        os.environ.get("TREAT_MMTB_MPS_WORKER_PYTHON", ""),
+        str(Path(__file__).resolve()),
+        *sys.argv[1:],
+    ]
+    if (
+        proof.get("schema_version") != 1
+        or proof.get("role") != expected_role
+        or proof.get("allocator") != contract["allocator"]
+        or proof.get("host") != contract["host"]
+        or proof.get("contract_sha256") != sha256_file(MPS_RESOURCE_CONTRACT_PATH)
+        or proof.get("launcher_sha256") != sha256_file(MPS_BOOTSTRAP_PATH)
+        or proof.get("worker_sha256") != sha256_file(Path(__file__).resolve())
+        or proof.get("child_argv_sha256")
+        != canonical_sha256(expected_child_argv)
+        or proof.get("parent_pid") != os.getppid()
+        or not re.fullmatch(r"[0-9a-f]{64}", str(proof.get("nonce", "")))
+        or proof.get("torch_imported_in_bootstrap") is not False
+    ):
+        raise RuntimeError("MPS bootstrap proof differs from reviewed contract")
+    allocator = validate_mps_allocator_environment()
+    if allocator["values"] != proof["allocator"]:
+        raise RuntimeError("allocator environment differs from bootstrap proof")
+    return {**proof, "proof_sha256": digest}
+
+
+def _supervisor_progress(event: dict[str, Any]) -> None:
+    descriptor = os.environ.get("TREAT_MMTB_MPS_PROGRESS_FD")
+    if descriptor is None:
+        raise RuntimeError("supervised execute requires progress descriptor")
+    payload = json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+    os.write(int(descriptor), payload.encode("utf-8"))
+
+
+def _validate_memory_headroom(snapshot: dict[str, int | None]) -> float:
+    driver = snapshot.get("driver_allocated_bytes")
+    recommended = snapshot.get("recommended_max_bytes")
+    if (
+        not isinstance(driver, int)
+        or not isinstance(recommended, int)
+        or recommended <= 0
+    ):
+        raise RuntimeError("MPS memory headroom APIs are required")
+    headroom = 1.0 - (driver / recommended)
+    required = float(_load_mps_resource_contract()["memory"]["minimum_headroom_ratio"])
+    if headroom < required:
+        raise RuntimeError("MPS memory headroom fell below reviewed minimum")
+    return headroom
+
+
 def _run_mps_optimizer_probe(
     loader: Any,
     device: torch.device,
@@ -205,8 +290,11 @@ def _run_mps_optimizer_probe(
     optimizer_updates: int,
     probe_name: str,
     heartbeat_path: Path | None = None,
+    validation_loader: Any = None,
+    validation_after_updates: int | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Exercise the exact accumulated AdamW path without starting W&B."""
+    """Exercise train/validation/transition MPS resources without W&B or scores."""
     if device.type != "mps" or not torch.backends.mps.is_available():
         raise RuntimeError("optimizer probe requires the verified MPS device")
     if optimizer_updates < 1:
@@ -217,6 +305,9 @@ def _run_mps_optimizer_probe(
     model: torch.nn.Module | None = None
     optimizer: torch.optim.Optimizer | None = None
     heartbeat_stream: Any = None
+    batch = image = mask = cls = None
+    segmentation = classification = None
+    segmentation_loss = classification_loss = loss = gradient_norm = None
     evidence: dict[str, Any] = {
         "schema_version": 1,
         "probe": probe_name,
@@ -229,13 +320,28 @@ def _run_mps_optimizer_probe(
         * GRADIENT_ACCUMULATION_STEPS,
         "wandb_started": False,
         "updates": [],
+        "validation": [],
     }
+
+    def emit(record: dict[str, Any]) -> None:
+        if heartbeat_stream is not None:
+            heartbeat_stream.write(
+                json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+            )
+            heartbeat_stream.flush()
+            os.fsync(heartbeat_stream.fileno())
+        if progress_callback is not None:
+            progress_callback(record)
+
     try:
         if heartbeat_path is not None:
             heartbeat_stream = heartbeat_path.open("x", encoding="utf-8")
         if callable(empty_cache):
             empty_cache()
         evidence["memory_before"] = _memory_snapshot()
+        evidence["memory_before_headroom_ratio"] = _validate_memory_headroom(
+            evidence["memory_before"]
+        )
         stage = "model_construction"
         model = cast(
             torch.nn.Module,
@@ -268,6 +374,97 @@ def _run_mps_optimizer_probe(
         started = time.perf_counter()
         completed_micro_steps = 0
         for update_index in range(optimizer_updates):
+            if (
+                validation_loader is not None
+                and validation_after_updates == update_index
+            ):
+                stage = "validation_resource_traversal"
+                model.eval()
+                validation_ids: list[str] = []
+                with torch.no_grad():
+                    for validation_index, validation_batch in enumerate(
+                        validation_loader, start=1
+                    ):
+                        batch = validation_batch
+                        validation_batch_ids = [
+                            str(value) for value in batch.get("id", [])
+                        ]
+                        if len(validation_batch_ids) != 1:
+                            raise ValueError("validation resource identity is missing")
+                        validation_ids.extend(validation_batch_ids)
+                        image = batch["image"].to(device)
+                        mask = batch["mask"].to(device)
+                        cls = batch["cls"].to(device)
+                        segmentation, classification = model(image)
+                        segmentation_main = (
+                            segmentation[0]
+                            if isinstance(segmentation, (list, tuple))
+                            else segmentation
+                        )
+                        segmentation_loss = segmentation_loss_fn(
+                            segmentation_main, mask
+                        )
+                        classification_loss = classification_loss_fn(
+                            classification, cls
+                        )
+                        loss = segmentation_loss + 0.5 * classification_loss
+                        if not all(
+                            bool(torch.isfinite(value).item())
+                            for value in (
+                                segmentation_loss,
+                                classification_loss,
+                                loss,
+                            )
+                        ):
+                            raise FloatingPointError(
+                                "validation resource loss is non-finite"
+                            )
+                        _ = segmentation_main.argmax(1).cpu()
+                        _ = torch.softmax(segmentation_main, dim=1)[:, 1].cpu()
+                        _ = torch.sigmoid(classification).cpu()
+                        if callable(synchronize):
+                            synchronize()
+                        memory = _memory_snapshot()
+                        headroom = _validate_memory_headroom(memory)
+                        validation_record = {
+                            "phase": "validation_resource",
+                            "validation_step": validation_index,
+                            "finite_loss": True,
+                            "elapsed_seconds": time.perf_counter() - started,
+                            "memory": memory,
+                            "headroom_ratio": headroom,
+                        }
+                        cast(
+                            list[dict[str, Any]], evidence["validation"]
+                        ).append(validation_record)
+                        emit(validation_record)
+                        batch = image = mask = cls = None
+                        segmentation = classification = None
+                        segmentation_loss = classification_loss = loss = None
+                if (
+                    len(validation_ids) != ACCEPTANCE_SOAK_VALIDATION_STEPS
+                    or len(set(validation_ids)) != ACCEPTANCE_SOAK_VALIDATION_STEPS
+                ):
+                    raise ValueError(
+                        "validation resource traversal is not exact 111 unique cases"
+                    )
+                evidence["validation_identity_sha256"] = canonical_sha256(
+                    sorted(validation_ids)
+                )
+                evidence["completed_validation_steps"] = len(validation_ids)
+                model.train()
+                iterator = iter(loader)
+                probe_lr = compute_lr(1, EPOCHS, 5e-5, "cosine", 5)
+                for group in optimizer.param_groups:
+                    group["lr"] = probe_lr
+                emit(
+                    {
+                        "phase": "next_epoch_transition",
+                        "completed_optimizer_updates": update_index,
+                        "learning_rate": probe_lr,
+                        "elapsed_seconds": time.perf_counter() - started,
+                    }
+                )
             update_case_ids: list[str] = []
             last_losses: dict[str, float] = {}
             for _ in range(GRADIENT_ACCUMULATION_STEPS):
@@ -308,6 +505,9 @@ def _run_mps_optimizer_probe(
                 stage = "backward"
                 (loss / GRADIENT_ACCUMULATION_STEPS).backward()
                 completed_micro_steps += 1
+                batch = image = mask = cls = None
+                segmentation = classification = None
+                segmentation_loss = classification_loss = loss = None
             if len(set(update_case_ids)) != GRADIENT_ACCUMULATION_STEPS:
                 raise ValueError("optimizer update did not use 8 distinct microbatches")
             stage = "gradient_clip"
@@ -321,7 +521,15 @@ def _run_mps_optimizer_probe(
             stage = "synchronize"
             if callable(synchronize):
                 synchronize()
+            memory = _memory_snapshot()
+            headroom = _validate_memory_headroom(memory)
             update_evidence = {
+                "phase": (
+                    "next_epoch_train"
+                    if validation_after_updates is not None
+                    and update_index >= validation_after_updates
+                    else "first_epoch_train"
+                ),
                 "optimizer_update": update_index + 1,
                 "completed_micro_steps": completed_micro_steps,
                 "distinct_microbatches": len(set(update_case_ids)),
@@ -333,24 +541,25 @@ def _run_mps_optimizer_probe(
                 "gradient_norm": float(gradient_norm.item()),
                 "last_microbatch_losses": last_losses,
                 "elapsed_seconds": time.perf_counter() - started,
-                "memory": _memory_snapshot(),
+                "memory": memory,
+                "headroom_ratio": headroom,
             }
             cast(list[dict[str, Any]], evidence["updates"]).append(update_evidence)
-            if heartbeat_stream is not None:
-                heartbeat_stream.write(
-                    json.dumps(update_evidence, sort_keys=True, separators=(",", ":"))
-                    + "\n"
-                )
-                heartbeat_stream.flush()
-                os.fsync(heartbeat_stream.fileno())
-                evidence["heartbeat_records_written"] = update_index + 1
+            emit(update_evidence)
+            evidence["heartbeat_records_written"] = len(evidence["updates"]) + len(
+                evidence["validation"]
+            )
+        memory_after = _memory_snapshot()
         evidence.update(
             {
                 "status": "passed",
                 "finite_loss": True,
                 "completed_optimizer_updates": optimizer_updates,
                 "completed_micro_steps": completed_micro_steps,
-                "memory_after_optimizer_path": _memory_snapshot(),
+                "memory_after_optimizer_path": memory_after,
+                "memory_after_headroom_ratio": _validate_memory_headroom(
+                    memory_after
+                ),
             }
         )
         if heartbeat_stream is not None:
@@ -358,7 +567,7 @@ def _run_mps_optimizer_probe(
             heartbeat_stream = None
             evidence["heartbeat_sha256"] = sha256_file(cast(Path, heartbeat_path))
         return evidence
-    except Exception as error:
+    except BaseException as error:
         if heartbeat_stream is not None:
             heartbeat_stream.flush()
             os.fsync(heartbeat_stream.fileno())
@@ -370,12 +579,27 @@ def _run_mps_optimizer_probe(
                 "error_type": type(error).__name__,
                 "out_of_memory": "out of memory" in str(error).lower(),
                 "memory_at_failure": _memory_snapshot(),
+                "heartbeat_records_written": len(evidence["updates"])
+                + len(evidence["validation"]),
             }
         )
+        if isinstance(error, RunInterrupted):
+            evidence.update(
+                {
+                    "reason": "signal_interruption",
+                    "signal": error.signal_name,
+                    "signal_number": error.signum,
+                }
+            )
         raise MPSFeasibilityFailure(evidence) from error
     finally:
         if heartbeat_stream is not None:
             heartbeat_stream.close()
+        batch = image = mask = cls = None
+        segmentation = classification = None
+        segmentation_loss = classification_loss = loss = gradient_norm = None
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
         if model is not None:
             zero_grad = getattr(model, "zero_grad", None)
             if callable(zero_grad):
@@ -386,9 +610,15 @@ def _run_mps_optimizer_probe(
             del model
         if optimizer is not None:
             del optimizer
+        gc.collect()
         if callable(empty_cache):
             try:
                 empty_cache()
+            except RuntimeError:
+                pass
+        if callable(synchronize):
+            try:
+                synchronize()
             except RuntimeError:
                 pass
 
@@ -406,6 +636,7 @@ def _resource_evidence(
     probe: dict[str, Any],
     acceptance_soak: dict[str, Any],
     allocator: dict[str, Any],
+    bootstrap: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -435,6 +666,7 @@ def _resource_evidence(
         "probe": probe,
         "acceptance_soak": acceptance_soak,
         "mps_allocator": allocator,
+        "bootstrap": bootstrap,
         "automatic_512_fallback_started": False,
         "wandb_started_before_probe_completion": False,
         "external_final_test_untouched": True,
@@ -453,6 +685,7 @@ def _build_config(
     identity_sha256: str,
     resource_sha256: str,
     allocator: dict[str, Any],
+    resource_gate_receipt_sha256: str,
 ) -> dict[str, Any]:
     return {
         "schema_version": 3,
@@ -480,6 +713,7 @@ def _build_config(
         "case_identity_sha256": identity_sha256,
         "resource_evidence_sha256": resource_sha256,
         "mps_allocator": allocator,
+        "resource_gate_receipt_sha256": resource_gate_receipt_sha256,
         "train_micro_steps_per_epoch": TRAIN_MICRO_STEPS,
         "train_optimizer_steps_per_epoch": TRAIN_OPTIMIZER_STEPS,
         "validation_steps_per_epoch": EXPECTED_VALIDATION_CASES,
@@ -532,6 +766,7 @@ def _wandb_public_config(config: dict[str, Any]) -> dict[str, Any]:
         },
         "resource_evidence_sha256": config["resource_evidence_sha256"],
         "mps_allocator": config["mps_allocator"],
+        "resource_gate_receipt_sha256": config["resource_gate_receipt_sha256"],
         "external_final_isolation": config["external_final_isolation"],
     }
 
@@ -571,10 +806,60 @@ def _validate_mps_epochs(epochs: list[dict[str, Any]]) -> None:
             raise ValueError("MPS cumulative optimizer-step evidence is incomplete")
 
 
+def _load_resource_gate(
+    args: argparse.Namespace,
+    source: dict[str, str],
+    identity_sha256: str,
+    pretrained_sha256: str,
+) -> tuple[dict[str, Any], str]:
+    receipt_path = args.resource_gate_receipt
+    if receipt_path is None:
+        raise RuntimeError("scientific run requires a supervisor resource-gate receipt")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    index_path = receipt_path.with_name("supervisor_index.json")
+    supervisor_index = json.loads(index_path.read_text(encoding="utf-8"))
+    receipt_sha256 = sha256_file(receipt_path)
+    expected_gate_id = f"{args.attempt_id}-resource-gate"
+    if (
+        receipt.get("status") != "completed"
+        or receipt.get("role") != "resource_gate"
+        or receipt.get("attempt_id") != expected_gate_id
+        or supervisor_index.get("receipt_sha256") != receipt_sha256
+        or supervisor_index.get("status") != "completed"
+    ):
+        raise RuntimeError("resource-gate supervisor receipt is incomplete")
+    gate_dir = args.artifact_root / expected_gate_id
+    gate_index_path = gate_dir / "acceptance_soak_index.json"
+    gate_resource_path = gate_dir / "resource_evidence.json"
+    gate_index = json.loads(gate_index_path.read_text(encoding="utf-8"))
+    resource = json.loads(gate_resource_path.read_text(encoding="utf-8"))
+    if (
+        gate_index.get("status") != "passed"
+        or gate_index.get("wandb_started") is not False
+        or gate_index.get("scientific_training_started") is not False
+        or gate_index.get("resource_evidence_sha256")
+        != sha256_file(gate_resource_path)
+        or resource.get("source") != source
+        or resource.get("case_identity_sha256") != identity_sha256
+        or resource.get("pretrained_sha256") != pretrained_sha256
+        or resource.get("acceptance_soak", {}).get("status") != "passed"
+    ):
+        raise RuntimeError("resource-gate evidence differs from scientific inputs")
+    return resource, receipt_sha256
+
+
 def _seal_resource_failure(
     artifact_dir: Path, args: argparse.Namespace, resource: dict[str, Any]
 ) -> dict[str, Any]:
     write_json_once(artifact_dir / "resource_evidence.json", resource)
+    artifacts = {
+        "resource_evidence.json": sha256_file(
+            artifact_dir / "resource_evidence.json"
+        )
+    }
+    heartbeat_path = artifact_dir / "acceptance_soak_heartbeat.jsonl"
+    if heartbeat_path.exists():
+        artifacts[heartbeat_path.name] = sha256_file(heartbeat_path)
     index = {
         "schema_version": 1,
         "attempt_id": args.attempt_id,
@@ -583,6 +868,7 @@ def _seal_resource_failure(
         "resource_evidence_sha256": sha256_file(
             artifact_dir / "resource_evidence.json"
         ),
+        "artifacts": artifacts,
         "automatic_512_fallback_started": False,
         "wandb_started": False,
         "external_final_test_untouched": True,
@@ -623,6 +909,12 @@ def _safe_failure(
             )
         if wandb_finish_error is not None:
             receipt["wandb_finish_error_type"] = type(wandb_finish_error).__name__
+        heartbeat = artifact_dir / "acceptance_soak_heartbeat.jsonl"
+        if heartbeat.exists():
+            receipt["partial_heartbeat_sha256"] = sha256_file(heartbeat)
+            receipt["partial_heartbeat_records"] = len(
+                heartbeat.read_text(encoding="utf-8").splitlines()
+            )
         write_json_once(path, receipt)
 
 
@@ -641,14 +933,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
     if not str(args.reviewed_by or "").strip():
         raise ValueError("--execute requires a non-empty --reviewed-by attestation")
+    if not args.internal_worker:
+        raise RuntimeError("execute must be launched by the stdlib-only bootstrap")
+
+    role = "resource_gate" if args.acceptance_soak_only else "scientific_run"
+    bootstrap = _validate_bootstrap_proof(role)
+    allocator = validate_mps_allocator_environment()
 
     artifact_dir.mkdir(parents=True, exist_ok=False)
     wandb_run: Any = None
     stage = "source_identity"
     previous_handlers = _install_interrupt_handlers()
     try:
-        stage = "mps_allocator_environment"
-        allocator = validate_mps_allocator_environment()
         stage = "source_identity"
         source = source_identity(REPO_ROOT)
         protocol = mps_protocol_contract()
@@ -693,44 +989,71 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if len(probe_loader) != EXPECTED_TRAIN_CASES or len(probe_val_loader) != 111:
             raise ValueError("MPS loaders differ from exact 444/111 microstep contract")
 
-        stage = "mps_1024_feasibility"
-        try:
-            probe = _run_mps_optimizer_probe(
-                probe_loader,
-                torch.device("mps"),
-                args.pretrained,
-                optimizer_updates=FEASIBILITY_OPTIMIZER_STEPS,
-                probe_name="exact_8_microbatch_adamw_optimizer_update",
-            )
-        except MPSFeasibilityFailure as error:
-            resource = _resource_evidence(
-                args,
-                source,
-                protocol,
-                manifest,
-                content,
-                pretrained,
-                baseline,
-                dependency,
-                identity_sha256,
-                error.evidence,
-                {"status": "not_started"},
-                allocator,
-            )
-            return _seal_resource_failure(artifact_dir, args, resource)
+        if args.acceptance_soak_only:
+            stage = "mps_1024_feasibility"
+            try:
+                probe = _run_mps_optimizer_probe(
+                    probe_loader,
+                    torch.device("mps"),
+                    args.pretrained,
+                    optimizer_updates=FEASIBILITY_OPTIMIZER_STEPS,
+                    probe_name="exact_8_microbatch_adamw_optimizer_update",
+                    progress_callback=_supervisor_progress,
+                )
+            except MPSFeasibilityFailure as error:
+                resource = _resource_evidence(
+                    args,
+                    source,
+                    protocol,
+                    manifest,
+                    content,
+                    pretrained,
+                    baseline,
+                    dependency,
+                    identity_sha256,
+                    error.evidence,
+                    {"status": "not_started"},
+                    allocator,
+                    bootstrap,
+                )
+                return _seal_resource_failure(artifact_dir, args, resource)
 
-        stage = "mps_1024_acceptance_soak"
-        _set_seed(protocol["seed"])
-        try:
-            acceptance_soak = _run_mps_optimizer_probe(
-                probe_loader,
-                torch.device("mps"),
-                args.pretrained,
-                optimizer_updates=ACCEPTANCE_SOAK_OPTIMIZER_STEPS,
-                probe_name="no_wandb_21_update_acceptance_soak",
-                heartbeat_path=artifact_dir / "acceptance_soak_heartbeat.jsonl",
-            )
-        except MPSFeasibilityFailure as error:
+            stage = "mps_1024_acceptance_soak"
+            _set_seed(protocol["seed"])
+            try:
+                acceptance_soak = _run_mps_optimizer_probe(
+                    probe_loader,
+                    torch.device("mps"),
+                    args.pretrained,
+                    optimizer_updates=ACCEPTANCE_SOAK_OPTIMIZER_STEPS,
+                    probe_name="no_wandb_train_validation_transition_soak",
+                    heartbeat_path=(
+                        artifact_dir / "acceptance_soak_heartbeat.jsonl"
+                    ),
+                    validation_loader=probe_val_loader,
+                    validation_after_updates=(
+                        ACCEPTANCE_FIRST_EPOCH_OPTIMIZER_STEPS
+                    ),
+                    progress_callback=_supervisor_progress,
+                )
+            except MPSFeasibilityFailure as error:
+                resource = _resource_evidence(
+                    args,
+                    source,
+                    protocol,
+                    manifest,
+                    content,
+                    pretrained,
+                    baseline,
+                    dependency,
+                    identity_sha256,
+                    probe,
+                    error.evidence,
+                    allocator,
+                    bootstrap,
+                )
+                return _seal_resource_failure(artifact_dir, args, resource)
+
             resource = _resource_evidence(
                 args,
                 source,
@@ -742,34 +1065,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 dependency,
                 identity_sha256,
                 probe,
-                error.evidence,
+                acceptance_soak,
                 allocator,
+                bootstrap,
             )
-            return _seal_resource_failure(artifact_dir, args, resource)
-
-        resource = _resource_evidence(
-            args,
-            source,
-            protocol,
-            manifest,
-            content,
-            pretrained,
-            baseline,
-            dependency,
-            identity_sha256,
-            probe,
-            acceptance_soak,
-            allocator,
-        )
-        write_json_once(artifact_dir / "resource_evidence.json", resource)
-        resource_sha256 = sha256_file(artifact_dir / "resource_evidence.json")
-        if args.acceptance_soak_only:
+            write_json_once(artifact_dir / "resource_evidence.json", resource)
+            resource_sha256 = sha256_file(artifact_dir / "resource_evidence.json")
+            del probe_loader, probe_val_loader
+            gc.collect()
+            torch.mps.empty_cache()
+            torch.mps.synchronize()
+            _supervisor_progress(
+                {
+                    "phase": "resource_process_cleanup",
+                    "status": "passed",
+                    "memory": _memory_snapshot(),
+                }
+            )
             index = {
                 "schema_version": 1,
                 "attempt_id": args.attempt_id,
                 "phase": "acceptance_soak",
                 "status": "passed",
                 "resource_evidence_sha256": resource_sha256,
+                "heartbeat_sha256": sha256_file(
+                    artifact_dir / "acceptance_soak_heartbeat.jsonl"
+                ),
                 "wandb_started": False,
                 "scientific_training_started": False,
                 "external_final_test_untouched": True,
@@ -777,7 +1098,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             write_json_once(artifact_dir / "acceptance_soak_index.json", index)
             return index
 
+        stage = "resource_gate_validation"
+        resource, resource_gate_receipt_sha256 = _load_resource_gate(
+            args, source, identity_sha256, pretrained["sha256"]
+        )
+        shutil.copyfile(
+            args.artifact_root
+            / f"{args.attempt_id}-resource-gate"
+            / "resource_evidence.json",
+            artifact_dir / "resource_evidence.json",
+        )
+        shutil.copyfile(
+            args.artifact_root
+            / f"{args.attempt_id}-resource-gate"
+            / "acceptance_soak_heartbeat.jsonl",
+            artifact_dir / "acceptance_soak_heartbeat.jsonl",
+        )
+        resource_sha256 = sha256_file(artifact_dir / "resource_evidence.json")
+
         stage = "fresh_training_setup"
+        del probe_loader, probe_val_loader
+        gc.collect()
+        torch.mps.empty_cache()
+        torch.mps.synchronize()
         _set_seed(protocol["seed"])
         train_loader, val_loader = datasets.dataloader(
             batch_size=PHYSICAL_BATCH_SIZE,
@@ -811,6 +1154,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             identity_sha256,
             resource_sha256,
             allocator,
+            resource_gate_receipt_sha256,
         )
         config["parameter_count"] = sum(p.numel() for p in model.parameters())
         config["wandb"]["config_sha256"] = canonical_sha256(
@@ -849,6 +1193,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 reproduction_expected_ids=identity["validation"],
                 return_details=True,
                 gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+                progress_callback=_supervisor_progress,
             ),
         )
 
@@ -971,7 +1316,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             try:
                 wandb_run.finish(exit_code=1)
                 finish_succeeded = True
-            except BaseException as caught_finish_error:  # noqa: BLE001
+            except BaseException as caught_finish_error:
                 finish_succeeded = False
                 finish_error = caught_finish_error
         _safe_failure(
@@ -1008,13 +1353,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--acceptance-soak-only",
         action="store_true",
-        help="run the mandatory no-W&B 21-update MPS acceptance gate and exit",
+        help="run the mandatory no-W&B epoch/validation/transition gate and exit",
+    )
+    parser.add_argument("--resource-gate-receipt", type=Path)
+    parser.add_argument(
+        "--internal-worker", action="store_true", help=argparse.SUPPRESS
     )
     args = parser.parse_args(argv)
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.attempt_id) is None:
         parser.error("--attempt-id must be a single safe path component")
-    if args.num_workers < 0:
-        parser.error("--num-workers must be non-negative")
+    if args.num_workers != 0:
+        parser.error("reviewed Apple-MPS contract requires --num-workers 0")
     path_names = (
         "artifact_root",
         "manifest",
@@ -1032,6 +1381,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     for name in path_names:
         value = getattr(args, name)
         setattr(args, name, resolve_non_external_path(value, name))
+    if args.resource_gate_receipt is not None:
+        reject_external_final_path(args.resource_gate_receipt, "resource_gate_receipt")
+        args.resource_gate_receipt = resolve_non_external_path(
+            args.resource_gate_receipt, "resource_gate_receipt"
+        )
     args.wandb_run_name = args.wandb_run_name or (
         f"task1-teammate-l05-veto-mps-health-{args.attempt_id}"
     )
@@ -1039,7 +1393,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> None:
-    print(json.dumps(run(parse_args(argv)), indent=2, sort_keys=True))
+    result = run(parse_args(argv))
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if result.get("status") in {"failed", "resource_infeasible"}:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

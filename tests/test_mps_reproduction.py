@@ -18,6 +18,14 @@ import reproduce_teammate_l05_mps as mps
 import reproduction
 
 
+def _healthy_memory_snapshot() -> dict[str, int]:
+    return {
+        "current_allocated_bytes": 1,
+        "driver_allocated_bytes": 10,
+        "recommended_max_bytes": 100,
+    }
+
+
 def _cli(tmp_path: Path) -> list[str]:
     return [
         "--attempt-id",
@@ -72,6 +80,54 @@ def test_mps_dry_run_requires_review_before_execution(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="reviewed-by"):
         mps.run(args)
     assert not (tmp_path / "artifacts" / args.attempt_id).exists()
+
+
+def test_worker_bootstrap_proof_binds_launcher_and_exact_child_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = mps._load_mps_resource_contract()
+    worker_python = "/reviewed/python"
+    child_args = ["--attempt-id", "sealed", "--internal-worker"]
+    monkeypatch.setattr(mps.sys, "argv", [str(mps.MPS_BOOTSTRAP_PATH), *child_args])
+    monkeypatch.setenv("TREAT_MMTB_MPS_WORKER_PYTHON", worker_python)
+    proof = {
+        "schema_version": 1,
+        "role": "resource_gate",
+        "allocator": contract["allocator"],
+        "host": contract["host"],
+        "contract_sha256": reproduction.sha256_file(
+            mps.MPS_RESOURCE_CONTRACT_PATH
+        ),
+        "launcher_sha256": reproduction.sha256_file(mps.MPS_BOOTSTRAP_PATH),
+        "worker_sha256": reproduction.sha256_file(Path(mps.__file__).resolve()),
+        "child_argv_sha256": reproduction.canonical_sha256(
+            [worker_python, str(Path(mps.__file__).resolve()), *child_args]
+        ),
+        "parent_pid": os.getppid(),
+        "nonce": "a" * 64,
+        "torch_imported_in_bootstrap": False,
+    }
+    encoded = json.dumps(proof, sort_keys=True, separators=(",", ":"))
+    monkeypatch.setenv("TREAT_MMTB_MPS_BOOTSTRAP_PROOF", encoded)
+    monkeypatch.setenv(
+        "TREAT_MMTB_MPS_BOOTSTRAP_PROOF_SHA256",
+        reproduction.canonical_sha256(proof),
+    )
+    monkeypatch.setattr(
+        mps,
+        "validate_mps_allocator_environment",
+        lambda: {"values": contract["allocator"]},
+    )
+    assert mps._validate_bootstrap_proof("resource_gate")["role"] == "resource_gate"
+    proof["child_argv_sha256"] = "0" * 64
+    altered = json.dumps(proof, sort_keys=True, separators=(",", ":"))
+    monkeypatch.setenv("TREAT_MMTB_MPS_BOOTSTRAP_PROOF", altered)
+    monkeypatch.setenv(
+        "TREAT_MMTB_MPS_BOOTSTRAP_PROOF_SHA256",
+        reproduction.canonical_sha256(proof),
+    )
+    with pytest.raises(RuntimeError, match="differs from reviewed contract"):
+        mps._validate_bootstrap_proof("resource_gate")
 
 
 def test_documented_repo_local_mps_venv_preserves_clean_source_identity(
@@ -159,7 +215,7 @@ def test_probe_seals_model_construction_and_transfer_resource_failures(
     failure_factory: Callable[[], object],
 ) -> None:
     monkeypatch.setattr(mps.torch.backends.mps, "is_available", lambda: True)
-    monkeypatch.setattr(mps, "_memory_snapshot", dict)
+    monkeypatch.setattr(mps, "_memory_snapshot", _healthy_memory_snapshot)
     monkeypatch.setattr(mps.torch.mps, "empty_cache", lambda: None, raising=False)
     monkeypatch.setattr(mps, "modeltype", lambda *_args, **_kwargs: failure_factory())
 
@@ -222,7 +278,7 @@ def test_probe_seals_forward_and_backward_resource_failures(
             return object(), object()
 
     monkeypatch.setattr(mps.torch.backends.mps, "is_available", lambda: True)
-    monkeypatch.setattr(mps, "_memory_snapshot", dict)
+    monkeypatch.setattr(mps, "_memory_snapshot", _healthy_memory_snapshot)
     monkeypatch.setattr(mps.torch.mps, "empty_cache", lambda: None, raising=False)
     monkeypatch.setattr(mps, "modeltype", lambda *_args, **_kwargs: ProbeModel())
     monkeypatch.setattr(mps, "DiceCELoss", lambda **_kwargs: lambda *_args: Loss())
@@ -262,8 +318,10 @@ def test_execute_routes_failed_probe_to_resource_only_without_wandb(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     args = mps.parse_args(
-        _cli(tmp_path) + ["--execute", "--reviewed-by", "review-url"]
+        _cli(tmp_path)
+        + ["--execute", "--reviewed-by", "review-url", "--acceptance-soak-only"]
     )
+    args.internal_worker = True
     identity = {
         "dataset_scope": reproduction.DATASET_SCOPE,
         "train": [f"train-{index}" for index in range(444)],
@@ -331,6 +389,11 @@ def test_execute_routes_failed_probe_to_resource_only_without_wandb(
             "sha256": "allocator",
         },
     )
+    monkeypatch.setattr(
+        mps,
+        "_validate_bootstrap_proof",
+        lambda _role: {"proof_sha256": "bootstrap"},
+    )
     monkeypatch.setattr(mps, "sha256_file", lambda _path: "sealed-hash")
     monkeypatch.setattr(
         mps.datasets,
@@ -344,7 +407,7 @@ def test_execute_routes_failed_probe_to_resource_only_without_wandb(
     )
     monkeypatch.setattr(mps, "modeltype", lambda *_args, **_kwargs: ProbeModel())
     monkeypatch.setattr(mps.torch.backends.mps, "is_available", lambda: True)
-    monkeypatch.setattr(mps, "_memory_snapshot", dict)
+    monkeypatch.setattr(mps, "_memory_snapshot", _healthy_memory_snapshot)
     monkeypatch.setattr(
         mps,
         "_start_wandb",
@@ -402,7 +465,20 @@ def test_subprocess_interrupt_closes_wandb_and_writes_safe_failure_receipt(
             encoding="utf-8"
         )
     )
-    assert receipt == {
+    assert {key: receipt[key] for key in (
+        "attempt_id",
+        "error_type",
+        "external_final_test_untouched",
+        "phase",
+        "reason",
+        "schema_version",
+        "signal",
+        "signal_number",
+        "stage",
+        "status",
+        "wandb_exit_code_1_requested",
+        "wandb_finish_succeeded",
+    )} == {
         "attempt_id": "interrupt-test",
         "error_type": "RunInterrupted",
         "external_final_test_untouched": True,
@@ -416,6 +492,8 @@ def test_subprocess_interrupt_closes_wandb_and_writes_safe_failure_receipt(
         "wandb_exit_code_1_requested": True,
         "wandb_finish_succeeded": True,
     }
+    assert receipt["partial_heartbeat_records"] == 1
+    assert len(receipt["partial_heartbeat_sha256"]) == 64
     assert json.loads(finish_path.read_text(encoding="utf-8")) == {"exit_code": 1}
     assert restored_path.read_text(encoding="utf-8") == "restored\n"
 
@@ -481,6 +559,51 @@ def test_mps_allocator_environment_is_sealed_at_exact_values(
     )
 
 
+def test_memory_headroom_fails_closed_on_missing_or_low_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        mps,
+        "_load_mps_resource_contract",
+        lambda: {"memory": {"minimum_headroom_ratio": 0.1}},
+    )
+    with pytest.raises(RuntimeError, match="APIs are required"):
+        mps._validate_memory_headroom({})
+    with pytest.raises(RuntimeError, match="below reviewed minimum"):
+        mps._validate_memory_headroom(
+            {
+                "driver_allocated_bytes": 95,
+                "recommended_max_bytes": 100,
+            }
+        )
+
+
+def test_mps_parser_rejects_background_workers(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        mps.parse_args(_cli(tmp_path) + ["--num-workers", "1"])
+
+
+def test_albumentations_compose_seeds_are_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compose_calls: list[dict[str, object]] = []
+
+    class FakeAlbumentations:
+        def __getattr__(self, _name: str) -> Callable[..., object]:
+            return lambda *_args, **_kwargs: object()
+
+        def Compose(self, *_args: object, **kwargs: object) -> object:
+            compose_calls.append(kwargs)
+            return object()
+
+    monkeypatch.setattr(mps.datasets, "_HAS_ALBU", True)
+    monkeypatch.setattr(mps.datasets, "A", FakeAlbumentations())
+    mps.datasets.build_geometric_aug(seed=42)
+    mps.datasets.build_intensity_aug(seed=43)
+    assert compose_calls[0]["seed"] == 42
+    assert compose_calls[1]["seed"] == 43
+
+
 def _mock_successful_optimizer_probe(
     monkeypatch: pytest.MonkeyPatch, *, fail_optimizer_step: bool = False
 ) -> list[dict[str, object]]:
@@ -488,6 +611,15 @@ def _mock_successful_optimizer_probe(
         shape = (1, 1, 1024, 1024)
 
         def to(self, _device: object) -> "Tensor":
+            return self
+
+        def cpu(self) -> "Tensor":
+            return self
+
+        def argmax(self, _dimension: int) -> "Tensor":
+            return self
+
+        def __getitem__(self, _key: object) -> "Tensor":
             return self
 
     class Loss:
@@ -515,6 +647,9 @@ def _mock_successful_optimizer_probe(
         def train(self) -> None:
             pass
 
+        def eval(self) -> None:
+            pass
+
         def zero_grad(self, *, set_to_none: bool) -> None:
             assert set_to_none is True
 
@@ -522,10 +657,11 @@ def _mock_successful_optimizer_probe(
             return []
 
         def __call__(self, _image: Tensor) -> tuple[object, object]:
-            return object(), object()
+            return Tensor(), Tensor()
 
     class Optimizer:
-        param_groups = [{"lr": 5e-5}]
+        def __init__(self) -> None:
+            self.param_groups = [{"lr": 5e-5}]
 
         def zero_grad(self, *, set_to_none: bool) -> None:
             assert set_to_none is True
@@ -537,7 +673,7 @@ def _mock_successful_optimizer_probe(
     monkeypatch.setattr(mps.torch.backends.mps, "is_available", lambda: True)
     monkeypatch.setattr(mps.torch.mps, "empty_cache", lambda: None, raising=False)
     monkeypatch.setattr(mps.torch.mps, "synchronize", lambda: None, raising=False)
-    monkeypatch.setattr(mps, "_memory_snapshot", lambda: {"allocated": 1})
+    monkeypatch.setattr(mps, "_memory_snapshot", _healthy_memory_snapshot)
     monkeypatch.setattr(mps, "modeltype", lambda *_args, **_kwargs: ProbeModel())
     monkeypatch.setattr(mps, "make_optimizer", lambda *_args, **_kwargs: Optimizer())
     monkeypatch.setattr(mps, "DiceCELoss", lambda **_kwargs: lambda *_args: Loss())
@@ -550,6 +686,8 @@ def _mock_successful_optimizer_probe(
     monkeypatch.setattr(
         mps.torch, "isfinite", lambda _value: SimpleNamespace(item=lambda: True)
     )
+    monkeypatch.setattr(mps.torch, "softmax", lambda value, **_kwargs: value)
+    monkeypatch.setattr(mps.torch, "sigmoid", lambda value: value)
     return [
         {
             "image": Tensor(),
@@ -561,10 +699,19 @@ def _mock_successful_optimizer_probe(
     ]
 
 
-def test_no_wandb_acceptance_soak_covers_21_updates_and_168_microsteps(
+def test_no_wandb_acceptance_soak_covers_full_lifecycle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     loader = _mock_successful_optimizer_probe(monkeypatch)
+    validation_loader = [
+        {
+            "image": loader[0]["image"],
+            "mask": loader[0]["mask"],
+            "cls": loader[0]["cls"],
+            "id": [f"validation-{index}"],
+        }
+        for index in range(mps.ACCEPTANCE_SOAK_VALIDATION_STEPS)
+    ]
     heartbeat = tmp_path / "acceptance.jsonl"
     evidence = mps._run_mps_optimizer_probe(
         loader,
@@ -573,16 +720,20 @@ def test_no_wandb_acceptance_soak_covers_21_updates_and_168_microsteps(
         optimizer_updates=mps.ACCEPTANCE_SOAK_OPTIMIZER_STEPS,
         probe_name="acceptance",
         heartbeat_path=heartbeat,
+        validation_loader=validation_loader,
+        validation_after_updates=mps.ACCEPTANCE_FIRST_EPOCH_OPTIMIZER_STEPS,
     )
     assert evidence["status"] == "passed"
     assert evidence["wandb_started"] is False
-    assert evidence["completed_optimizer_updates"] == 21
-    assert evidence["completed_micro_steps"] == 168
-    assert len(evidence["updates"]) == 21
+    assert evidence["completed_optimizer_updates"] == 76
+    assert evidence["completed_micro_steps"] == 608
+    assert evidence["completed_validation_steps"] == 111
+    assert len(evidence["updates"]) == 76
+    assert len(evidence["validation"]) == 111
     assert all(update["distinct_microbatches"] == 8 for update in evidence["updates"])
     assert all("memory" in update for update in evidence["updates"])
-    assert len(heartbeat.read_text(encoding="utf-8").splitlines()) == 21
-    assert evidence["heartbeat_records_written"] == 21
+    assert len(heartbeat.read_text(encoding="utf-8").splitlines()) == 188
+    assert evidence["heartbeat_records_written"] == 187
     assert evidence["heartbeat_sha256"] == reproduction.sha256_file(heartbeat)
 
 
@@ -639,6 +790,7 @@ def test_mps_public_wandb_config_excludes_case_identity_values() -> None:
             "mps_cpu_fallback": False,
         },
         "resource_evidence_sha256": "resource",
+        "resource_gate_receipt_sha256": "resource-receipt",
         "mps_allocator": {
             "values": dict(reproduction.EXPECTED_MPS_ALLOCATOR_ENVIRONMENT),
             "set_before_mps_runtime_validation": True,
