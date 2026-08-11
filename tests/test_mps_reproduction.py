@@ -1,4 +1,5 @@
 import argparse
+import builtins
 import importlib.metadata
 import json
 import os
@@ -1026,10 +1027,10 @@ def test_validation_probability_dtype_preserves_cuda_and_promotes_mps_bf16(
         def flatten(self) -> "TraceTensor":
             return TraceTensor(self.dtype, self.array.flatten())
 
-        def __getitem__(self, key: object) -> "TraceTensor":
+        def __getitem__(self, key: Any) -> "TraceTensor":
             return TraceTensor(self.dtype, self.array[key])
 
-        def __gt__(self, threshold: float) -> "TraceTensor":
+        def __gt__(self, threshold: builtins.float) -> "TraceTensor":
             observed["threshold"].append((self.dtype, threshold))
             return TraceTensor("bool", self.array > threshold)
 
@@ -1039,8 +1040,8 @@ def test_validation_probability_dtype_preserves_cuda_and_promotes_mps_bf16(
         def sum(self) -> "TraceTensor":
             return TraceTensor(self.dtype, training.np.asarray(self.array.sum()))
 
-        def item(self) -> float:
-            return float(self.array.item())
+        def item(self) -> builtins.float:
+            return builtins.float(self.array.item())
 
         def numel(self) -> int:
             return int(self.array.size)
