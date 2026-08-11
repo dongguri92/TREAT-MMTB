@@ -158,6 +158,17 @@ def mps_protocol_contract() -> dict[str, Any]:
         "crop_frac": 0.15,
         "clahe_clip": 2.0,
         "seed": 42,
+        "augmentation_rng": {
+            "library": "albumentations",
+            "version": "2.0.8",
+            "geometric_compose_seed": (
+                42 + datasets.GEOMETRIC_AUGMENTATION_SEED_OFFSET
+            ),
+            "intensity_compose_seed": (
+                42 + datasets.INTENSITY_AUGMENTATION_SEED_OFFSET
+            ),
+            "continuation_state": "recursive_compose_and_child_generators",
+        },
         "checkpoint_selection": "max_0.7_accuracy_plus_0.3_dice",
         "validation_space": "native",
         "feasibility": {

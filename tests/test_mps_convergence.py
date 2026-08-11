@@ -1,4 +1,5 @@
 import argparse
+import copy
 import io
 import json
 import random
@@ -12,10 +13,12 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import datasets
 import reproduce_teammate_l05_mps_convergence as convergence
 from reproduction import sha256_file
 from training import (
     build_continuation_scheduler_state,
+    compute_lr,
     continuation_learning_rates,
     restore_continuation_rng_state,
     restore_continuation_training_state,
@@ -153,22 +156,63 @@ def test_convergence_extension_requires_all_gates_and_never_auto_launches() -> N
     assert "best" not in result["extension_semantics"]
 
 
-def test_epoch_51_loader_permutation_and_lr_match_after_restore() -> None:
-    uninterrupted_generator = torch.Generator().manual_seed(42)
+def test_epoch_51_real_augmentation_and_model_update_match_after_restore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_image = np.indices((24, 20)).sum(axis=0).astype(np.float32)
+    base_image /= base_image.max()
+    base_mask = np.zeros((24, 20), dtype=np.uint8)
+    base_mask[5:16, 7:14] = 1
+
+    def load_image(path: str) -> np.ndarray:
+        index = int(Path(path).stem)
+        return np.roll(base_image, index, axis=1).copy()
+
+    def load_synthetic_mask(path: str) -> np.ndarray:
+        index = int(Path(path).name.split(".", 1)[0])
+        return np.roll(base_mask, index, axis=0).copy()
+
+    monkeypatch.setattr(datasets, "load_dicom_normalized", load_image)
+    monkeypatch.setattr(datasets, "load_mask", load_synthetic_mask)
+
+    def make_loader() -> torch.utils.data.DataLoader:
+        dataset = datasets.CXRCavityDataset(
+            "/synthetic/dcm",
+            "/synthetic/mask",
+            ["0", "1", "2", "3"],
+            train=True,
+            target_size=16,
+            crop_frac=0.0,
+            augmentation_seed=42,
+        )
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=1,
+            shuffle=True,
+            num_workers=0,
+            persistent_workers=False,
+            generator=torch.Generator().manual_seed(42),
+        )
+
+    uninterrupted_loader = make_loader()
     for _ in range(50):
-        torch.randperm(23, generator=uninterrupted_generator)
-    loader_state = uninterrupted_generator.get_state()
-    uninterrupted_epoch_51 = torch.randperm(23, generator=uninterrupted_generator)
+        list(uninterrupted_loader)
+    assert isinstance(uninterrupted_loader.generator, torch.Generator)
+    assert isinstance(uninterrupted_loader.dataset, datasets.CXRCavityDataset)
+    loader_state = uninterrupted_loader.generator.get_state()
+    last_lr = compute_lr(49, 50, 5e-5, "cosine", 5)
     scheduler = build_continuation_scheduler_state(
-        "cosine", 5, 5e-5, 50, 50, [1e-7]
+        "cosine", 5, 5e-5, 50, 50, [last_lr]
     )
-    uninterrupted_model = torch.nn.Linear(2, 1)
+    uninterrupted_model = torch.nn.Conv2d(1, 1, 1, bias=False).double()
+    torch.nn.init.constant_(uninterrupted_model.weight, 0.25)
     uninterrupted_optimizer = torch.optim.AdamW(
         uninterrupted_model.parameters(), lr=5e-5
     )
+    epoch_50_model = copy.deepcopy(uninterrupted_model.state_dict())
     checkpoint = {
-        "model": uninterrupted_model.state_dict(),
-        "optimizer": uninterrupted_optimizer.state_dict(),
+        "model": copy.deepcopy(uninterrupted_model.state_dict()),
+        "optimizer": copy.deepcopy(uninterrupted_optimizer.state_dict()),
         "completed_epochs": 50,
         "python_rng_state": random.getstate(),
         "numpy_rng_state": np.random.get_state(),
@@ -181,26 +225,46 @@ def test_epoch_51_loader_permutation_and_lr_match_after_restore() -> None:
             "worker_rng_states": [],
             "worker_rng_policy": "single_process_no_worker_rng",
         },
+        "augmentation_rng_state": (
+            uninterrupted_loader.dataset.augmentation_rng_state()
+        ),
         "scheduler": scheduler,
     }
-    uninterrupted_augmentation_rng = (
-        random.random(),
-        float(np.random.random()),
-        torch.rand(3),
-    )
     serialized = io.BytesIO()
     torch.save(checkpoint, serialized)
+    uninterrupted_lr = continuation_learning_rates(scheduler, 50)[0]
+    for group in uninterrupted_optimizer.param_groups:
+        group["lr"] = uninterrupted_lr
+    uninterrupted_epoch_51 = list(uninterrupted_loader)
+    uninterrupted_optimizer.zero_grad(set_to_none=True)
+    uninterrupted_loss = torch.nn.functional.mse_loss(
+        uninterrupted_model(uninterrupted_epoch_51[0]["image"].double()),
+        uninterrupted_epoch_51[0]["mask"].double(),
+    )
+    uninterrupted_loss.backward()
+    uninterrupted_optimizer.step()
+
+    sampler_only_loader = make_loader()
+    assert isinstance(sampler_only_loader.generator, torch.Generator)
+    sampler_only_loader.generator.set_state(loader_state)
+    sampler_only_epoch_51 = list(sampler_only_loader)
+    assert [batch["id"][0] for batch in uninterrupted_epoch_51] == [
+        batch["id"][0] for batch in sampler_only_epoch_51
+    ]
+    assert any(
+        not torch.equal(expected["image"], sampler_only["image"])
+        for expected, sampler_only in zip(
+            uninterrupted_epoch_51, sampler_only_epoch_51
+        )
+    )
+
     serialized.seek(0)
     restored = torch.load(serialized, map_location="cpu", weights_only=False)
-    resumed_loader = SimpleNamespace(
-        generator=torch.Generator().manual_seed(999),
-        num_workers=0,
-        persistent_workers=False,
-    )
+    resumed_loader = make_loader()
     random.seed(999)
     np.random.seed(999)
     torch.manual_seed(999)
-    resumed_model = torch.nn.Linear(2, 1)
+    resumed_model = torch.nn.Conv2d(1, 1, 1, bias=False).double()
     resumed_optimizer = torch.optim.AdamW(resumed_model.parameters(), lr=999.0)
     restored_phase = restore_continuation_training_state(
         restored,
@@ -209,11 +273,23 @@ def test_epoch_51_loader_permutation_and_lr_match_after_restore() -> None:
         resumed_loader,
         torch.device("cpu"),
     )
-    resumed_epoch_51 = torch.randperm(23, generator=resumed_loader.generator)
-    assert torch.equal(uninterrupted_epoch_51, resumed_epoch_51)
-    assert random.random() == uninterrupted_augmentation_rng[0]
-    assert float(np.random.random()) == uninterrupted_augmentation_rng[1]
-    assert torch.equal(torch.rand(3), uninterrupted_augmentation_rng[2])
+    resumed_epoch_51 = list(resumed_loader)
+    assert [batch["id"][0] for batch in uninterrupted_epoch_51] == [
+        batch["id"][0] for batch in resumed_epoch_51
+    ]
+    for uninterrupted_batch, resumed_batch in zip(
+        uninterrupted_epoch_51, resumed_epoch_51
+    ):
+        assert torch.equal(uninterrupted_batch["image"], resumed_batch["image"])
+        assert torch.equal(uninterrupted_batch["mask"], resumed_batch["mask"])
+    resumed_optimizer.zero_grad(set_to_none=True)
+    resumed_loss = torch.nn.functional.mse_loss(
+        resumed_model(resumed_epoch_51[0]["image"].double()),
+        resumed_epoch_51[0]["mask"].double(),
+    )
+    resumed_loss.backward()
+    resumed_optimizer.step()
+
     uninterrupted_epoch_51_lr = continuation_learning_rates(scheduler, 50)
     assert restored_phase == {
         "next_epoch": 50,
@@ -222,7 +298,26 @@ def test_epoch_51_loader_permutation_and_lr_match_after_restore() -> None:
     assert [group["lr"] for group in resumed_optimizer.param_groups] == (
         uninterrupted_epoch_51_lr
     )
-    assert uninterrupted_epoch_51_lr == [1e-7]
+    assert uninterrupted_epoch_51_lr == [last_lr]
+    assert torch.equal(uninterrupted_loss, resumed_loss)
+    assert any(
+        not torch.equal(epoch_50_model[name], value)
+        for name, value in uninterrupted_model.state_dict().items()
+    )
+    for name, value in uninterrupted_model.state_dict().items():
+        assert torch.equal(value, resumed_model.state_dict()[name])
+    uninterrupted_optimizer_state = uninterrupted_optimizer.state_dict()
+    resumed_optimizer_state = resumed_optimizer.state_dict()
+    assert uninterrupted_optimizer_state["param_groups"] == (
+        resumed_optimizer_state["param_groups"]
+    )
+    for parameter, state in uninterrupted_optimizer_state["state"].items():
+        for name, value in state.items():
+            resumed_value = resumed_optimizer_state["state"][parameter][name]
+            if isinstance(value, torch.Tensor):
+                assert torch.equal(value, resumed_value)
+            else:
+                assert value == resumed_value
 
 
 def test_continuation_rejects_worker_rng_that_cannot_be_restored() -> None:
@@ -488,6 +583,13 @@ def _completed_base(
                 "worker_rng_states": [],
                 "worker_rng_policy": "single_process_no_worker_rng",
             },
+            "augmentation_rng_state": datasets.CXRCavityDataset(
+                "",
+                "",
+                [],
+                train=True,
+                augmentation_seed=42,
+            ).augmentation_rng_state(),
         },
         artifact_dir / convergence.CONTINUATION_CHECKPOINT,
     )
@@ -593,7 +695,7 @@ def test_completion_rejects_incomplete_continuation_and_approval_toctou(
     continuation = convergence.engine.torch.load(
         continuation_path, map_location="cpu", weights_only=False
     )
-    del continuation["train_loader_rng_state"]
+    del continuation["augmentation_rng_state"]
     convergence.engine.torch.save(continuation, continuation_path)
     base["artifacts"][convergence.CONTINUATION_CHECKPOINT] = sha256_file(  # type: ignore[index]
         continuation_path

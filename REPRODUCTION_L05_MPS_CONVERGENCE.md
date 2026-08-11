@@ -29,6 +29,11 @@ external-final access. Dry-run writes that specification once under
 bound to its exact SHA-256. A retry is a new reviewed attempt and directory.
 The convergence protocol requires `num_workers=0`; this removes unobservable
 persistent-worker RNG from the continuation boundary.
+The geometric and intensity Albumentations `Compose` pipelines use distinct
+explicit seeds (`42` and `43`). Exact continuation recursively seals and
+restores the internal Python and NumPy generators of each Compose and every
+child transform; global Python/NumPy seeds alone are not treated as
+augmentation evidence.
 
 The successful 50-epoch path preserves the base runner's signal handling:
 SIGINT/SIGTERM finish active W&B with `exit_code=1`, write an immutable
@@ -60,6 +65,12 @@ zero-worker policy, the completed 50-epoch scheduler horizon, and the exact
 cosine epoch-51-through-150 rule. Machine-readable continuation fields point
 only to `continuation_epoch_50.pth`; the independently selected best checkpoint
 remains separate and is never a continuation source.
+
+This preregistered rule preserves LR continuity, but epoch 50 is already about
+`6.09e-8`, so epochs 51–150 form a near-zero-LR cosine tail. That scientific
+choice requires separate protocol-owner approval before the 50-epoch launch.
+It must not be silently changed after epoch 50; a restart or raised LR would be
+a different experiment requiring a newly reviewed schedule and receipt.
 That continuation requires a new runner/spec/attempt/W&B ID and review receipt;
 this amendment deliberately contains no executable epoch-150 path.
 

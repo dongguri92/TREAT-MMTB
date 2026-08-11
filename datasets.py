@@ -15,13 +15,15 @@ Inputs (original data):
     <mask_dir>/<id>.nii.gz
 """
 
-import os
 import glob
+import os
 import random
+from copy import deepcopy
 from functools import partial
 from typing import Any
-import numpy as np
+
 import cv2
+import numpy as np
 import pydicom
 import SimpleITK as sitk
 import torch
@@ -31,9 +33,69 @@ try:
     import albumentations as _albumentations
     A: Any = _albumentations
     _HAS_ALBU = True
-except Exception:
+except Exception:  # noqa: BLE001
     A = None
     _HAS_ALBU = False
+
+
+GEOMETRIC_AUGMENTATION_SEED_OFFSET = 0
+INTENSITY_AUGMENTATION_SEED_OFFSET = 1
+AUGMENTATION_RNG_SCHEMA_VERSION = 1
+
+
+def _transform_identity(transform):
+    transform_type = type(transform)
+    return f"{transform_type.__module__}.{transform_type.__qualname__}"
+
+
+def _capture_transform_rng_state(transform):
+    random_generator = getattr(transform, "random_generator", None)
+    py_random = getattr(transform, "py_random", None)
+    if not isinstance(random_generator, np.random.Generator):
+        raise TypeError("Albumentations transform lacks a NumPy generator")
+    if not isinstance(py_random, random.Random):
+        raise TypeError("Albumentations transform lacks a Python generator")
+    children = list(getattr(transform, "transforms", []))
+    return {
+        "transform": _transform_identity(transform),
+        "seed": getattr(transform, "seed", None),
+        "numpy_bit_generator": type(random_generator.bit_generator).__name__,
+        "numpy_state": deepcopy(random_generator.bit_generator.state),
+        "python_state": py_random.getstate(),
+        "children": [_capture_transform_rng_state(child) for child in children],
+    }
+
+
+def _restore_transform_rng_state(transform, state):
+    if (
+        not isinstance(state, dict)
+        or set(state)
+        != {
+            "transform",
+            "seed",
+            "numpy_bit_generator",
+            "numpy_state",
+            "python_state",
+            "children",
+        }
+        or state["transform"] != _transform_identity(transform)
+        or state["seed"] != getattr(transform, "seed", None)
+    ):
+        raise ValueError("Albumentations transform RNG identity differs")
+    bit_generator_type = getattr(np.random, state["numpy_bit_generator"], None)
+    if bit_generator_type is None:
+        raise ValueError("Albumentations NumPy bit generator is unavailable")
+    random_generator = np.random.Generator(bit_generator_type())
+    random_generator.bit_generator.state = deepcopy(state["numpy_state"])
+    py_random = random.Random()
+    py_random.setstate(state["python_state"])
+    transform.set_random_state(random_generator, py_random)
+    children = list(getattr(transform, "transforms", []))
+    child_states = state["children"]
+    if not isinstance(child_states, list) or len(children) != len(child_states):
+        raise ValueError("Albumentations transform tree differs")
+    for child, child_state in zip(children, child_states):
+        _restore_transform_rng_state(child, child_state)
 
 
 def load_dicom_normalized(path):
@@ -55,7 +117,7 @@ def resize_and_pad_info(img, target_size, is_mask=False):
     h, w = img.shape[:2]
     th, tw = target_size, target_size
     scale = min(th / h, tw / w)
-    nw, nh = int(round(w * scale)), int(round(h * scale))
+    nw, nh = round(w * scale), round(h * scale)
     interp = cv2.INTER_NEAREST if is_mask else cv2.INTER_LINEAR
     resized = cv2.resize(img, (nw, nh), interpolation=interp)
     padded = np.zeros((th, tw), dtype=img.dtype)
@@ -81,7 +143,7 @@ def zscore(img):
     return (img - m) / (s + 1e-8)
 
 
-def build_geometric_aug():
+def build_geometric_aug(seed=None):
     """Spatial transforms on BOTH image and mask, on original resolution.
     Mirrors nnU-Net's spatial augmentation (rotation / scaling / elastic) plus
     mirroring. Probabilities/ranges chosen close to nnU-Net defaults."""
@@ -97,10 +159,10 @@ def build_geometric_aug():
                  mask_interpolation=cv2.INTER_NEAREST, p=0.5),
         # elastic deformation
         A.ElasticTransform(alpha=1, sigma=50, p=0.2),
-    ], additional_targets={'mask': 'mask'})
+    ], additional_targets={'mask': 'mask'}, seed=seed)
 
 
-def build_intensity_aug():
+def build_intensity_aug(seed=None):
     #Intensity transforms on IMAGE ONLY, after CLAHE.
     #Mirrors nnU-Net's intensity augmentation: gaussian noise, gaussian blur,
     #brightness (multiplicative), contrast, simulate-low-resolution, gamma.
@@ -121,7 +183,7 @@ def build_intensity_aug():
                     p=0.2),
         # gamma (both directions)
         A.RandomGamma(gamma_limit=(70, 150), p=0.3),
-    ])
+    ], seed=seed)
 
 """
 def build_intensity_aug():
@@ -150,7 +212,7 @@ LOWER_CROP_FRAC = 0.15
 def crop_lower(img, frac=LOWER_CROP_FRAC):
     """하부 frac 비율 제거. 상부 (1-frac)만 남김. img: (H, W)."""
     H = img.shape[0]
-    keep = int(round(H * (1 - frac)))
+    keep = round(H * (1 - frac))
     return img[:keep, :]
 
 TRAIN_DCM_DIR = os.environ.get(
@@ -168,16 +230,74 @@ VAL_MASK_DIR = os.environ.get(
 
 class CXRCavityDataset(Dataset):
     def __init__(self, dcm_dir, mask_dir, ids, train=True,
-                 target_size=1024, clahe_clip=2.0, crop_frac=LOWER_CROP_FRAC):
+                 target_size=1024, clahe_clip=2.0, crop_frac=LOWER_CROP_FRAC,
+                 augmentation_seed=42):
         self.dcm_dir = dcm_dir
         self.mask_dir = mask_dir
         self.ids = list(ids)
         self.train = train
         self.target_size = target_size
         self.clahe_clip = clahe_clip
-        self.geo_aug = build_geometric_aug() if train else None
-        self.int_aug = build_intensity_aug() if train else None
+        self.augmentation_seed = augmentation_seed
+        self.geo_aug = (
+            build_geometric_aug(
+                augmentation_seed + GEOMETRIC_AUGMENTATION_SEED_OFFSET
+            )
+            if train
+            else None
+        )
+        self.int_aug = (
+            build_intensity_aug(
+                augmentation_seed + INTENSITY_AUGMENTATION_SEED_OFFSET
+            )
+            if train
+            else None
+        )
         self.crop_frac = crop_frac
+
+    def augmentation_rng_state(self):
+        if self.geo_aug is None or self.int_aug is None:
+            raise RuntimeError("training augmentation pipelines are unavailable")
+        return {
+            "schema_version": AUGMENTATION_RNG_SCHEMA_VERSION,
+            "library_version": A.__version__,
+            "base_seed": self.augmentation_seed,
+            "geometric_seed": (
+                self.augmentation_seed + GEOMETRIC_AUGMENTATION_SEED_OFFSET
+            ),
+            "intensity_seed": (
+                self.augmentation_seed + INTENSITY_AUGMENTATION_SEED_OFFSET
+            ),
+            "geometric": _capture_transform_rng_state(self.geo_aug),
+            "intensity": _capture_transform_rng_state(self.int_aug),
+        }
+
+    def restore_augmentation_rng_state(self, state):
+        if (
+            not isinstance(state, dict)
+            or set(state)
+            != {
+                "schema_version",
+                "library_version",
+                "base_seed",
+                "geometric_seed",
+                "intensity_seed",
+                "geometric",
+                "intensity",
+            }
+            or state["schema_version"] != AUGMENTATION_RNG_SCHEMA_VERSION
+            or state["library_version"] != A.__version__
+            or state["base_seed"] != self.augmentation_seed
+            or state["geometric_seed"]
+            != self.augmentation_seed + GEOMETRIC_AUGMENTATION_SEED_OFFSET
+            or state["intensity_seed"]
+            != self.augmentation_seed + INTENSITY_AUGMENTATION_SEED_OFFSET
+            or self.geo_aug is None
+            or self.int_aug is None
+        ):
+            raise ValueError("training augmentation RNG contract differs")
+        _restore_transform_rng_state(self.geo_aug, state["geometric"])
+        _restore_transform_rng_state(self.int_aug, state["intensity"])
 
     def __len__(self):
         return len(self.ids)
@@ -239,7 +359,7 @@ class CXRCavityDataset(Dataset):
                 ).unsqueeze(0).long(),
                 'native_shape': torch.tensor(native_shape, dtype=torch.long),
                 'crop_shape': torch.tensor(
-                    [int(round(native_shape[0] * (1 - self.crop_frac))),
+                    [round(native_shape[0] * (1 - self.crop_frac)),
                      native_shape[1]],
                     dtype=torch.long,
                 ),
@@ -283,7 +403,8 @@ def dataloader(batch_size=3, target_size=1024, clahe_clip=2.0,
 
     train_ds = CXRCavityDataset(TRAIN_DCM_DIR, TRAIN_MASK_DIR, train_ids,
                                 train=True, target_size=target_size,
-                                clahe_clip=clahe_clip, crop_frac=crop_frac)
+                                clahe_clip=clahe_clip, crop_frac=crop_frac,
+                                augmentation_seed=seed)
     val_ds = CXRCavityDataset(VAL_DCM_DIR, VAL_MASK_DIR, val_ids,
                               train=False, target_size=target_size,
                               clahe_clip=clahe_clip, crop_frac=crop_frac)
@@ -294,13 +415,13 @@ def dataloader(batch_size=3, target_size=1024, clahe_clip=2.0,
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True, drop_last=True,
-        persistent_workers=True if num_workers > 0 else False,
+        persistent_workers=num_workers > 0,
         generator=generator,
         worker_init_fn=partial(_seed_worker, base_seed=seed))
     val_loader = torch.utils.data.DataLoader(
         val_ds, batch_size=1, shuffle=False,
         num_workers=num_workers, pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False)
+        persistent_workers=num_workers > 0)
 
     return train_loader, val_loader
 

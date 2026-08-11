@@ -22,6 +22,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import datasets
 import reproduce_teammate_l05_mps as engine
 from reproduction import canonical_sha256, sha256_file, write_json_once
 from training import continuation_learning_rates
@@ -336,6 +337,65 @@ def _slope(values: Sequence[float]) -> float:
     )
     denominator = sum((index - mean_x) ** 2 for index in range(len(values)))
     return numerator / denominator
+
+
+def _valid_augmentation_rng_node(state: Any) -> bool:
+    if (
+        not isinstance(state, dict)
+        or set(state)
+        != {
+            "transform",
+            "seed",
+            "numpy_bit_generator",
+            "numpy_state",
+            "python_state",
+            "children",
+        }
+        or not isinstance(state.get("transform"), str)
+        or not state["transform"].startswith("albumentations.")
+        or not isinstance(state.get("seed"), int)
+        or state.get("numpy_bit_generator") != "PCG64"
+        or not isinstance(state.get("numpy_state"), dict)
+        or not isinstance(state.get("python_state"), tuple)
+        or not isinstance(state.get("children"), list)
+    ):
+        return False
+    return all(_valid_augmentation_rng_node(child) for child in state["children"])
+
+
+def _valid_augmentation_rng_state(state: Any) -> bool:
+    valid_shape = (
+        isinstance(state, dict)
+        and set(state)
+        == {
+            "schema_version",
+            "library_version",
+            "base_seed",
+            "geometric_seed",
+            "intensity_seed",
+            "geometric",
+            "intensity",
+        }
+        and state.get("schema_version") == datasets.AUGMENTATION_RNG_SCHEMA_VERSION
+        and state.get("library_version") == "2.0.8"
+        and state.get("base_seed") == 42
+        and state.get("geometric_seed")
+        == 42 + datasets.GEOMETRIC_AUGMENTATION_SEED_OFFSET
+        and state.get("intensity_seed")
+        == 42 + datasets.INTENSITY_AUGMENTATION_SEED_OFFSET
+        and _valid_augmentation_rng_node(state.get("geometric"))
+        and _valid_augmentation_rng_node(state.get("intensity"))
+    )
+    if not valid_shape:
+        return False
+    try:
+        expected_dataset = datasets.CXRCavityDataset(
+            "", "", [], train=True, augmentation_seed=42
+        )
+        expected_dataset.restore_augmentation_rng_state(state)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+    return True
 
 
 def convergence_decision(
@@ -727,6 +787,7 @@ def _seal_completion(
         "torch_rng_state",
         "mps_rng_state",
         "train_loader_rng_state",
+        "augmentation_rng_state",
     }
     scheduler = (
         continuation.get("scheduler") if isinstance(continuation, dict) else None
@@ -770,6 +831,7 @@ def _seal_completion(
     ):
         raise ValueError("epoch-50 continuation state is incomplete")
     loader_rng = continuation["train_loader_rng_state"]
+    augmentation_rng = continuation["augmentation_rng_state"]
     continuation_schedule = scheduler["continuation"]
     if (
         not isinstance(loader_rng, dict)
@@ -786,6 +848,7 @@ def _seal_completion(
         or loader_rng.get("persistent_workers") is not False
         or loader_rng.get("worker_rng_states") != []
         or loader_rng.get("worker_rng_policy") != "single_process_no_worker_rng"
+        or not _valid_augmentation_rng_state(augmentation_rng)
         or not isinstance(continuation_schedule, dict)
         or set(continuation_schedule)
         != {

@@ -140,6 +140,12 @@ def restore_continuation_rng_state(continuation_state, train_loader, device):
     np.random.set_state(continuation_state['numpy_rng_state'])
     torch.set_rng_state(continuation_state['torch_rng_state'])
     generator.set_state(loader_state['generator_state'])
+    restore_augmentation_rng = getattr(
+        train_loader.dataset, 'restore_augmentation_rng_state', None
+    )
+    if not callable(restore_augmentation_rng):
+        raise TypeError('exact continuation requires augmentation RNG restore')
+    restore_augmentation_rng(continuation_state['augmentation_rng_state'])
     if device.type == 'mps':
         set_mps_rng_state = getattr(torch.mps, 'set_rng_state', None)
         if not callable(set_mps_rng_state):
@@ -504,6 +510,9 @@ def fit(model, train_loader, val_loader, device,
         if device.type == "mps" and callable(get_mps_rng_state):
             mps_rng = get_mps_rng_state()
         loader_generator = getattr(train_loader, 'generator', None)
+        capture_augmentation_rng = getattr(
+            train_loader.dataset, 'augmentation_rng_state', None
+        )
         last_learning_rates = [
             group['lr'] for group in optimizer.param_groups
         ]
@@ -512,9 +521,11 @@ def fit(model, train_loader, val_loader, device,
             and getattr(train_loader, 'num_workers', None) == 0
             and getattr(train_loader, 'persistent_workers', None) is False
             and scheduler == 'cosine'
+            and callable(capture_augmentation_rng)
         )
         if exact_loader_rng:
             assert isinstance(loader_generator, torch.Generator)
+            assert callable(capture_augmentation_rng)
             scheduler_state = build_continuation_scheduler_state(
                 scheduler,
                 warmup_epochs,
@@ -530,6 +541,7 @@ def fit(model, train_loader, val_loader, device,
                 'worker_rng_states': [],
                 'worker_rng_policy': 'single_process_no_worker_rng',
             }
+            augmentation_rng_state = capture_augmentation_rng()
         else:
             scheduler_state = {
                 'kind': scheduler,
@@ -549,6 +561,7 @@ def fit(model, train_loader, val_loader, device,
                 'worker_rng_states': None,
                 'worker_rng_policy': 'not_exact_generic_fit',
             }
+            augmentation_rng_state = None
         return {
             'best_score': best_score,
             'best_epoch': best_epoch + 1,
@@ -572,6 +585,7 @@ def fit(model, train_loader, val_loader, device,
                 'torch_rng_state': torch.get_rng_state(),
                 'mps_rng_state': mps_rng,
                 'train_loader_rng_state': loader_rng_state,
+                'augmentation_rng_state': augmentation_rng_state,
             },
         }
     return best_score, best_epoch

@@ -59,6 +59,13 @@ def test_mps_protocol_is_distinct_and_preregistered() -> None:
     assert protocol["train_micro_steps_per_epoch"] == 440
     assert protocol["train_optimizer_steps_per_epoch"] == 55
     assert protocol["lambda_cls"] == 0.5
+    assert protocol["augmentation_rng"] == {
+        "library": "albumentations",
+        "version": "2.0.8",
+        "geometric_compose_seed": 42,
+        "intensity_compose_seed": 43,
+        "continuation_state": "recursive_compose_and_child_generators",
+    }
     assert protocol["inference"]["t_veto"] == 0.005
     assert protocol["feasibility"]["automatic_512_fallback"] is False
 
