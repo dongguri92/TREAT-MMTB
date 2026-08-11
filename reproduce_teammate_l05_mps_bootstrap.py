@@ -329,7 +329,7 @@ def _validate_child_completion(
                 expected_bootstrap_proof_sha256,
                 independent_scientific_verification,
             )
-    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+    except Exception:
         return False, None, None
     return True, _sha256_file(completion_path), chain
 
@@ -387,9 +387,12 @@ def _supervise(
     supervisor_error: BaseException | None = None
 
     signal_events: list[int] = []
+    post_commit_signal_events: list[int] = []
+    completion_commit_reached = False
 
     def interrupt(signum: int, _frame: Any) -> None:
-        signal_events.append(signum)
+        target = post_commit_signal_events if completion_commit_reached else signal_events
+        target.append(signum)
 
     try:
         for signum in (signal.SIGTERM, signal.SIGINT):
@@ -596,53 +599,75 @@ def _supervise(
     index_path = supervisor_dir / "supervisor_index.json"
     watched_signals = {signal.SIGTERM, signal.SIGINT}
     old_mask = None
-    try:
-        if hasattr(signal, "pthread_sigmask"):
-            old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, watched_signals)
-        staged_receipt = _stage_json(receipt_path, receipt)
-        receipt_sha256 = _sha256_file(staged_receipt)
-        staged_index = _stage_json(
-            index_path,
-            {
-                "schema_version": 1,
-                "attempt_id": attempt_id,
-                "receipt_sha256": receipt_sha256,
-                "status": receipt["status"],
-            },
-        )
+
+    def latch_pending_signals() -> None:
         if hasattr(signal, "sigpending"):
             pending = signal.sigpending() & watched_signals
             signal_events.extend(
                 signum for signum in sorted(pending) if signum not in signal_events
             )
-        if signal_events and receipt["signals_received"] != [
+
+    def discard_publication_files() -> None:
+        for path in (
+            receipt_path,
+            index_path,
+            receipt_path.with_name(f".{receipt_path.name}.pending"),
+            index_path.with_name(f".{index_path.name}.pending"),
+        ):
+            path.unlink(missing_ok=True)
+
+    def stage_pair() -> tuple[Path, Path]:
+        staged_receipt = _stage_json(receipt_path, receipt)
+        staged_index = _stage_json(
+            index_path,
+            {
+                "schema_version": 1,
+                "attempt_id": attempt_id,
+                "receipt_sha256": _sha256_file(staged_receipt),
+                "status": receipt["status"],
+            },
+        )
+        return staged_receipt, staged_index
+
+    def convert_to_failure() -> tuple[Path, Path]:
+        discard_publication_files()
+        receipt["status"] = "failed"
+        receipt["supervisor_error_type"] = "InterruptedError"
+        receipt["signals_received"] = [
             signal.Signals(value).name for value in signal_events
-        ]:
-            staged_receipt.unlink()
-            staged_index.unlink()
-            receipt["status"] = "failed"
-            receipt["supervisor_error_type"] = "InterruptedError"
-            receipt["signals_received"] = [
-                signal.Signals(value).name for value in signal_events
-            ]
-            staged_receipt = _stage_json(receipt_path, receipt)
-            staged_index = _stage_json(
-                index_path,
-                {
-                    "schema_version": 1,
-                    "attempt_id": attempt_id,
-                    "receipt_sha256": _sha256_file(staged_receipt),
-                    "status": "failed",
-                },
-            )
+        ]
+        return stage_pair()
+
+    try:
+        staged_receipt, staged_index = stage_pair()
+        if signal_events:
+            staged_receipt, staged_index = convert_to_failure()
         _publish_staged(staged_receipt, receipt_path)
+        if receipt["status"] == "completed" and signal_events:
+            staged_receipt, staged_index = convert_to_failure()
+            _publish_staged(staged_receipt, receipt_path)
+        if receipt["status"] == "completed" and hasattr(signal, "pthread_sigmask"):
+            old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, watched_signals)
+        latch_pending_signals()
+        if receipt["status"] == "completed" and signal_events:
+            staged_receipt, staged_index = convert_to_failure()
+            _publish_staged(staged_receipt, receipt_path)
         _publish_staged(staged_index, index_path)
+        latch_pending_signals()
+        if receipt["status"] == "completed" and signal_events:
+            staged_receipt, staged_index = convert_to_failure()
+            _publish_staged(staged_receipt, receipt_path)
+            _publish_staged(staged_index, index_path)
+        elif receipt["status"] == "completed":
+            # The completed index is durable and the blocked signal set is empty.
+            # Signals observed after this assignment are post-commit notifications.
+            completion_commit_reached = True
     finally:
         if old_mask is not None:
             signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
-    if receipt["status"] != "completed":
+    if receipt["status"] != "completed" or not completion_commit_reached:
         raise RuntimeError(f"supervised {role} child failed")
     return receipt_path
 

@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 import mps_evidence
+import verify_mps_scientific_completion as scientific_verifier
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP_PATH = ROOT / "reproduce_teammate_l05_mps_bootstrap.py"
@@ -111,7 +112,9 @@ def _write_valid_gate(tmp_path: Path, attempt_id: str) -> Path:
     validation_ids = [f"{index + 1000:064x}" for index in range(111)]
     updates = []
     for index in range(1, 77):
-        identities = [train_ids[(index * 8 + offset) % 444] for offset in range(8)]
+        identities = [
+            train_ids[((index - 1) * 8 + offset) % 444] for offset in range(8)
+        ]
         updates.append({
             "phase": "first_epoch_train" if index <= 55 else "next_epoch_train",
             "optimizer_update": index,
@@ -184,8 +187,27 @@ def _write_valid_gate(tmp_path: Path, attempt_id: str) -> Path:
                 "train": train_ids, "validation": validation_ids,
             },
             "probe": {
-                "status": "passed", "completed_optimizer_updates": 1,
-                "completed_micro_steps": 8, "updates": [probe_update],
+                "status": "passed",
+                "probe": "exact_8_microbatch_adamw_optimizer_update",
+                "target_size": 1024,
+                "physical_batch_size": 1,
+                "gradient_accumulation_steps": 8,
+                "effective_batch_size": 8,
+                "requested_optimizer_updates": 1,
+                "requested_micro_steps": 8,
+                "wandb_started": False,
+                "completed_optimizer_updates": 1,
+                "completed_micro_steps": 8,
+                "optimizer": {
+                    "name": "adamw",
+                    "learning_rate": 1e-5,
+                    "gradient_clip_norm": 12,
+                },
+                "loader_start_components": loader_components,
+                "loader_start_fingerprint": mps_evidence.canonical_sha256(
+                    loader_components
+                ),
+                "updates": [probe_update],
                 "cleanup": {"status": "passed", "errors": [], **memory()},
             },
             "acceptance_soak": {
@@ -268,7 +290,7 @@ def _write_valid_science(tmp_path: Path, attempt_id: str) -> Path:
     }
     expected_ids = sorted(f"case-{index}" for index in range(111))
     accuracy = 89 / 111
-    dice = 0.3
+    dice = 89 * 0.3 / 111
     weighted = 0.7 * accuracy + 0.3 * dice
     metrics = {"classification_accuracy": accuracy, "dice": dice,
                "weighted_composite": weighted, "coverage": coverage}
@@ -339,11 +361,15 @@ def _write_valid_science(tmp_path: Path, attempt_id: str) -> Path:
             "truth": int(index < 89),
             "prediction": 1,
             "correct": int(index < 89),
-            "dice": dice,
+            "dice": 0.3 if index < 89 else 0.0,
             "error_type": "true_positive" if index < 89 else "false_positive",
             "cls_probability": 0.9,
             "segmentation_max_probability": 0.9,
             "predicted_pixels_native": 10,
+            "truth_pixels_native": 10 if index < 89 else 0,
+            "intersection_pixels_native": 3 if index < 89 else 0,
+            "decision_branch": "agreement",
+            "applied_segmentation_threshold": 0.5,
         }
         for index, case_id in enumerate(expected_ids)
     ]
@@ -438,6 +464,15 @@ def _write_valid_science(tmp_path: Path, attempt_id: str) -> Path:
 
 def _independent_science(tmp_path: Path, attempt_id: str) -> dict[str, Any]:
     terminal = json.loads((tmp_path / "wandb_terminal.json").read_text())
+    score = json.loads((tmp_path / "score.json").read_text())
+    metadata = {
+        "native_epoch": score["selected_epoch"] - 1,
+        "selected_epoch": score["selected_epoch"],
+        "native_best_metric": score["metrics"]["weighted_composite"],
+        "selected_weighted_composite": score["metrics"]["weighted_composite"],
+        "model_keys": ["weight"],
+        "optimizer_keys": ["param_groups"],
+    }
     return {
         "attempt_id": attempt_id,
         "checkpoint_sha256": bootstrap._sha256_file(
@@ -449,6 +484,8 @@ def _independent_science(tmp_path: Path, attempt_id: str) -> dict[str, Any]:
         "wandb_url": terminal["url"],
         "wandb_config_sha256": terminal["config_sha256"],
         "wandb_summary_sha256": terminal["summary_sha256"],
+        "checkpoint_metadata": metadata,
+        "checkpoint_metadata_sha256": mps_evidence.canonical_sha256(metadata),
     }
 
 
@@ -788,6 +825,28 @@ def test_gate_rejects_invalid_feasibility_semantics_after_rehash(
     ) == (False, None, None)
 
 
+def test_gate_rejects_minimal_feasibility_summary_after_rehash(
+    tmp_path: Path,
+) -> None:
+    path = _write_valid_gate(tmp_path, "sealed-attempt")
+    resource_path = tmp_path / "resource_evidence.json"
+    resource = json.loads(resource_path.read_text())
+    resource["probe"] = {
+        "status": "passed",
+        "completed_optimizer_updates": 1,
+        "completed_micro_steps": 8,
+        "updates": resource["probe"]["updates"],
+        "cleanup": resource["probe"]["cleanup"],
+    }
+    _write_json(resource_path, resource)
+    index = json.loads(path.read_text())
+    index["resource_evidence_sha256"] = bootstrap._sha256_file(resource_path)
+    _write_json(path, index)
+    assert bootstrap._validate_child_completion(
+        path, "resource_gate", "sealed-attempt", 0, 0.1
+    ) == (False, None, None)
+
+
 def test_gate_rejects_loader_fingerprint_redefinition_after_rehash(
     tmp_path: Path,
 ) -> None:
@@ -837,6 +896,86 @@ def test_science_rejects_rehashed_raw_case_forgery(tmp_path: Path) -> None:
     assert bootstrap._validate_child_completion(
         path, "scientific_run", "sealed-attempt", 0, 0.1
     ) == (False, None, None)
+
+
+def test_science_rejects_impossible_prediction_pixel_semantics(
+    tmp_path: Path,
+) -> None:
+    path = _write_valid_science(tmp_path, "sealed-attempt")
+    cases_path = tmp_path / "best_epoch_cases.json"
+    payload = json.loads(cases_path.read_text())
+    first = payload["cases"][0]
+    first["prediction"] = 0
+    first["correct"] = 0
+    first["error_type"] = "false_negative"
+    compensating = payload["cases"][89]
+    compensating["prediction"] = 0
+    compensating["correct"] = 1
+    compensating["error_type"] = "true_negative"
+    _write_json(cases_path, payload)
+    regression_path = tmp_path / "regression.json"
+    regression = json.loads(regression_path.read_text())
+    regression["cases"][0].update({
+        "candidate_correct": False,
+        "baseline_correct": True,
+        "taxonomy": "regressed",
+    })
+    regression["cases"][89].update({
+        "candidate_correct": True,
+        "baseline_correct": False,
+        "taxonomy": "fixed",
+    })
+    regression["taxonomy_counts"] = {
+        "fixed": 1,
+        "regressed": 1,
+        "unchanged_correct": 88,
+        "unchanged_error": 21,
+    }
+    _write_json(regression_path, regression)
+    index = json.loads(path.read_text())
+    index["artifacts"]["best_epoch_cases.json"] = bootstrap._sha256_file(
+        cases_path
+    )
+    index["artifacts"]["regression.json"] = bootstrap._sha256_file(
+        regression_path
+    )
+    _write_json(path, index)
+    with pytest.raises(ValueError, match="native case semantics"):
+        mps_evidence.validate_scientific_artifacts(
+            tmp_path,
+            "sealed-attempt",
+            independent_verification=_independent_science(
+                tmp_path, "sealed-attempt"
+            ),
+        )
+    assert bootstrap._validate_child_completion(
+        path,
+        "scientific_run",
+        "sealed-attempt",
+        0,
+        0.1,
+        independent_scientific_verification=_independent_science(
+            tmp_path, "sealed-attempt"
+        ),
+    ) == (False, None, None)
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        {"epoch": 1, "best_metric": 0.8, "model": {"w": 1},
+         "optimizer": {"state": 1}},
+        {"epoch": 2, "best_metric": 0.8, "model": {},
+         "optimizer": {"state": 1}},
+        {"epoch": 2, "best_metric": 0.8, "model": {"w": 1},
+         "optimizer": {}},
+    ],
+)
+def test_checkpoint_metadata_rejects_mismatch_and_empty_mappings(
+    checkpoint: dict[str, Any],
+) -> None:
+    with pytest.raises(ValueError):
+        scientific_verifier._checkpoint_metadata(checkpoint, 3, 0.8)
 
 
 def test_science_rejects_wrong_published_coverage_after_rehash(
@@ -928,6 +1067,25 @@ def test_supervisor_requires_exact_scientific_progress_sequence(tmp_path: Path) 
     ) == (False, None, None)
 
 
+def test_supervisor_rejects_truncated_scientific_progress_without_escaping(
+    tmp_path: Path,
+) -> None:
+    path = _write_valid_science(tmp_path, "sealed-attempt")
+    progress = tmp_path / "truncated-progress.jsonl"
+    progress.write_text("{}\n", encoding="utf-8")
+    assert bootstrap._validate_child_completion(
+        path,
+        "scientific_run",
+        "sealed-attempt",
+        0,
+        0.1,
+        progress,
+        independent_scientific_verification=_independent_science(
+            tmp_path, "sealed-attempt"
+        ),
+    ) == (False, None, None)
+
+
 def test_supervisor_seals_setup_failure_after_attempt_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -972,3 +1130,58 @@ def test_signal_during_receipt_staging_never_completes(
     ).read_text())
     assert receipt["status"] == "failed"
     assert receipt["signals_received"] == ["SIGTERM"]
+
+
+@pytest.mark.parametrize("signal_destination", ["supervisor_receipt.json",
+                                                   "supervisor_index.json"])
+def test_signal_in_success_publication_window_rolls_back_to_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    signal_destination: str,
+) -> None:
+    class Child:
+        pid = 12345
+        returncode = 0
+
+        def poll(self) -> int:
+            return 0
+
+    monkeypatch.setattr(bootstrap.subprocess, "Popen", lambda *_a, **_k: Child())
+    monkeypatch.setattr(bootstrap, "_load_contract", lambda: {
+        "memory": {"minimum_headroom_ratio": 0.1},
+        "watchdog": {"progress_timeout_seconds": 1},
+    })
+    monkeypatch.setattr(
+        bootstrap, "_sealed_environment",
+        lambda *_args: ({}, {"schema_version": 1}),
+    )
+    monkeypatch.setattr(
+        bootstrap, "_recompute_loader_start",
+        lambda _argv: {"components": [{}] * 8, "fingerprint": "a" * 64},
+    )
+    monkeypatch.setattr(
+        bootstrap, "_validate_child_completion",
+        lambda *_args, **_kwargs: (True, "b" * 64, {"verified": True}),
+    )
+    original_publish = bootstrap._publish_staged
+    delivered = False
+
+    def publish(staged: Path, destination: Path) -> None:
+        nonlocal delivered
+        original_publish(staged, destination)
+        if destination.name == signal_destination and not delivered:
+            delivered = True
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    monkeypatch.setattr(bootstrap, "_publish_staged", publish)
+    with pytest.raises(RuntimeError, match="supervised resource_gate child failed"):
+        bootstrap._supervise([], "resource_gate", tmp_path, "publish-signal")
+    supervisor = tmp_path / ".supervisor/publish-signal"
+    receipt = json.loads((supervisor / "supervisor_receipt.json").read_text())
+    index = json.loads((supervisor / "supervisor_index.json").read_text())
+    assert receipt["status"] == "failed"
+    assert receipt["signals_received"] == ["SIGTERM"]
+    assert index["status"] == "failed"
+    assert index["receipt_sha256"] == bootstrap._sha256_file(
+        supervisor / "supervisor_receipt.json"
+    )

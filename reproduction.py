@@ -437,8 +437,28 @@ def native_case_record(
     prepared = combo_veto_mask(foreground_probability, cls_probability)
     predicted = restore_native_mask(prepared, pad_info, crop_shape, native_shape)
     truth = (np.asarray(native_mask).squeeze() > 0).astype(np.uint8)
-    predicted_present = int(predicted.sum() > MIN_PIXELS)
-    truth_present = int(truth.sum() > 0)
+    predicted_pixels = int(predicted.sum())
+    truth_pixels = int(truth.sum())
+    intersection_pixels = int(np.logical_and(predicted, truth).sum())
+    predicted_present = int(predicted_pixels > MIN_PIXELS)
+    truth_present = int(truth_pixels > 0)
+    segmentation_max_probability = float(
+        np.asarray(foreground_probability).max()
+    )
+    cls_positive = float(cls_probability) >= CLS_THRESHOLD
+    seg_positive = segmentation_max_probability >= 0.5
+    if cls_positive == seg_positive:
+        decision_branch = "agreement"
+        applied_threshold: float | None = 0.5
+    elif cls_positive and segmentation_max_probability >= VETO_THRESHOLD:
+        decision_branch = "cls_positive_veto_recovery"
+        applied_threshold = VETO_THRESHOLD
+    elif cls_positive:
+        decision_branch = "cls_positive_below_veto_empty"
+        applied_threshold = None
+    else:
+        decision_branch = "cls_negative_seg_positive"
+        applied_threshold = 0.5
     dice = dice_metric(predicted, truth)
     error_type = (
         "true_positive"
@@ -457,8 +477,12 @@ def native_case_record(
         "dice": None if np.isnan(dice) else float(dice),
         "error_type": error_type,
         "cls_probability": float(cls_probability),
-        "segmentation_max_probability": float(np.asarray(foreground_probability).max()),
-        "predicted_pixels_native": int(predicted.sum()),
+        "segmentation_max_probability": segmentation_max_probability,
+        "predicted_pixels_native": predicted_pixels,
+        "truth_pixels_native": truth_pixels,
+        "intersection_pixels_native": intersection_pixels,
+        "decision_branch": decision_branch,
+        "applied_segmentation_threshold": applied_threshold,
     }
 
 

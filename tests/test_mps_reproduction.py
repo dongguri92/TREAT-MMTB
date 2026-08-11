@@ -403,7 +403,10 @@ def test_execute_routes_failed_probe_to_resource_only_without_wandb(
     monkeypatch.setattr(
         mps,
         "_validate_bootstrap_proof",
-        lambda _role: {"proof_sha256": "bootstrap"},
+        lambda _role: {
+            "proof_sha256": "bootstrap",
+            "loader_start": {"fingerprint": "a" * 64},
+        },
     )
     monkeypatch.setattr(mps, "sha256_file", lambda _path: "sealed-hash")
     monkeypatch.setattr(
@@ -763,6 +766,33 @@ def test_no_wandb_acceptance_soak_covers_full_lifecycle(
     assert len(heartbeat.read_text(encoding="utf-8").splitlines()) == 188
     assert evidence["heartbeat_records_written"] == 188
     assert evidence["heartbeat_sha256"] == reproduction.sha256_file(heartbeat)
+
+
+def test_first_group_fingerprint_materializes_each_batch_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loader = _mock_successful_optimizer_probe(monkeypatch)
+    calls: list[str] = []
+
+    def component(batch: dict[str, object]) -> dict[str, object]:
+        case_id = str(batch["id"][0])  # type: ignore[index]
+        calls.append(case_id)
+        return {"case": case_id}
+
+    expected_components = [{"case": f"case-{index}"} for index in range(8)]
+    monkeypatch.setattr(mps, "_batch_fingerprint_component", component)
+    evidence = mps._run_mps_optimizer_probe(
+        loader,
+        mps.torch.device("mps"),
+        tmp_path / "pretrained.pt",
+        optimizer_updates=1,
+        probe_name="single-pass-fingerprint",
+        expected_start_fingerprint=reproduction.canonical_sha256(
+            expected_components
+        ),
+    )
+    assert calls == [f"case-{index}" for index in range(8)]
+    assert evidence["loader_start_components"] == expected_components
 
 
 def test_optimizer_path_failure_is_sealed_before_wandb(

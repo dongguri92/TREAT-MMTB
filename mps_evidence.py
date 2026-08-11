@@ -15,6 +15,14 @@ TOTAL_UPDATES = FIRST_EPOCH_UPDATES + NEXT_EPOCH_UPDATES
 GRADIENT_ACCUMULATION_STEPS = 8
 TOTAL_MICROSTEPS = TOTAL_UPDATES * GRADIENT_ACCUMULATION_STEPS
 VALIDATION_STEPS = 111
+TARGET_SIZE = 1024
+PHYSICAL_BATCH_SIZE = 1
+EFFECTIVE_BATCH_SIZE = 8
+FEASIBILITY_PROBE = "exact_8_microbatch_adamw_optimizer_update"
+FEASIBILITY_LEARNING_RATE = 1e-5
+CLS_THRESHOLD = 0.5
+VETO_THRESHOLD = 0.005
+MIN_PIXELS = 0
 HEARTBEAT_ROWS = TOTAL_UPDATES + VALIDATION_STEPS + 1
 VALIDATION_OPERATION_EVENTS = [
     "device_transfers",
@@ -218,16 +226,49 @@ def _validate_raw_gate_rows(
     if not isinstance(probe, dict):
         raise TypeError("feasibility probe evidence is missing")
     probe_updates = probe.get("updates")
+    probe_optimizer = probe.get("optimizer")
+    sealed_loader_start = bootstrap.get("loader_start")
+    probe_loader_components = probe.get("loader_start_components")
     if (
         probe.get("status") != "passed"
+        or probe.get("probe") != FEASIBILITY_PROBE
+        or probe.get("target_size") != TARGET_SIZE
+        or probe.get("physical_batch_size") != PHYSICAL_BATCH_SIZE
+        or probe.get("gradient_accumulation_steps")
+        != GRADIENT_ACCUMULATION_STEPS
+        or probe.get("effective_batch_size") != EFFECTIVE_BATCH_SIZE
+        or probe.get("requested_optimizer_updates") != 1
+        or probe.get("requested_micro_steps") != GRADIENT_ACCUMULATION_STEPS
+        or probe.get("wandb_started") is not False
         or probe.get("completed_optimizer_updates") != 1
         or probe.get("completed_micro_steps") != GRADIENT_ACCUMULATION_STEPS
         or not isinstance(probe_updates, list)
         or len(probe_updates) != 1
+        or not isinstance(probe_optimizer, dict)
+        or probe_optimizer.get("name") != "adamw"
+        or not _same_number(
+            probe_optimizer.get("learning_rate"), FEASIBILITY_LEARNING_RATE
+        )
+        or probe_optimizer.get("gradient_clip_norm") != 12
+        or not isinstance(probe_loader_components, list)
+        or len(probe_loader_components) != GRADIENT_ACCUMULATION_STEPS
+        or probe.get("loader_start_fingerprint")
+        != canonical_sha256(probe_loader_components)
+        or not isinstance(sealed_loader_start, dict)
+        or sealed_loader_start.get("components") != probe_loader_components
+        or sealed_loader_start.get("fingerprint")
+        != probe.get("loader_start_fingerprint")
         or probe.get("cleanup", {}).get("status") != "passed"
     ):
         raise ValueError("feasibility probe differs from exact contract")
-    validate_update(probe_updates[0])
+    probe_identities = validate_update(probe_updates[0])
+    if [
+        case_id
+        for component in probe_loader_components
+        for case_id in component.get("case_sha256_ordered", [])
+        if isinstance(component, dict)
+    ] != probe_identities:
+        raise ValueError("feasibility update differs from sealed loader start")
     probe_cleanup = probe.get("cleanup")
     if not isinstance(probe_cleanup, dict):
         raise TypeError("feasibility cleanup evidence is incomplete")
@@ -279,7 +320,6 @@ def _validate_raw_gate_rows(
     ):
         raise ValueError("validation identity digest does not recompute")
     loader_components = soak.get("loader_start_components")
-    sealed_loader_start = bootstrap.get("loader_start")
     if (
         not isinstance(loader_components, list)
         or len(loader_components) != GRADIENT_ACCUMULATION_STEPS
@@ -308,6 +348,12 @@ def _validate_raw_gate_rows(
             if not isinstance(tensor, dict) or not isinstance(tensor.get("shape"), list):
                 raise TypeError("loader tensor component is incomplete")
             _require_sha256(tensor.get("sha256"), "loader tensor")
+    if [
+        case_id
+        for component in loader_components
+        for case_id in component["case_sha256_ordered"]
+    ] != updates[0].get("microbatch_case_sha256_ordered"):
+        raise ValueError("soak first update differs from sealed loader start")
     recomputed = min(headrooms)
     if recomputed < minimum or abs(
         float(soak.get("minimum_headroom_ratio", -1)) - recomputed
@@ -601,9 +647,54 @@ def validate_scientific_artifacts(
         cls_probability = row.get("cls_probability")
         segmentation_probability = row.get("segmentation_max_probability")
         pixels = row.get("predicted_pixels_native")
+        truth_pixels = row.get("truth_pixels_native")
+        intersection_pixels = row.get("intersection_pixels_native")
+        branch = row.get("decision_branch")
+        threshold = row.get("applied_segmentation_threshold")
+        expected_prediction = (
+            int(pixels > MIN_PIXELS) if isinstance(pixels, int) else None
+        )
+        expected_truth = (
+            int(truth_pixels > 0) if isinstance(truth_pixels, int) else None
+        )
+        denominator = (
+            pixels + truth_pixels
+            if isinstance(pixels, int) and isinstance(truth_pixels, int)
+            else -1
+        )
+        expected_dice = (
+            None
+            if denominator == 0
+            else 2 * intersection_pixels / denominator
+            if denominator > 0 and isinstance(intersection_pixels, int)
+            else math.nan
+        )
+        if isinstance(cls_probability, (int, float)) and isinstance(
+            segmentation_probability, (int, float)
+        ):
+            cls_positive = float(cls_probability) >= CLS_THRESHOLD
+            seg_positive = float(segmentation_probability) >= 0.5
+            if cls_positive == seg_positive:
+                expected_branch, expected_threshold = "agreement", 0.5
+            elif cls_positive and float(segmentation_probability) >= VETO_THRESHOLD:
+                expected_branch, expected_threshold = (
+                    "cls_positive_veto_recovery", VETO_THRESHOLD
+                )
+            elif cls_positive:
+                expected_branch, expected_threshold = (
+                    "cls_positive_below_veto_empty", None
+                )
+            else:
+                expected_branch, expected_threshold = (
+                    "cls_negative_seg_positive", 0.5
+                )
+        else:
+            expected_branch, expected_threshold = None, None
         if (
             truth not in (0, 1)
             or prediction not in (0, 1)
+            or prediction != expected_prediction
+            or truth != expected_truth
             or correct_value != int(truth == prediction)
             or row.get("error_type") != error_types[(truth, prediction)]
             or (
@@ -620,6 +711,25 @@ def validate_scientific_artifacts(
             or not 0 <= float(segmentation_probability) <= 1
             or not isinstance(pixels, int)
             or pixels < 0
+            or not isinstance(truth_pixels, int)
+            or truth_pixels < 0
+            or not isinstance(intersection_pixels, int)
+            or intersection_pixels < 0
+            or intersection_pixels > min(pixels, truth_pixels)
+            or branch != expected_branch
+            or threshold != expected_threshold
+            or (
+                branch == "cls_positive_below_veto_empty"
+                and pixels != 0
+            )
+            or (
+                expected_dice is None
+                and case_dice is not None
+            )
+            or (
+                expected_dice is not None
+                and not _same_number(case_dice, expected_dice)
+            )
         ):
             raise ValueError("scientific native case semantics are invalid")
     for number, epoch in enumerate(epochs, start=1):
@@ -768,6 +878,27 @@ def validate_scientific_artifacts(
         != wandb_terminal.get("summary_sha256")
     ):
         raise ValueError("independent checkpoint/W&B verification is missing")
+    checkpoint_metadata = independent_verification.get("checkpoint_metadata")
+    if (
+        not isinstance(checkpoint_metadata, dict)
+        or checkpoint_metadata.get("native_epoch") != selected_epoch - 1
+        or checkpoint_metadata.get("selected_epoch") != selected_epoch
+        or not _same_number(
+            checkpoint_metadata.get("native_best_metric"),
+            metrics.get("weighted_composite"),
+        )
+        or not _same_number(
+            checkpoint_metadata.get("selected_weighted_composite"),
+            metrics.get("weighted_composite"),
+        )
+        or not isinstance(checkpoint_metadata.get("model_keys"), list)
+        or not checkpoint_metadata["model_keys"]
+        or not isinstance(checkpoint_metadata.get("optimizer_keys"), list)
+        or not checkpoint_metadata["optimizer_keys"]
+        or independent_verification.get("checkpoint_metadata_sha256")
+        != canonical_sha256(checkpoint_metadata)
+    ):
+        raise ValueError("independent checkpoint metadata verification is invalid")
     progress_sha256 = None
     if supervisor_progress_path is not None:
         progress_sha256 = _validate_scientific_progress(

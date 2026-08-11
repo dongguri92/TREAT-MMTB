@@ -22,6 +22,39 @@ from reproduction import (
 )
 
 
+def _checkpoint_metadata(
+    checkpoint: dict[str, Any], selected_epoch: int, selected_metric: float
+) -> dict[str, Any]:
+    model = checkpoint.get("model")
+    optimizer = checkpoint.get("optimizer")
+    native_epoch = checkpoint.get("epoch")
+    native_best_metric = checkpoint.get("best_metric")
+    if not isinstance(model, dict) or not model:
+        raise ValueError("checkpoint model mapping is empty")
+    if not isinstance(optimizer, dict) or not optimizer:
+        raise ValueError("checkpoint optimizer mapping is empty")
+    if (
+        not isinstance(native_epoch, int)
+        or isinstance(native_epoch, bool)
+        or native_epoch + 1 != selected_epoch
+    ):
+        raise ValueError("checkpoint native epoch differs from selected epoch")
+    if (
+        not isinstance(native_best_metric, (int, float))
+        or isinstance(native_best_metric, bool)
+        or abs(float(native_best_metric) - float(selected_metric)) > 1e-12
+    ):
+        raise ValueError("checkpoint native best metric differs from selected metric")
+    return {
+        "native_epoch": native_epoch,
+        "selected_epoch": selected_epoch,
+        "native_best_metric": float(native_best_metric),
+        "selected_weighted_composite": float(selected_metric),
+        "model_keys": sorted(str(key) for key in model),
+        "optimizer_keys": sorted(str(key) for key in optimizer),
+    }
+
+
 def verify(
     science_dir: Path,
     attempt_id: str,
@@ -51,6 +84,11 @@ def verify(
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if not isinstance(checkpoint, dict):
         raise TypeError("checkpoint must contain a mapping")
+    checkpoint_metadata = _checkpoint_metadata(
+        checkpoint,
+        int(score["selected_epoch"]),
+        float(score["metrics"]["weighted_composite"]),
+    )
     reproduction = checkpoint.get("reproduction")
     expected_reproduction = {
         "attempt_id": attempt_id,
@@ -97,7 +135,8 @@ def verify(
         "schema_version": 1,
         "attempt_id": attempt_id,
         "checkpoint_sha256": checkpoint_receipt["checkpoint_sha256"],
-        "checkpoint_metadata_sha256": canonical_sha256(reproduction),
+        "checkpoint_metadata": checkpoint_metadata,
+        "checkpoint_metadata_sha256": canonical_sha256(checkpoint_metadata),
         "regression_sha256": sha256_file(science_dir / "regression.json"),
         "wandb_id": str(remote.id),
         "wandb_state": str(remote.state).lower(),

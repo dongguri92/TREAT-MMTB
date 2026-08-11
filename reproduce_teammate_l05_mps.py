@@ -344,7 +344,7 @@ def _batches_fingerprint(batches: list[dict[str, Any]]) -> str:
     return canonical_sha256([_batch_fingerprint_component(batch) for batch in batches])
 
 
-def _fingerprint_callbacks(expected: str) -> tuple[Any, Any]:
+def _fingerprint_callbacks(expected: str) -> tuple[list[dict[str, Any]], Any, Any]:
     components: list[dict[str, Any]] = []
 
     def observe(batch: dict[str, Any], _index: int) -> None:
@@ -356,7 +356,7 @@ def _fingerprint_callbacks(expected: str) -> tuple[Any, Any]:
         if canonical_sha256(components) != expected:
             raise ValueError("first optimizer group differs from sealed preview")
 
-    return observe, validate
+    return components, observe, validate
 
 
 def _loader_start_fingerprint(loader: Any) -> str:
@@ -591,17 +591,18 @@ def _run_mps_optimizer_probe(
             update_components: list[dict[str, Any]] = []
             fingerprint_observer = fingerprint_validator = None
             if update_index == 0 and expected_start_fingerprint is not None:
-                fingerprint_observer, fingerprint_validator = _fingerprint_callbacks(
-                    expected_start_fingerprint
-                )
+                (
+                    update_components,
+                    fingerprint_observer,
+                    fingerprint_validator,
+                ) = _fingerprint_callbacks(expected_start_fingerprint)
 
             bound_iterator = iterator
 
             def update_batches(
                 iterator_: Any = bound_iterator,
                 case_ids: list[str] = update_case_ids,
-                components: list[dict[str, Any]] = update_components,
-                observer: Any = fingerprint_observer,
+                current_update_index: int = update_index,
             ) -> Any:
                 nonlocal completed_micro_steps, stage
                 for _ in range(GRADIENT_ACCUMULATION_STEPS):
@@ -617,12 +618,13 @@ def _run_mps_optimizer_probe(
                     if len(batch_ids) != PHYSICAL_BATCH_SIZE:
                         raise ValueError("probe microbatch identity is missing")
                     case_ids.extend(batch_ids)
-                    if validation_after_updates is not None and update_index >= validation_after_updates:
+                    if (
+                        validation_after_updates is not None
+                        and current_update_index >= validation_after_updates
+                    ):
                         next_epoch_case_ids.extend(batch_ids)
                     else:
                         first_epoch_case_ids.extend(batch_ids)
-                    if observer is not None:
-                        components.append(_batch_fingerprint_component(current))
                     if tuple(current["image"].shape) != (
                         1, 1, TARGET_SIZE, TARGET_SIZE
                     ):
@@ -1326,6 +1328,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     optimizer_updates=FEASIBILITY_OPTIMIZER_STEPS,
                     probe_name="exact_8_microbatch_adamw_optimizer_update",
                     progress_callback=_supervisor_progress,
+                    expected_start_fingerprint=bootstrap["loader_start"][
+                        "fingerprint"
+                    ],
                 )
             except MPSFeasibilityFailure as error:
                 resource = _resource_evidence(
@@ -1514,9 +1519,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         if training_identity != identity or training_identity_sha256 != identity_sha256:
             raise RuntimeError("dataset identity changed after feasibility probe")
-        first_group_observer, first_group_validator = _fingerprint_callbacks(
-            loader_start_fingerprint
-        )
+        (
+            _first_group_components,
+            first_group_observer,
+            first_group_validator,
+        ) = _fingerprint_callbacks(loader_start_fingerprint)
         model = modeltype(
             "evax_seg",
             in_channels=1,
