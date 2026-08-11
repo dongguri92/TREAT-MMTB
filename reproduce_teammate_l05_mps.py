@@ -11,6 +11,7 @@ import argparse
 import gc
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -55,7 +56,13 @@ from reproduction import (
     validate_pretrained,
     write_json_once,
 )
-from training import accumulated_train_step, compute_lr, fit, make_optimizer
+from training import (
+    accumulated_train_step,
+    compute_lr,
+    fit,
+    make_optimizer,
+    validation_step,
+)
 from utils import DiceCELoss
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -238,6 +245,7 @@ def _validate_bootstrap_proof(expected_role: str) -> dict[str, Any]:
         raise RuntimeError("MPS bootstrap proof digest is invalid")
     proof = json.loads(encoded)
     contract = _load_mps_resource_contract()
+    loader_start = proof.get("loader_start")
     expected_child_argv = [
         os.environ.get("TREAT_MMTB_MPS_WORKER_PYTHON", ""),
         str(Path(__file__).resolve()),
@@ -256,6 +264,11 @@ def _validate_bootstrap_proof(expected_role: str) -> dict[str, Any]:
         or proof.get("parent_pid") != os.getppid()
         or not re.fullmatch(r"[0-9a-f]{64}", str(proof.get("nonce", "")))
         or proof.get("torch_imported_in_bootstrap") is not False
+        or not isinstance(loader_start, dict)
+        or not isinstance(loader_start.get("components"), list)
+        or len(loader_start["components"]) != GRADIENT_ACCUMULATION_STEPS
+        or loader_start.get("fingerprint")
+        != canonical_sha256(loader_start["components"])
     ):
         raise RuntimeError("MPS bootstrap proof differs from reviewed contract")
     allocator = validate_mps_allocator_environment()
@@ -410,9 +423,7 @@ def _run_mps_optimizer_probe(
     model: torch.nn.Module | None = None
     optimizer: torch.optim.Optimizer | None = None
     heartbeat_stream: Any = None
-    batch = image = mask = cls = None
-    segmentation = classification = None
-    segmentation_loss = classification_loss = loss = None
+    batch = None
     evidence: dict[str, Any] = {
         "schema_version": 1,
         "probe": probe_name,
@@ -493,11 +504,12 @@ def _run_mps_optimizer_probe(
             "gradient_clip_norm": 12,
         }
         segmentation_loss_fn = DiceCELoss(batch_dice=True)
-        classification_loss_fn = torch.nn.BCEWithLogitsLoss()
         iterator = iter(loader)
         optimizer.zero_grad(set_to_none=True)
         started = time.perf_counter()
         completed_micro_steps = 0
+        first_epoch_case_ids: list[str] = []
+        next_epoch_case_ids: list[str] = []
         for update_index in range(optimizer_updates):
             if (
                 validation_loader is not None
@@ -517,36 +529,22 @@ def _run_mps_optimizer_probe(
                         if len(validation_batch_ids) != 1:
                             raise ValueError("validation resource identity is missing")
                         validation_ids.extend(validation_batch_ids)
-                        image = batch["image"].to(device)
-                        mask = batch["mask"].to(device)
-                        cls = batch["cls"].to(device)
-                        segmentation, classification = model(image)
-                        segmentation_main = (
-                            segmentation[0]
-                            if isinstance(segmentation, (list, tuple))
-                            else segmentation
+                        validation_events: list[str] = []
+                        validation_result = validation_step(
+                            model,
+                            batch,
+                            segmentation_loss_fn,
+                            0.5,
+                            device,
+                            use_amp=False,
+                            materialize_log_loss=True,
+                            native_case_materialization=True,
+                            stage_callback=validation_events.append,
                         )
-                        segmentation_loss = segmentation_loss_fn(
-                            segmentation_main, mask
-                        )
-                        classification_loss = classification_loss_fn(
-                            classification, cls
-                        )
-                        loss = segmentation_loss + 0.5 * classification_loss
-                        if not all(
-                            bool(torch.isfinite(value).item())
-                            for value in (
-                                segmentation_loss,
-                                classification_loss,
-                                loss,
-                            )
-                        ):
+                        if not math.isfinite(float(validation_result["loss"])):
                             raise FloatingPointError(
                                 "validation resource loss is non-finite"
                             )
-                        _ = segmentation_main.argmax(1).cpu()
-                        _ = torch.softmax(segmentation_main, dim=1)[:, 1].cpu()
-                        _ = torch.sigmoid(classification).cpu()
                         memory = _memory_snapshot()
                         headroom = _validate_memory_headroom(memory)
                         minimum_headroom = min(minimum_headroom, headroom)
@@ -555,6 +553,7 @@ def _run_mps_optimizer_probe(
                             "validation_step": validation_index,
                             "finite_loss": True,
                             "case_sha256": _case_digest(validation_batch_ids[0]),
+                            "operation_events": validation_events,
                             "elapsed_seconds": time.perf_counter() - started,
                             "memory": memory,
                             "headroom_ratio": headroom,
@@ -563,9 +562,7 @@ def _run_mps_optimizer_probe(
                             list[dict[str, Any]], evidence["validation"]
                         ).append(validation_record)
                         emit(validation_record)
-                        batch = image = mask = cls = None
-                        segmentation = classification = None
-                        segmentation_loss = classification_loss = loss = None
+                        batch = None
                 if (
                     len(validation_ids) != ACCEPTANCE_SOAK_VALIDATION_STEPS
                     or len(set(validation_ids)) != ACCEPTANCE_SOAK_VALIDATION_STEPS
@@ -620,6 +617,10 @@ def _run_mps_optimizer_probe(
                     if len(batch_ids) != PHYSICAL_BATCH_SIZE:
                         raise ValueError("probe microbatch identity is missing")
                     case_ids.extend(batch_ids)
+                    if validation_after_updates is not None and update_index >= validation_after_updates:
+                        next_epoch_case_ids.extend(batch_ids)
+                    else:
+                        first_epoch_case_ids.extend(batch_ids)
                     if observer is not None:
                         components.append(_batch_fingerprint_component(current))
                     if tuple(current["image"].shape) != (
@@ -694,12 +695,38 @@ def _run_mps_optimizer_probe(
             cast(list[dict[str, Any]], evidence["updates"]).append(update_evidence)
             emit(update_evidence)
         memory_after = _memory_snapshot()
+        expected_first = (
+            validation_after_updates * GRADIENT_ACCUMULATION_STEPS
+            if validation_after_updates is not None
+            else optimizer_updates * GRADIENT_ACCUMULATION_STEPS
+        )
+        expected_next = (
+            (optimizer_updates - validation_after_updates)
+            * GRADIENT_ACCUMULATION_STEPS
+            if validation_after_updates is not None
+            else 0
+        )
+        if (
+            len(first_epoch_case_ids) != expected_first
+            or len(set(first_epoch_case_ids)) != expected_first
+            or len(next_epoch_case_ids) != expected_next
+            or len(set(next_epoch_case_ids)) != expected_next
+        ):
+            raise ValueError("soak epoch identities are not exact unique cohorts")
         evidence.update(
             {
                 "status": "passed",
                 "finite_loss": True,
                 "completed_optimizer_updates": optimizer_updates,
                 "completed_micro_steps": completed_micro_steps,
+                "first_epoch_unique_case_count": len(set(first_epoch_case_ids)),
+                "next_epoch_unique_case_count": len(set(next_epoch_case_ids)),
+                "first_epoch_identity_sha256": canonical_sha256(
+                    sorted(_case_digest(value) for value in first_epoch_case_ids)
+                ),
+                "next_epoch_identity_sha256": canonical_sha256(
+                    sorted(_case_digest(value) for value in next_epoch_case_ids)
+                ),
                 "memory_after_optimizer_path": memory_after,
                 "memory_after_headroom_ratio": _validate_memory_headroom(
                     memory_after
@@ -746,20 +773,18 @@ def _run_mps_optimizer_probe(
         if heartbeat_stream is not None:
             try:
                 heartbeat_stream.close()
-            except BaseException as cleanup_error:  # noqa: BLE001
+            except BaseException as cleanup_error:
                 cleanup_errors.append(
                     {
                         "stage": "heartbeat_close",
                         "error_type": type(cleanup_error).__name__,
                     }
                 )
-        batch = image = mask = cls = None
-        segmentation = classification = None
-        segmentation_loss = classification_loss = loss = None
+        batch = None
         if optimizer is not None:
             try:
                 optimizer.zero_grad(set_to_none=True)
-            except BaseException as cleanup_error:  # noqa: BLE001
+            except BaseException as cleanup_error:
                 cleanup_errors.append(
                     {
                         "stage": "optimizer_zero_grad",
@@ -771,7 +796,7 @@ def _run_mps_optimizer_probe(
             if callable(zero_grad):
                 try:
                     zero_grad(set_to_none=True)
-                except BaseException as cleanup_error:  # noqa: BLE001
+                except BaseException as cleanup_error:
                     cleanup_errors.append(
                         {
                             "stage": "model_zero_grad",
@@ -783,14 +808,14 @@ def _run_mps_optimizer_probe(
             del optimizer
         try:
             gc.collect()
-        except BaseException as cleanup_error:  # noqa: BLE001
+        except BaseException as cleanup_error:
             cleanup_errors.append(
                 {"stage": "gc_collect", "error_type": type(cleanup_error).__name__}
             )
         if callable(empty_cache):
             try:
                 empty_cache()
-            except BaseException as cleanup_error:  # noqa: BLE001
+            except BaseException as cleanup_error:
                 cleanup_errors.append(
                     {
                         "stage": "empty_cache",
@@ -800,16 +825,20 @@ def _run_mps_optimizer_probe(
         if callable(synchronize):
             try:
                 synchronize()
-            except BaseException as cleanup_error:  # noqa: BLE001
+            except BaseException as cleanup_error:
                 cleanup_errors.append(
                     {
                         "stage": "synchronize_cleanup",
                         "error_type": type(cleanup_error).__name__,
                     }
                 )
+        cleanup_memory = _memory_snapshot()
+        cleanup_headroom = _validate_memory_headroom(cleanup_memory)
         evidence["cleanup"] = {
             "status": "failed" if cleanup_errors else "passed",
             "errors": cleanup_errors,
+            "memory": cleanup_memory,
+            "headroom_ratio": cleanup_headroom,
         }
         if cleanup_errors and not active_error:
             evidence.update(
@@ -1003,7 +1032,13 @@ def _start_wandb(config: dict[str, Any]) -> Any:
     return run
 
 
-def _verify_wandb_terminal(attempt_id: str) -> dict[str, Any]:
+def _verify_wandb_terminal(
+    attempt_id: str,
+    config: dict[str, Any],
+    score: dict[str, Any],
+    regression: dict[str, Any],
+    checkpoint_sha256: str,
+) -> dict[str, Any]:
     """Query the authoritative W&B API after finish before sealing completion."""
     import wandb
 
@@ -1018,6 +1053,26 @@ def _verify_wandb_terminal(attempt_id: str) -> dict[str, Any]:
         time.sleep(5)
     if remote is None or str(remote.id) != attempt_id or state != "finished":
         raise RuntimeError("W&B run is not authoritatively finished")
+    remote_config = dict(remote.config)
+    expected_config = _wandb_public_config(config)
+    if remote_config != expected_config:
+        raise RuntimeError("authoritative W&B config differs from sealed config")
+    remote_summary = dict(remote.summary)
+    expected_summary = {
+        **{
+            f"best/{name}": value
+            for name, value in score["metrics"].items()
+            if name != "coverage"
+        },
+        "best/epoch": score["selected_epoch"],
+        "resource/evidence_sha256": score["resource_evidence_sha256"],
+        "regression/fixed": regression["taxonomy_counts"]["fixed"],
+        "regression/regressed": regression["taxonomy_counts"]["regressed"],
+        "regression/sha256": score["regression_sha256"],
+        "checkpoint/sha256": checkpoint_sha256,
+    }
+    if any(remote_summary.get(key) != value for key, value in expected_summary.items()):
+        raise RuntimeError("authoritative W&B summary differs from sealed evidence")
     return {
         "schema_version": 1,
         "id": str(remote.id),
@@ -1025,6 +1080,9 @@ def _verify_wandb_terminal(attempt_id: str) -> dict[str, Any]:
         "project": WANDB_PROJECT,
         "state": state,
         "url": str(remote.url),
+        "config_sha256": canonical_sha256(remote_config),
+        "summary_sha256": canonical_sha256(expected_summary),
+        "verified_summary": expected_summary,
     }
 
 
@@ -1306,6 +1364,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if preview_identity != identity or preview_identity_sha256 != identity_sha256:
                 raise RuntimeError("preview loader identity differs after feasibility")
             loader_start_fingerprint = _loader_start_fingerprint(preview_loader)
+            if (
+                loader_start_fingerprint
+                != bootstrap["loader_start"]["fingerprint"]
+            ):
+                raise RuntimeError(
+                    "loader start differs from independent canonical-input verifier"
+                )
             del preview_loader, preview_val_loader
             _cleanup_mps_boundary()
             _set_seed(protocol["seed"])
@@ -1607,10 +1672,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         wandb_run.summary["regression/regressed"] = regression["taxonomy_counts"][
             "regressed"
         ]
+        wandb_run.summary["regression/sha256"] = score["regression_sha256"]
+        wandb_run.summary["checkpoint/sha256"] = checkpoint_receipt[
+            "checkpoint_sha256"
+        ]
         wandb_run.finish()
         wandb_run = None
         stage = "wandb_terminal_verification"
-        wandb_terminal = _verify_wandb_terminal(args.attempt_id)
+        wandb_terminal = _verify_wandb_terminal(
+            args.attempt_id,
+            config,
+            score,
+            regression,
+            checkpoint_receipt["checkpoint_sha256"],
+        )
         if wandb_terminal["url"] != str(run_url):
             raise RuntimeError("W&B terminal URL differs from sealed run")
         write_json_once(artifact_dir / "wandb_terminal.json", wandb_terminal)
@@ -1679,7 +1754,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             try:
                 wandb_run.finish(exit_code=1)
                 finish_succeeded = True
-            except BaseException as caught_finish_error:  # noqa: BLE001
+            except BaseException as caught_finish_error:
                 finish_succeeded = False
                 finish_error = caught_finish_error
         _safe_failure(

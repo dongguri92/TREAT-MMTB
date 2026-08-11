@@ -14,6 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import mps_evidence
 import reproduce_teammate_l05_mps as mps
 import reproduction
 import training
@@ -107,6 +108,12 @@ def test_worker_bootstrap_proof_binds_launcher_and_exact_child_command(
         "parent_pid": os.getppid(),
         "nonce": "a" * 64,
         "torch_imported_in_bootstrap": False,
+        "loader_start": {
+            "components": [{} for _ in range(mps.GRADIENT_ACCUMULATION_STEPS)],
+            "fingerprint": reproduction.canonical_sha256(
+                [{} for _ in range(mps.GRADIENT_ACCUMULATION_STEPS)]
+            ),
+        },
     }
     encoded = json.dumps(proof, sort_keys=True, separators=(",", ":"))
     monkeypatch.setenv("TREAT_MMTB_MPS_BOOTSTRAP_PROOF", encoded)
@@ -695,6 +702,14 @@ def _mock_successful_optimizer_probe(
     )
     monkeypatch.setattr(mps.torch, "softmax", lambda value, **_kwargs: value)
     monkeypatch.setattr(mps.torch, "sigmoid", lambda value: value)
+    def fake_validation_step(
+        *_args: object, stage_callback: Callable[[str], None], **_kwargs: object
+    ) -> dict[str, object]:
+        for event in mps_evidence.VALIDATION_OPERATION_EVENTS:
+            stage_callback(event)
+        return {"loss": 1.0}
+
+    monkeypatch.setattr(mps, "validation_step", fake_validation_step)
     return [
         {
             "image": Tensor(),
@@ -737,6 +752,12 @@ def test_no_wandb_acceptance_soak_covers_full_lifecycle(
     assert evidence["completed_validation_steps"] == 111
     assert len(evidence["updates"]) == 76
     assert len(evidence["validation"]) == 111
+    assert all(
+        row["operation_events"] == mps_evidence.VALIDATION_OPERATION_EVENTS
+        for row in evidence["validation"]
+    )
+    assert evidence["first_epoch_unique_case_count"] == 440
+    assert evidence["next_epoch_unique_case_count"] == 168
     assert all(update["distinct_microbatches"] == 8 for update in evidence["updates"])
     assert all("memory" in update for update in evidence["updates"])
     assert len(heartbeat.read_text(encoding="utf-8").splitlines()) == 188

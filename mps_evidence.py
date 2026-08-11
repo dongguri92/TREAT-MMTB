@@ -16,6 +16,16 @@ GRADIENT_ACCUMULATION_STEPS = 8
 TOTAL_MICROSTEPS = TOTAL_UPDATES * GRADIENT_ACCUMULATION_STEPS
 VALIDATION_STEPS = 111
 HEARTBEAT_ROWS = TOTAL_UPDATES + VALIDATION_STEPS + 1
+VALIDATION_OPERATION_EVENTS = [
+    "device_transfers",
+    "forward",
+    "loss_item",
+    "log_loss_item",
+    "prepared_masks_cpu",
+    "classification_sum_item",
+    "probabilities_cpu",
+    "native_metadata_cpu",
+]
 SCIENCE_ARTIFACTS = {
     "config.json", "source.json", "case_identity.json", "bootstrap_proof.json",
     "dependency.lock",
@@ -179,28 +189,10 @@ def _validate_raw_gate_rows(
     if rows[-NEXT_EPOCH_UPDATES:] != updates[-NEXT_EPOCH_UPDATES:]:
         raise ValueError("next-epoch heartbeat does not bind raw updates")
     headrooms: list[float] = []
-    probe = resource.get("probe")
-    if not isinstance(probe, dict):
-        raise TypeError("feasibility probe evidence is missing")
-    probe_updates = probe.get("updates")
-    if (
-        probe.get("status") != "passed"
-        or probe.get("completed_optimizer_updates") != 1
-        or probe.get("completed_micro_steps") != GRADIENT_ACCUMULATION_STEPS
-        or not isinstance(probe_updates, list)
-        or len(probe_updates) != 1
-        or probe.get("cleanup", {}).get("status") != "passed"
-    ):
-        raise ValueError("feasibility probe differs from exact contract")
-    for memory_key, ratio_key in (
-        ("memory_before", "memory_before_headroom_ratio"),
-        ("memory_after_optimizer_path", "memory_after_headroom_ratio"),
-    ):
-        headrooms.append(_headroom({
-            "memory": soak.get(memory_key),
-            "headroom_ratio": soak.get(ratio_key),
-        }))
-    for update in updates:
+
+    def validate_update(update: Any) -> list[str]:
+        if not isinstance(update, dict):
+            raise TypeError("optimizer update proof is incomplete")
         critical = update.get("critical_memory")
         identities = update.get("microbatch_case_sha256_ordered")
         if (
@@ -220,9 +212,63 @@ def _validate_raw_gate_rows(
         ):
             raise ValueError("optimizer proof is incomplete")
         headrooms.extend((_headroom(critical), _headroom(update)))
+        return identities
+
+    probe = resource.get("probe")
+    if not isinstance(probe, dict):
+        raise TypeError("feasibility probe evidence is missing")
+    probe_updates = probe.get("updates")
+    if (
+        probe.get("status") != "passed"
+        or probe.get("completed_optimizer_updates") != 1
+        or probe.get("completed_micro_steps") != GRADIENT_ACCUMULATION_STEPS
+        or not isinstance(probe_updates, list)
+        or len(probe_updates) != 1
+        or probe.get("cleanup", {}).get("status") != "passed"
+    ):
+        raise ValueError("feasibility probe differs from exact contract")
+    validate_update(probe_updates[0])
+    probe_cleanup = probe.get("cleanup")
+    if not isinstance(probe_cleanup, dict):
+        raise TypeError("feasibility cleanup evidence is incomplete")
+    headrooms.append(_headroom(probe_cleanup))
+    for memory_key, ratio_key in (
+        ("memory_before", "memory_before_headroom_ratio"),
+        ("memory_after_optimizer_path", "memory_after_headroom_ratio"),
+    ):
+        headrooms.append(_headroom({
+            "memory": soak.get(memory_key),
+            "headroom_ratio": soak.get(ratio_key),
+        }))
+    first_epoch_ids: list[str] = []
+    next_epoch_ids: list[str] = []
+    for update_index, update in enumerate(updates):
+        identities = validate_update(update)
+        target = (
+            first_epoch_ids
+            if update_index < FIRST_EPOCH_UPDATES
+            else next_epoch_ids
+        )
+        target.extend(identities)
+    if (
+        len(first_epoch_ids) != 440
+        or len(set(first_epoch_ids)) != 440
+        or len(next_epoch_ids) != 168
+        or len(set(next_epoch_ids)) != 168
+        or soak.get("first_epoch_unique_case_count") != 440
+        or soak.get("next_epoch_unique_case_count") != 168
+        or soak.get("first_epoch_identity_sha256")
+        != canonical_sha256(sorted(first_epoch_ids))
+        or soak.get("next_epoch_identity_sha256")
+        != canonical_sha256(sorted(next_epoch_ids))
+    ):
+        raise ValueError("soak epoch identity coverage is invalid")
     for row in validation:
         _require_sha256(row.get("case_sha256"), "validation case")
-        if row.get("finite_loss") is not True:
+        if (
+            row.get("finite_loss") is not True
+            or row.get("operation_events") != VALIDATION_OPERATION_EVENTS
+        ):
             raise ValueError("validation resource proof is incomplete")
         headrooms.append(_headroom(row))
     observed_validation = [row["case_sha256"] for row in validation]
@@ -233,11 +279,16 @@ def _validate_raw_gate_rows(
     ):
         raise ValueError("validation identity digest does not recompute")
     loader_components = soak.get("loader_start_components")
+    sealed_loader_start = bootstrap.get("loader_start")
     if (
         not isinstance(loader_components, list)
         or len(loader_components) != GRADIENT_ACCUMULATION_STEPS
         or soak.get("loader_start_fingerprint")
         != canonical_sha256(loader_components)
+        or not isinstance(sealed_loader_start, dict)
+        or sealed_loader_start.get("components") != loader_components
+        or sealed_loader_start.get("fingerprint")
+        != soak.get("loader_start_fingerprint")
     ):
         raise ValueError("loader fingerprint does not recompute")
     for component in loader_components:
@@ -437,6 +488,7 @@ def validate_scientific_artifacts(
     attempt_id: str,
     supervisor_progress_path: Path | None = None,
     expected_bootstrap_proof_sha256: str | None = None,
+    independent_verification: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     index_path = science_dir / "artifact_index.json"
     index = _read_object(index_path)
@@ -516,6 +568,14 @@ def validate_scientific_artifacts(
     dice = sum(float(value) for value in dice_values) / len(dice_values)
     weighted = 0.7 * accuracy + 0.3 * dice
     metrics = score.get("metrics", {})
+    exact_coverage = {
+        "expected": 111,
+        "observed": 111,
+        "unique": 111,
+        "missing": [],
+        "unexpected": [],
+        "duplicates": 0,
+    }
     if not all(
         _same_number(metrics.get(name), value)
         for name, value in (
@@ -523,8 +583,45 @@ def validate_scientific_artifacts(
             ("dice", dice),
             ("weighted_composite", weighted),
         )
-    ):
+    ) or metrics.get("coverage") != exact_coverage:
         raise ValueError("scientific aggregate metrics do not recompute")
+    error_types = {
+        (1, 1): "true_positive",
+        (0, 1): "false_positive",
+        (1, 0): "false_negative",
+        (0, 0): "true_negative",
+    }
+    for row in cases:
+        if not isinstance(row, dict):
+            raise TypeError("scientific native case row is incomplete")
+        truth = row.get("truth")
+        prediction = row.get("prediction")
+        correct_value = row.get("correct")
+        case_dice = row.get("dice")
+        cls_probability = row.get("cls_probability")
+        segmentation_probability = row.get("segmentation_max_probability")
+        pixels = row.get("predicted_pixels_native")
+        if (
+            truth not in (0, 1)
+            or prediction not in (0, 1)
+            or correct_value != int(truth == prediction)
+            or row.get("error_type") != error_types[(truth, prediction)]
+            or (
+                case_dice is not None
+                and (
+                    not isinstance(case_dice, (int, float))
+                    or not math.isfinite(float(case_dice))
+                    or not 0 <= float(case_dice) <= 1
+                )
+            )
+            or not isinstance(cls_probability, (int, float))
+            or not 0 <= float(cls_probability) <= 1
+            or not isinstance(segmentation_probability, (int, float))
+            or not 0 <= float(segmentation_probability) <= 1
+            or not isinstance(pixels, int)
+            or pixels < 0
+        ):
+            raise ValueError("scientific native case semantics are invalid")
     for number, epoch in enumerate(epochs, start=1):
         if not isinstance(epoch, dict):
             raise TypeError("scientific epoch evidence is incomplete")
@@ -540,6 +637,11 @@ def validate_scientific_artifacts(
             or coverage.get("duplicates") != 0
             or coverage.get("missing") != []
             or coverage.get("unexpected") != []
+            or not _same_number(
+                epoch.get("weighted_composite"),
+                0.7 * float(epoch.get("classification_accuracy", math.nan))
+                + 0.3 * float(epoch.get("dice", math.nan)),
+            )
         ):
             raise ValueError("scientific epoch coverage is incomplete")
     selected_epoch = score.get("selected_epoch")
@@ -584,6 +686,15 @@ def validate_scientific_artifacts(
         taxonomy_counts[expected_taxonomy] += 1
     if regression.get("taxonomy_counts") != taxonomy_counts:
         raise ValueError("scientific regression counts do not recompute")
+    if (
+        regression.get("case_count") != 111
+        or regression.get("baseline_id") != "P2-B3-resolution-degradation-1e"
+        or config.get("baseline", {}).get("score_sha256")
+        != resource.get("baseline_score_sha256")
+        or config.get("baseline", {}).get("run_record_sha256")
+        != resource.get("baseline_run_record_sha256")
+    ):
+        raise ValueError("scientific regression baseline binding is invalid")
     wandb = run_record.get("wandb", {})
     if (
         run_record.get("status") != "completed"
@@ -626,10 +737,37 @@ def validate_scientific_artifacts(
         or wandb_terminal.get("project") != "treat-mmtb-task1"
         or wandb_terminal.get("state") != "finished"
         or wandb_terminal.get("url") != wandb.get("url")
+        or wandb_terminal.get("config_sha256")
+        != config.get("wandb", {}).get("config_sha256")
+        or wandb_terminal.get("verified_summary", {}).get("best/epoch")
+        != selected_epoch
+        or wandb_terminal.get("verified_summary", {}).get(
+            "resource/evidence_sha256"
+        )
+        != sha256_file(science_dir / "resource_evidence.json")
+        or wandb_terminal.get("verified_summary", {}).get("regression/sha256")
+        != sha256_file(science_dir / "regression.json")
+        or wandb_terminal.get("verified_summary", {}).get("checkpoint/sha256")
+        != checkpoint_sha256
         or run_record.get("wandb_terminal_sha256")
         != sha256_file(science_dir / "wandb_terminal.json")
     ):
         raise ValueError("scientific W&B terminal evidence is invalid")
+    if (
+        not isinstance(independent_verification, dict)
+        or independent_verification.get("attempt_id") != attempt_id
+        or independent_verification.get("checkpoint_sha256") != checkpoint_sha256
+        or independent_verification.get("regression_sha256")
+        != sha256_file(science_dir / "regression.json")
+        or independent_verification.get("wandb_id") != attempt_id
+        or independent_verification.get("wandb_state") != "finished"
+        or independent_verification.get("wandb_url") != wandb.get("url")
+        or independent_verification.get("wandb_config_sha256")
+        != wandb_terminal.get("config_sha256")
+        or independent_verification.get("wandb_summary_sha256")
+        != wandb_terminal.get("summary_sha256")
+    ):
+        raise ValueError("independent checkpoint/W&B verification is missing")
     progress_sha256 = None
     if supervisor_progress_path is not None:
         progress_sha256 = _validate_scientific_progress(

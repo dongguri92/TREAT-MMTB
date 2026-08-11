@@ -302,6 +302,74 @@ def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
     return float(np.mean(losses)), global_step
 
 
+def validation_step(model, batch, seg_loss_fn, lambda_cls, device,
+                    use_amp=True, materialize_log_loss=False,
+                    native_case_materialization=False, stage_callback=None):
+    """Execute the scientific validation tensor/host boundary for one batch."""
+    bce = torch.nn.BCEWithLogitsLoss()
+    if stage_callback is not None:
+        stage_callback('device_transfers')
+    img = batch['image'].to(device, non_blocking=True)
+    mask = batch['mask'].to(device, non_blocking=True)
+    cls = batch['cls'].to(device, non_blocking=True)
+    with autocast(device.type, enabled=use_amp) if device.type == 'cuda' else _nullctx():
+        model.return_cls = True
+        if stage_callback is not None:
+            stage_callback('forward')
+        seg_out, cls_logit = model(img)
+        seg_main = seg_out[0] if isinstance(seg_out, (list, tuple)) else seg_out
+        l_seg = seg_loss_fn(seg_main, mask)
+        l_cls = bce(cls_logit, cls)
+        loss = l_seg + lambda_cls * l_cls
+    if stage_callback is not None:
+        stage_callback('loss_item')
+    loss_value = loss.item()
+    log_loss_value = None
+    if materialize_log_loss:
+        if stage_callback is not None:
+            stage_callback('log_loss_item')
+        log_loss_value = loss.item()
+    if stage_callback is not None:
+        stage_callback('prepared_masks_cpu')
+    pred = seg_main.argmax(1).cpu().numpy()
+    gt = mask.squeeze(1).cpu().numpy()
+    dices = [dice_metric(pred[index], gt[index]) for index in range(pred.shape[0])]
+    cls_pred = (torch.sigmoid(cls_logit) > 0.5).float()
+    if stage_callback is not None:
+        stage_callback('classification_sum_item')
+    cls_correct = (cls_pred == cls).sum().item()
+    cls_total = cls.numel()
+    native_cases = []
+    if native_case_materialization:
+        from reproduction import native_case_record
+
+        required = {'id', 'native_mask', 'native_shape', 'crop_shape', 'pad_info'}
+        missing_fields = sorted(required - set(batch))
+        if missing_fields:
+            raise ValueError(f"native validation metadata missing: {missing_fields}")
+        if stage_callback is not None:
+            stage_callback('probabilities_cpu')
+        fg_prob = torch.softmax(seg_main, dim=1)[:, 1].cpu().numpy()
+        cls_prob = torch.sigmoid(cls_logit).flatten().cpu().numpy()
+        for index, case_id in enumerate(batch['id']):
+            if stage_callback is not None:
+                stage_callback('native_metadata_cpu')
+            native_cases.append(native_case_record(
+                case_id=case_id,
+                foreground_probability=fg_prob[index],
+                cls_probability=cls_prob[index],
+                native_mask=batch['native_mask'][index].cpu().numpy(),
+                pad_info=batch['pad_info'][index].cpu().numpy(),
+                crop_shape=batch['crop_shape'][index].cpu().numpy(),
+                native_shape=batch['native_shape'][index].cpu().numpy(),
+            ))
+    return {
+        'loss': loss_value, 'log_loss': log_loss_value, 'dices': dices,
+        'cls_correct': cls_correct, 'cls_total': cls_total,
+        'native_cases': native_cases,
+    }
+
+
 @torch.no_grad()
 def validate(model, loader, seg_loss_fn, lambda_cls, device, use_amp=True,
              wandb_run=None, epoch=0, native_combo_expected_ids=None,
@@ -309,63 +377,24 @@ def validate(model, loader, seg_loss_fn, lambda_cls, device, use_amp=True,
     model.eval()
     dices, cls_correct, cls_total = [], 0, 0
     native_cases = []
-    bce = torch.nn.BCEWithLogitsLoss()
     val_losses = []
     for batch_index, batch in enumerate(loader):
-        img = batch['image'].to(device, non_blocking=True)
-        mask = batch['mask'].to(device, non_blocking=True)
-        cls = batch['cls'].to(device, non_blocking=True)
-
-        with autocast(device.type, enabled=use_amp) if device.type == 'cuda' else _nullctx():
-            model.return_cls = True
-            seg_out, cls_logit = model(img)
-            seg_main = seg_out[0] if isinstance(seg_out, (list, tuple)) else seg_out
-            l_seg = seg_loss_fn(seg_main, mask)
-            l_cls = bce(cls_logit, cls)
-            loss = l_seg + lambda_cls * l_cls
-        val_losses.append(loss.item())
+        row = validation_step(
+            model, batch, seg_loss_fn, lambda_cls, device, use_amp=use_amp,
+            materialize_log_loss=wandb_run is not None,
+            native_case_materialization=native_combo_expected_ids is not None,
+        )
+        val_losses.append(row['loss'])
         if wandb_run is not None:
             wandb_run.log({
                 'validation/global_step': epoch * len(loader) + batch_index + 1,
                 'validation/epoch': epoch + 1,
-                'validation/batch_loss': loss.item(),
+                'validation/batch_loss': row['log_loss'],
             })
-
-        # per-sample dice
-        pred = seg_main.argmax(1).cpu().numpy()        # (B, H, W)
-        gt = mask.squeeze(1).cpu().numpy()
-        for b in range(pred.shape[0]):
-            d = dice_metric(pred[b], gt[b])
-            dices.append(d)
-
-        # cls accuracy
-        cls_pred = (torch.sigmoid(cls_logit) > 0.5).float()
-        cls_correct += (cls_pred == cls).sum().item()
-        cls_total += cls.numel()
-
-        if native_combo_expected_ids is not None:
-            from reproduction import native_case_record
-
-            required = {
-                'id', 'native_mask', 'native_shape', 'crop_shape', 'pad_info'
-            }
-            missing_fields = sorted(required - set(batch))
-            if missing_fields:
-                raise ValueError(
-                    f"native validation metadata missing: {missing_fields}"
-                )
-            fg_prob = torch.softmax(seg_main, dim=1)[:, 1].cpu().numpy()
-            cls_prob = torch.sigmoid(cls_logit).flatten().cpu().numpy()
-            for index, case_id in enumerate(batch['id']):
-                native_cases.append(native_case_record(
-                    case_id=case_id,
-                    foreground_probability=fg_prob[index],
-                    cls_probability=cls_prob[index],
-                    native_mask=batch['native_mask'][index].cpu().numpy(),
-                    pad_info=batch['pad_info'][index].cpu().numpy(),
-                    crop_shape=batch['crop_shape'][index].cpu().numpy(),
-                    native_shape=batch['native_shape'][index].cpu().numpy(),
-                ))
+        dices.extend(row['dices'])
+        cls_correct += row['cls_correct']
+        cls_total += row['cls_total']
+        native_cases.extend(row['native_cases'])
         if progress_callback is not None:
             progress_callback({
                 'phase': 'scientific_validation',

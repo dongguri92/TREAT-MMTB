@@ -23,10 +23,15 @@ from mps_evidence import validate_gate_artifacts, validate_scientific_artifacts
 ROOT = Path(__file__).resolve().parent
 CONTRACT_PATH = ROOT / "mps_resource_contract.json"
 WORKER_PATH = ROOT / "reproduce_teammate_l05_mps.py"
+SCIENTIFIC_VERIFIER_PATH = ROOT / "verify_mps_scientific_completion.py"
+LOADER_VERIFIER_PATH = ROOT / "verify_mps_loader_start.py"
 PROOF_ENV = "TREAT_MMTB_MPS_BOOTSTRAP_PROOF"
 PROOF_SHA_ENV = "TREAT_MMTB_MPS_BOOTSTRAP_PROOF_SHA256"
 PROGRESS_FD_ENV = "TREAT_MMTB_MPS_PROGRESS_FD"
 WORKER_PYTHON_ENV = "TREAT_MMTB_MPS_WORKER_PYTHON"
+CANONICAL_MANIFEST_SHA256 = (
+    "98484d6d96b9f6898393331d0493fa4d22ed6af0057b29210e14d32be7d5aef8"
+)
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -53,6 +58,25 @@ def _write_json_once(path: Path, value: Any) -> None:
         stream.write(encoded)
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def _stage_json(path: Path, value: Any) -> Path:
+    staged = path.with_name(f".{path.name}.pending")
+    encoded = json.dumps(value, indent=2, sort_keys=True) + "\n"
+    with staged.open("x", encoding="utf-8") as stream:
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return staged
+
+
+def _publish_staged(staged: Path, destination: Path) -> None:
+    os.replace(staged, destination)
+    directory_fd = os.open(destination.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _flag_value(argv: list[str], name: str, default: str | None = None) -> str:
@@ -103,6 +127,7 @@ def _sealed_environment(
     role: str,
     child_argv: list[str],
     soak_approval: dict[str, Any] | None = None,
+    loader_start: dict[str, Any] | None = None,
 ) -> tuple[dict[str, str], dict[str, Any]]:
     environment = dict(os.environ)
     allocator = contract["allocator"]
@@ -117,24 +142,50 @@ def _sealed_environment(
     manifest_identity = None
     if "--manifest" in child_argv:
         manifest_path = Path(_flag_value(child_argv, "--manifest")).resolve()
+        manifest_sha256 = _sha256_file(manifest_path)
+        if manifest_sha256 != CANONICAL_MANIFEST_SHA256:
+            raise RuntimeError("manifest hash differs from pinned 444/111 contract")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        identity = manifest.get("identity") if isinstance(manifest, dict) else None
+        split = manifest.get("split") if isinstance(manifest, dict) else None
+        validation_cases = (
+            manifest.get("validation_cases") if isinstance(manifest, dict) else None
+        )
         if (
-            not isinstance(identity, dict)
-            or not isinstance(identity.get("train"), list)
-            or not isinstance(identity.get("validation"), list)
-            or len(identity["train"]) != 444
-            or len(identity["validation"]) != 111
+            not isinstance(split, dict)
+            or not isinstance(validation_cases, dict)
+            or not isinstance(split.get("train"), list)
+            or not isinstance(split.get("val"), list)
+            or len(split["train"]) != 444
+            or len(split["val"]) != 111
+            or set(validation_cases) != set(split["val"])
         ):
             raise RuntimeError("manifest identity differs from exact 444/111 contract")
+        train_ids = [str(case_id) for case_id in split["train"]]
+        validation_ids: list[str] = []
+        for prepared_id in split["val"]:
+            metadata = validation_cases.get(prepared_id)
+            if not isinstance(metadata, dict) or not isinstance(
+                metadata.get("source_case_id"), str
+            ):
+                raise RuntimeError("manifest validation source identity is incomplete")
+            validation_ids.append(metadata["source_case_id"])
+        if (
+            len(set(train_ids)) != 444
+            or len(set(validation_ids)) != 111
+            or set(train_ids) & set(validation_ids)
+        ):
+            raise RuntimeError("manifest identities are not exact disjoint cohorts")
         manifest_identity = {
-            "manifest_file_sha256": _sha256_file(manifest_path),
+            "manifest_file_sha256": manifest_sha256,
             "canonical_case_sha256": {
                 split: [
                     _sha256_bytes(str(case_id).encode("utf-8"))
-                    for case_id in identity[split]
+                    for case_id in case_ids
                 ]
-                for split in ("train", "validation")
+                for split, case_ids in (
+                    ("train", sorted(train_ids)),
+                    ("validation", sorted(validation_ids)),
+                )
             },
         }
     proof = {
@@ -152,6 +203,7 @@ def _sealed_environment(
         "torch_imported_in_bootstrap": "torch" in sys.modules,
         "soak_approval": soak_approval,
         "dataset_identity": manifest_identity,
+        "loader_start": loader_start,
     }
     if proof["torch_imported_in_bootstrap"]:
         raise RuntimeError("stdlib bootstrap imported torch unexpectedly")
@@ -160,6 +212,39 @@ def _sealed_environment(
     environment[PROOF_SHA_ENV] = _sha256_bytes(encoded)
     environment[WORKER_PYTHON_ENV] = sys.executable
     return environment, proof
+
+
+def _recompute_loader_start(child_argv: list[str]) -> dict[str, Any]:
+    command = [sys.executable, str(LOADER_VERIFIER_PATH)]
+    for flag in (
+        "--manifest",
+        "--train-dcm-dir",
+        "--train-mask-dir",
+        "--val-dcm-dir",
+        "--val-mask-dir",
+    ):
+        command.extend((flag, _flag_value(child_argv, flag)))
+    result = subprocess.run(
+        command,
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    output_lines = [line for line in result.stdout.splitlines() if line.strip()]
+    if not output_lines:
+        raise ValueError("independent loader-start verifier returned no evidence")
+    payload = json.loads(output_lines[-1])
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("components"), list)
+        or len(payload["components"]) != 8
+        or payload.get("fingerprint")
+        != _sha256_bytes(_canonical_bytes(payload["components"]))
+    ):
+        raise ValueError("independent loader-start verifier returned invalid evidence")
+    return payload
 
 
 def _sample_process(pid: int, output: Path, seconds: int) -> dict[str, Any]:
@@ -223,6 +308,7 @@ def _validate_child_completion(
     minimum_headroom_ratio: float,
     supervisor_progress_path: Path | None = None,
     expected_bootstrap_proof_sha256: str | None = None,
+    independent_scientific_verification: dict[str, Any] | None = None,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
     if returncode != 0 or not completion_path.exists():
         return False, None, None
@@ -241,10 +327,43 @@ def _validate_child_completion(
                 attempt_id,
                 supervisor_progress_path,
                 expected_bootstrap_proof_sha256,
+                independent_scientific_verification,
             )
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return False, None, None
     return True, _sha256_file(completion_path), chain
+
+
+def _verify_scientific_completion_independently(
+    child_argv: list[str], artifact_root: Path, attempt_id: str
+) -> dict[str, Any]:
+    command = [
+        sys.executable,
+        str(SCIENTIFIC_VERIFIER_PATH),
+        "--science-dir",
+        str(artifact_root / attempt_id),
+        "--attempt-id",
+        attempt_id,
+        "--baseline-score",
+        _flag_value(child_argv, "--baseline-score"),
+        "--baseline-run-record",
+        _flag_value(child_argv, "--baseline-run-record"),
+    ]
+    result = subprocess.run(
+        command,
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    output_lines = [line for line in result.stdout.splitlines() if line.strip()]
+    if not output_lines:
+        raise ValueError("independent scientific verifier returned no evidence")
+    payload = json.loads(output_lines[-1])
+    if not isinstance(payload, dict):
+        raise TypeError("independent scientific verifier returned invalid evidence")
+    return payload
 
 
 def _supervise(
@@ -287,8 +406,9 @@ def _supervise(
             raise InterruptedError("supervisor interrupted before setup")
         contract = _load_contract()
         read_fd, write_fd = os.pipe()
+        loader_start = _recompute_loader_start(child_argv)
         environment, proof = _sealed_environment(
-            contract, role, child_command, soak_approval
+            contract, role, child_command, soak_approval, loader_start
         )
         environment[PROGRESS_FD_ENV] = str(write_fd)
         _write_json_once(supervisor_dir / "bootstrap_proof.json", proof)
@@ -359,20 +479,20 @@ def _supervise(
         if timed_out or supervisor_error is not None:
             try:
                 termination = _terminate_child(child, supervisor_dir, contract)
-            except BaseException as termination_error:  # noqa: BLE001
+            except BaseException as termination_error:
                 termination = {
                     "error_type": type(termination_error).__name__,
                     "returncode": child.poll(),
                 }
         elif child.poll() is None:
             child.wait()
-    except BaseException as error:  # noqa: BLE001
+    except BaseException as error:
         supervisor_error = error
         if child is not None and child.poll() is None:
             try:
                 if contract is not None:
                     termination = _terminate_child(child, supervisor_dir, contract)
-            except BaseException as termination_error:  # noqa: BLE001
+            except BaseException as termination_error:
                 termination = {
                     "error_type": type(termination_error).__name__,
                     "returncode": child.poll(),
@@ -388,7 +508,7 @@ def _supervise(
             try:
                 child.kill()
                 child.wait(timeout=30)
-            except BaseException as reap_error:  # noqa: BLE001
+            except BaseException as reap_error:
                 supervisor_error = supervisor_error or reap_error
     if not heartbeat_path.exists():
         heartbeat_path.touch(exist_ok=False)
@@ -405,6 +525,22 @@ def _supervise(
     child_completion_valid = False
     child_completion_sha256 = None
     evidence_chain = None
+    independent_scientific_verification = None
+    if (
+        role == "scientific_run"
+        and child is not None
+        and child.returncode == 0
+        and supervisor_error is None
+        and not signal_events
+    ):
+        try:
+            independent_scientific_verification = (
+                _verify_scientific_completion_independently(
+                    child_argv, artifact_root, attempt_id
+                )
+            )
+        except BaseException as error:
+            supervisor_error = error
     if contract is not None and proof is not None:
         (
             child_completion_valid,
@@ -418,6 +554,7 @@ def _supervise(
             float(contract["memory"]["minimum_headroom_ratio"]),
             heartbeat_path,
             _sha256_bytes(_canonical_bytes(proof)),
+            independent_scientific_verification,
         )
     proof_path = supervisor_dir / "bootstrap_proof.json"
     receipt = {
@@ -453,20 +590,58 @@ def _supervise(
         "child_completion_sha256": child_completion_sha256,
         "child_completion_verified_by_supervisor": child_completion_valid,
         "evidence_chain": evidence_chain,
+        "independent_scientific_verification": independent_scientific_verification,
     }
     receipt_path = supervisor_dir / "supervisor_receipt.json"
-    _write_json_once(receipt_path, receipt)
-    _write_json_once(
-        supervisor_dir / "supervisor_index.json",
-        {
-            "schema_version": 1,
-            "attempt_id": attempt_id,
-            "receipt_sha256": _sha256_file(receipt_path),
-            "status": receipt["status"],
-        },
-    )
-    for signum, handler in previous_handlers.items():
-        signal.signal(signum, handler)
+    index_path = supervisor_dir / "supervisor_index.json"
+    watched_signals = {signal.SIGTERM, signal.SIGINT}
+    old_mask = None
+    try:
+        if hasattr(signal, "pthread_sigmask"):
+            old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, watched_signals)
+        staged_receipt = _stage_json(receipt_path, receipt)
+        receipt_sha256 = _sha256_file(staged_receipt)
+        staged_index = _stage_json(
+            index_path,
+            {
+                "schema_version": 1,
+                "attempt_id": attempt_id,
+                "receipt_sha256": receipt_sha256,
+                "status": receipt["status"],
+            },
+        )
+        if hasattr(signal, "sigpending"):
+            pending = signal.sigpending() & watched_signals
+            signal_events.extend(
+                signum for signum in sorted(pending) if signum not in signal_events
+            )
+        if signal_events and receipt["signals_received"] != [
+            signal.Signals(value).name for value in signal_events
+        ]:
+            staged_receipt.unlink()
+            staged_index.unlink()
+            receipt["status"] = "failed"
+            receipt["supervisor_error_type"] = "InterruptedError"
+            receipt["signals_received"] = [
+                signal.Signals(value).name for value in signal_events
+            ]
+            staged_receipt = _stage_json(receipt_path, receipt)
+            staged_index = _stage_json(
+                index_path,
+                {
+                    "schema_version": 1,
+                    "attempt_id": attempt_id,
+                    "receipt_sha256": _sha256_file(staged_receipt),
+                    "status": "failed",
+                },
+            )
+        _publish_staged(staged_receipt, receipt_path)
+        _publish_staged(staged_index, index_path)
+    finally:
+        if old_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
     if receipt["status"] != "completed":
         raise RuntimeError(f"supervised {role} child failed")
     return receipt_path
