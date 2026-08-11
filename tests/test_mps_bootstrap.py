@@ -670,6 +670,79 @@ def test_bootstrap_rejects_internal_worker_bypass() -> None:
         bootstrap.main(["--internal-worker"])
 
 
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--attempt-id", "../escaped-attempt"),
+        ("--artifact-root", "../escaped-artifacts"),
+        ("--manifest", "inputs/external-final/manifest.json"),
+    ],
+)
+def test_bootstrap_rejects_unsafe_paths_before_supervisor_or_loader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    flag: str,
+    value: str,
+) -> None:
+    arguments = [
+        "--execute",
+        "--acceptance-soak-only",
+        "--attempt-id",
+        "safe-attempt",
+        "--artifact-root",
+        str(tmp_path / "artifacts"),
+        "--manifest",
+        str(tmp_path / "manifest.json"),
+    ]
+    arguments[arguments.index(flag) + 1] = value
+    monkeypatch.setattr(
+        bootstrap,
+        "_supervise",
+        lambda *_args, **_kwargs: pytest.fail("supervisor must not start"),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "_recompute_loader_start",
+        lambda *_args, **_kwargs: pytest.fail("loader verifier must not start"),
+    )
+    with pytest.raises(ValueError):
+        bootstrap.main(arguments)
+    assert not (tmp_path / "artifacts").exists()
+
+
+def test_supervise_rejects_protected_root_before_mkdir(tmp_path: Path) -> None:
+    protected = tmp_path / "external-final" / "artifacts"
+    with pytest.raises(ValueError, match="external final"):
+        bootstrap._supervise([], "resource_gate", protected, "safe-attempt")
+    assert not protected.exists()
+
+
+def test_bootstrap_rejects_symlink_to_protected_input_before_supervisor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    protected = tmp_path / "external-final"
+    protected.mkdir()
+    manifest = tmp_path / "manifest.json"
+    manifest.symlink_to(protected / "manifest.json")
+    monkeypatch.setattr(
+        bootstrap,
+        "_supervise",
+        lambda *_args, **_kwargs: pytest.fail("supervisor must not start"),
+    )
+    with pytest.raises(ValueError, match="external final"):
+        bootstrap.main([
+            "--execute",
+            "--acceptance-soak-only",
+            "--attempt-id",
+            "safe-attempt",
+            "--artifact-root",
+            str(tmp_path / "artifacts"),
+            "--manifest",
+            str(manifest),
+        ])
+    assert not (tmp_path / "artifacts").exists()
+
+
 def test_bootstrap_rejects_supervisor_receipt_and_duplicate_attempt_bypass() -> None:
     with pytest.raises(SystemExit, match="owns the resource gate receipt"):
         bootstrap.main(["--resource-gate-receipt", "forged.json"])

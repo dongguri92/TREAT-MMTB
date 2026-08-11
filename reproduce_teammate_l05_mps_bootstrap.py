@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import secrets
 import selectors
 import signal
@@ -32,6 +33,48 @@ WORKER_PYTHON_ENV = "TREAT_MMTB_MPS_WORKER_PYTHON"
 CANONICAL_MANIFEST_SHA256 = (
     "98484d6d96b9f6898393331d0493fa4d22ed6af0057b29210e14d32be7d5aef8"
 )
+SAFE_ATTEMPT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+PROTECTED_PATH_RE = re.compile(r"external_final|external_test|final_test|test_final")
+
+
+def _reject_unsafe_attempt(attempt_id: str) -> None:
+    if SAFE_ATTEMPT_RE.fullmatch(attempt_id) is None:
+        raise ValueError("attempt id must be a single safe path component")
+
+
+def _reject_protected_path(path: Path | str, label: str) -> None:
+    candidate = Path(path)
+    if ".." in candidate.parts:
+        raise ValueError(f"{label} must not contain path traversal")
+    normalized = [
+        "".join(ch if ch.isalnum() else "_" for ch in part.lower())
+        for part in candidate.parts
+    ]
+    if any(PROTECTED_PATH_RE.search(part) for part in normalized):
+        raise ValueError(f"{label} must not reference the external final test")
+
+
+def _validate_bootstrap_paths(
+    child_argv: list[str], artifact_root: Path, attempt_id: str
+) -> None:
+    _reject_unsafe_attempt(attempt_id)
+    _reject_protected_path(artifact_root, "artifact_root")
+    for flag in (
+        "--artifact-root",
+        "--manifest",
+        "--baseline-score",
+        "--baseline-run-record",
+        "--pretrained",
+        "--train-dcm-dir",
+        "--train-mask-dir",
+        "--val-dcm-dir",
+        "--val-mask-dir",
+    ):
+        if flag in child_argv:
+            label = flag.removeprefix("--")
+            value = Path(_flag_value(child_argv, flag))
+            _reject_protected_path(value, label)
+            _reject_protected_path(value.resolve(), label)
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -373,6 +416,7 @@ def _supervise(
     attempt_id: str,
     soak_approval: dict[str, Any] | None = None,
 ) -> Path:
+    _validate_bootstrap_paths(child_argv, artifact_root, attempt_id)
     supervisor_dir = artifact_root / ".supervisor" / attempt_id
     heartbeat_path = supervisor_dir / "progress.jsonl"
     child_command = [sys.executable, str(WORKER_PATH), *child_argv, "--internal-worker"]
@@ -714,13 +758,16 @@ def main(argv: list[str] | None = None) -> int:
             check=False,
         ).returncode
     attempt_id = _flag_value(arguments, "--attempt-id")
-    artifact_root = Path(
+    artifact_root_raw = Path(
         _flag_value(
             arguments,
             "--artifact-root",
             str(ROOT / "artifacts" / "reproduction-mps"),
         )
-    ).resolve()
+    )
+    _validate_bootstrap_paths(arguments, artifact_root_raw, attempt_id)
+    artifact_root = artifact_root_raw.resolve()
+    _reject_protected_path(artifact_root, "artifact_root")
     gate_id = f"{attempt_id}-resource-gate"
     gate_only = "--acceptance-soak-only" in arguments
     scientific = "--scientific-run" in arguments

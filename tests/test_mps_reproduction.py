@@ -597,6 +597,24 @@ def test_mps_parser_rejects_background_workers(tmp_path: Path) -> None:
         mps.parse_args(_cli(tmp_path) + ["--num-workers", "1"])
 
 
+def test_mps_parser_rejects_path_traversal_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called = False
+
+    def unexpected_resolve(_self: Path) -> Path:
+        nonlocal called
+        called = True
+        raise AssertionError("filesystem resolution must not occur")
+
+    monkeypatch.setattr(Path, "resolve", unexpected_resolve)
+    argv = _cli(tmp_path)
+    argv[argv.index("--artifact-root") + 1] = "../escaped-artifacts"
+    with pytest.raises(ValueError, match="path traversal"):
+        mps.parse_args(argv)
+    assert called is False
+
+
 def test_albumentations_compose_seeds_are_explicit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -836,6 +854,74 @@ def test_probe_cleanup_failure_fails_closed(
         )
     assert caught.value.evidence["failure_stage"] == "cleanup"
     assert caught.value.evidence["cleanup"]["status"] == "failed"
+
+
+def test_primary_probe_failure_survives_cleanup_headroom_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loader = _mock_successful_optimizer_probe(
+        monkeypatch, fail_optimizer_step=True
+    )
+    calls = 0
+
+    def memory_snapshot() -> dict[str, int]:
+        nonlocal calls
+        calls += 1
+        if calls >= 4:
+            return {
+                "current_allocated_bytes": 1,
+                "driver_allocated_bytes": 95,
+                "recommended_max_bytes": 100,
+            }
+        return _healthy_memory_snapshot()
+
+    monkeypatch.setattr(mps, "_memory_snapshot", memory_snapshot)
+    with pytest.raises(mps.MPSFeasibilityFailure) as caught:
+        mps._run_mps_optimizer_probe(
+            loader,
+            mps.torch.device("mps"),
+            tmp_path / "pretrained.pt",
+            optimizer_updates=1,
+            probe_name="primary-before-cleanup",
+        )
+    assert caught.value.evidence["failure_stage"] == "optimizer_step"
+    assert caught.value.evidence["error_type"] == "RuntimeError"
+    assert caught.value.evidence["cleanup"]["status"] == "failed"
+    assert caught.value.evidence["cleanup"]["errors"] == [
+        {"stage": "cleanup_memory_headroom", "error_type": "RuntimeError"}
+    ]
+
+
+def test_transition_heartbeat_is_counted_when_callback_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loader = _mock_successful_optimizer_probe(monkeypatch)
+    validation_loader = [
+        {
+            "image": loader[0]["image"],
+            "mask": loader[0]["mask"],
+            "cls": loader[0]["cls"],
+            "id": [f"validation-{index}"],
+        }
+        for index in range(mps.ACCEPTANCE_SOAK_VALIDATION_STEPS)
+    ]
+
+    def progress(record: dict[str, object]) -> None:
+        if record.get("phase") == "next_epoch_transition":
+            raise RuntimeError("transition callback failed")
+
+    with pytest.raises(mps.MPSFeasibilityFailure) as caught:
+        mps._run_mps_optimizer_probe(
+            loader,
+            mps.torch.device("mps"),
+            tmp_path / "pretrained.pt",
+            optimizer_updates=56,
+            probe_name="transition-count",
+            validation_loader=validation_loader,
+            validation_after_updates=55,
+            progress_callback=progress,
+        )
+    assert caught.value.evidence["heartbeat_records_written"] == 167
 
 
 def test_accumulated_step_materializes_scalars_only_after_adamw(

@@ -449,10 +449,10 @@ def _run_mps_optimizer_probe(
             )
             heartbeat_stream.flush()
             os.fsync(heartbeat_stream.fileno())
-        if progress_callback is not None:
-            progress_callback(record)
         emitted_records += 1
         evidence["heartbeat_records_written"] = emitted_records
+        if progress_callback is not None:
+            progress_callback(record)
 
     def observe_critical_memory(context: dict[str, Any] | None) -> dict[str, Any]:
         nonlocal minimum_headroom
@@ -756,8 +756,7 @@ def _run_mps_optimizer_probe(
                 "error_type": type(error).__name__,
                 "out_of_memory": "out of memory" in str(error).lower(),
                 "memory_at_failure": _memory_snapshot(),
-                "heartbeat_records_written": len(evidence["updates"])
-                + len(evidence["validation"]),
+                "heartbeat_records_written": emitted_records,
             }
         )
         if isinstance(error, RunInterrupted):
@@ -834,8 +833,18 @@ def _run_mps_optimizer_probe(
                         "error_type": type(cleanup_error).__name__,
                     }
                 )
-        cleanup_memory = _memory_snapshot()
-        cleanup_headroom = _validate_memory_headroom(cleanup_memory)
+        cleanup_memory: dict[str, Any] = {}
+        cleanup_headroom: float | None = None
+        try:
+            cleanup_memory = _memory_snapshot()
+            cleanup_headroom = _validate_memory_headroom(cleanup_memory)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(
+                {
+                    "stage": "cleanup_memory_headroom",
+                    "error_type": type(cleanup_error).__name__,
+                }
+            )
         evidence["cleanup"] = {
             "status": "failed" if cleanup_errors else "passed",
             "errors": cleanup_errors,
@@ -1244,6 +1253,29 @@ def _safe_failure(
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.attempt_id) is None:
+        raise ValueError("attempt id must be a single safe path component")
+    for name in (
+        "artifact_root",
+        "manifest",
+        "baseline_score",
+        "baseline_run_record",
+        "pretrained",
+        "train_dcm_dir",
+        "train_mask_dir",
+        "val_dcm_dir",
+        "val_mask_dir",
+    ):
+        value = Path(getattr(args, name))
+        reject_external_final_path(value, name)
+        reject_external_final_path(value.resolve(), name)
+    if args.resource_gate_receipt is not None:
+        reject_external_final_path(
+            Path(args.resource_gate_receipt), "resource_gate_receipt"
+        )
+        reject_external_final_path(
+            Path(args.resource_gate_receipt).resolve(), "resource_gate_receipt"
+        )
     artifact_dir = args.artifact_root / args.attempt_id
     if artifact_dir.exists():
         raise FileExistsError("attempt directory already exists; retries must be fresh")

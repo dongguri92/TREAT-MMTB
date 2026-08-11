@@ -141,6 +141,8 @@ def source_identity(repo_root: Path | str) -> dict[str, str]:
 
 def reject_external_final_path(path: Path | str, label: str) -> None:
     """Reject a lexically forbidden path without touching the filesystem."""
+    if ".." in Path(path).parts:
+        raise ValueError(f"{label} must not contain path traversal")
     normalized = [
         "".join(ch if ch.isalnum() else "_" for ch in part.lower())
         for part in Path(path).parts
