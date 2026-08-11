@@ -91,7 +91,7 @@ def test_convergence_rejects_plateau_nonfinite_and_incomplete_trajectory() -> No
         ]
         is False
     )
-    with pytest.raises(ValueError, match="contiguous"):
+    with pytest.raises(ValueError, match="at least five"):
         convergence.convergence_decision(
             [_epoch(1, 0.5, 1.0), _epoch(3, 0.6, 0.9)], health_gate_passed=True
         )
