@@ -103,10 +103,103 @@ def _seg_loss_on_output(seg_output, target, seg_loss_fn) -> torch.Tensor:
     return seg_loss_fn(seg_output, target)
 
 
+def accumulated_train_step(
+    model,
+    batches,
+    optimizer,
+    seg_loss_fn,
+    lambda_cls,
+    device,
+    scaler=None,
+    use_amp=True,
+    critical_memory_observer=None,
+    stage_callback=None,
+):
+    """Run one accumulated optimizer step with one reviewed operation order."""
+    accumulation = len(batches)
+    if accumulation < 1:
+        raise ValueError("accumulated step requires at least one microbatch")
+    bce = torch.nn.BCEWithLogitsLoss()
+    deferred = []
+    if stage_callback is not None:
+        stage_callback("optimizer_zero_grad_before")
+    optimizer.zero_grad(set_to_none=True)
+    for batch in batches:
+        img = batch['image'].to(device, non_blocking=True)
+        mask = batch['mask'].to(device, non_blocking=True)
+        cls = batch['cls'].to(device, non_blocking=True)
+        with autocast(device.type, enabled=use_amp) if device.type == 'cuda' else _nullctx():
+            model.return_cls = True
+            if stage_callback is not None:
+                stage_callback("forward")
+            seg_out, cls_logit = model(img)
+            if stage_callback is not None:
+                stage_callback("loss")
+            l_seg = _seg_loss_on_output(seg_out, mask, seg_loss_fn)
+            l_cls = bce(cls_logit, cls)
+            loss = l_seg + lambda_cls * l_cls
+            backward_loss = loss / accumulation
+        if scaler is not None:
+            if stage_callback is not None:
+                stage_callback("backward")
+            scaler.scale(backward_loss).backward()
+        else:
+            if stage_callback is not None:
+                stage_callback("backward")
+            backward_loss.backward()
+        deferred.append((loss.detach(), l_seg.detach(), l_cls.detach()))
+
+    if stage_callback is not None:
+        stage_callback("critical_memory")
+    critical_memory = (
+        critical_memory_observer() if critical_memory_observer is not None else None
+    )
+    if stage_callback is not None:
+        stage_callback("gradient_clip")
+    if scaler is not None:
+        scaler.unscale_(optimizer)
+    gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 12)
+    if scaler is not None:
+        if stage_callback is not None:
+            stage_callback("optimizer_step")
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        if stage_callback is not None:
+            stage_callback("optimizer_step")
+        optimizer.step()
+    if stage_callback is not None:
+        stage_callback("optimizer_zero_grad_after")
+    optimizer.zero_grad(set_to_none=True)
+
+    if stage_callback is not None:
+        stage_callback("scalar_materialization")
+    rows = [
+        {
+            'loss': float(loss.item()),
+            'segmentation_loss': float(seg.item()),
+            'classification_loss': float(cls.item()),
+        }
+        for loss, seg, cls in deferred
+    ]
+    gradient_norm_value = float(gradient_norm.item())
+    if not all(
+        math.isfinite(value)
+        for row in rows
+        for value in row.values()
+    ) or not math.isfinite(gradient_norm_value):
+        raise FloatingPointError("accumulated optimizer step produced non-finite values")
+    return {
+        'microbatches': rows,
+        'gradient_norm': gradient_norm_value,
+        'critical_memory': critical_memory,
+    }
+
+
 def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
                     device, scaler, use_amp=True, wandb_run=None,
                     epoch=0, global_step=0, gradient_accumulation_steps=1,
-                    progress_callback=None):
+                    progress_callback=None, critical_memory_observer=None):
     if gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be positive")
     usable_micro_steps = (
@@ -116,70 +209,51 @@ def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
         raise ValueError("loader cannot provide one complete effective batch")
     model.train()
     losses = []
-    bce = torch.nn.BCEWithLogitsLoss()
-    optimizer.zero_grad(set_to_none=True)
-    for batch_index, batch in enumerate(loader):
-        if batch_index >= usable_micro_steps:
-            break
-        img = batch['image'].to(device, non_blocking=True)
-        mask = batch['mask'].to(device, non_blocking=True)
-        cls = batch['cls'].to(device, non_blocking=True)
-
-        with autocast(device.type, enabled=use_amp) if device.type == 'cuda' else _nullctx():
-            model.return_cls = True
-            seg_out, cls_logit = model(img)
-            l_seg = _seg_loss_on_output(seg_out, mask, seg_loss_fn)
-            l_cls = bce(cls_logit, cls)
-            loss = l_seg + lambda_cls * l_cls
-            backward_loss = loss / gradient_accumulation_steps
-
-        if scaler is not None:
-            scaler.scale(backward_loss).backward()
-        else:
-            backward_loss.backward()
-
-        optimizer_step_completed = (
-            (batch_index + 1) % gradient_accumulation_steps == 0
+    iterator = iter(loader)
+    for group_start in range(0, usable_micro_steps, gradient_accumulation_steps):
+        batches = [next(iterator) for _ in range(gradient_accumulation_steps)]
+        step = accumulated_train_step(
+            model,
+            batches,
+            optimizer,
+            seg_loss_fn,
+            lambda_cls,
+            device,
+            scaler=scaler,
+            use_amp=use_amp,
+            critical_memory_observer=critical_memory_observer,
         )
-        if optimizer_step_completed:
-            if scaler is not None:
-                scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 12)
-            if scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            global_step += 1
-
-        losses.append(loss.item())
-        if wandb_run is not None:
-            step_log = {
-                'train/global_step': global_step,
-                'train/micro_step': epoch * usable_micro_steps + batch_index + 1,
-                'train/epoch': epoch + 1,
-                'train/batch_loss': loss.item(),
-                'train/total_loss': loss.item(),
-                'train/segmentation_loss': l_seg.item(),
-                'train/classification_loss': l_cls.item(),
-                'train/optimizer_step_completed': optimizer_step_completed,
-                'train/gradient_accumulation_steps': gradient_accumulation_steps,
-                'train/learning_rate': optimizer.param_groups[0]['lr'],
-            }
-            step_log.update({
-                f'train/learning_rate_group_{index}': group['lr']
-                for index, group in enumerate(optimizer.param_groups)
-            })
-            wandb_run.log(step_log)
-        if progress_callback is not None:
-            progress_callback({
-                'phase': 'scientific_train',
-                'epoch': epoch + 1,
-                'micro_step': batch_index + 1,
-                'optimizer_step': global_step,
-                'optimizer_step_completed': optimizer_step_completed,
-            })
+        global_step += 1
+        for offset, row in enumerate(step['microbatches']):
+            batch_index = group_start + offset
+            losses.append(row['loss'])
+            optimizer_step_completed = offset == gradient_accumulation_steps - 1
+            if wandb_run is not None:
+                step_log = {
+                    'train/global_step': global_step,
+                    'train/micro_step': epoch * usable_micro_steps + batch_index + 1,
+                    'train/epoch': epoch + 1,
+                    'train/batch_loss': row['loss'],
+                    'train/total_loss': row['loss'],
+                    'train/segmentation_loss': row['segmentation_loss'],
+                    'train/classification_loss': row['classification_loss'],
+                    'train/optimizer_step_completed': optimizer_step_completed,
+                    'train/gradient_accumulation_steps': gradient_accumulation_steps,
+                    'train/learning_rate': optimizer.param_groups[0]['lr'],
+                }
+                step_log.update({
+                    f'train/learning_rate_group_{index}': group['lr']
+                    for index, group in enumerate(optimizer.param_groups)
+                })
+                wandb_run.log(step_log)
+            if progress_callback is not None:
+                progress_callback({
+                    'phase': 'scientific_train',
+                    'epoch': epoch + 1,
+                    'micro_step': batch_index + 1,
+                    'optimizer_step': global_step,
+                    'optimizer_step_completed': optimizer_step_completed,
+                })
     return float(np.mean(losses)), global_step
 
 
@@ -278,7 +352,7 @@ def fit(model, train_loader, val_loader, device,
         scheduler='poly', warmup_epochs=0, loss_name='dicece',
         wandb_run=None, reproduction_expected_ids=None,
         return_details=False, gradient_accumulation_steps=1,
-        progress_callback=None):
+        progress_callback=None, critical_memory_observer=None):
 
     optimizer = make_optimizer(model, initial_lr=initial_lr,
                                optimizer_name=optimizer_name)
@@ -315,7 +389,8 @@ def fit(model, train_loader, val_loader, device,
             lambda_cls, device, scaler, wandb_run=wandb_run,
             epoch=epoch, global_step=global_step,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            progress_callback=progress_callback)
+            progress_callback=progress_callback,
+            critical_memory_observer=critical_memory_observer)
         validation_started = time.perf_counter()
         val_loss, val_dice, val_acc, native_metrics = validate(
             model, val_loader, seg_loss_fn, lambda_cls, device,

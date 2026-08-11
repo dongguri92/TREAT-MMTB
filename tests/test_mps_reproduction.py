@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import reproduce_teammate_l05_mps as mps
 import reproduction
+import training
 
 
 def _healthy_memory_snapshot() -> dict[str, int]:
@@ -241,7 +242,7 @@ def test_probe_seals_forward_and_backward_resource_failures(
     class Tensor:
         shape = (1, 1, 1024, 1024)
 
-        def to(self, _device: object) -> "Tensor":
+        def to(self, _device: object, **_kwargs: object) -> "Tensor":
             return self
 
     class Loss:
@@ -252,6 +253,9 @@ def test_probe_seals_forward_and_backward_resource_failures(
             return self
 
         def __truediv__(self, _other: object) -> "Loss":
+            return self
+
+        def detach(self) -> "Loss":
             return self
 
         def backward(self) -> None:
@@ -610,7 +614,7 @@ def _mock_successful_optimizer_probe(
     class Tensor:
         shape = (1, 1, 1024, 1024)
 
-        def to(self, _device: object) -> "Tensor":
+        def to(self, _device: object, **_kwargs: object) -> "Tensor":
             return self
 
         def cpu(self) -> "Tensor":
@@ -630,6 +634,9 @@ def _mock_successful_optimizer_probe(
             return self
 
         def __truediv__(self, _other: object) -> "Loss":
+            return self
+
+        def detach(self) -> "Loss":
             return self
 
         def backward(self) -> None:
@@ -733,7 +740,7 @@ def test_no_wandb_acceptance_soak_covers_full_lifecycle(
     assert all(update["distinct_microbatches"] == 8 for update in evidence["updates"])
     assert all("memory" in update for update in evidence["updates"])
     assert len(heartbeat.read_text(encoding="utf-8").splitlines()) == 188
-    assert evidence["heartbeat_records_written"] == 187
+    assert evidence["heartbeat_records_written"] == 188
     assert evidence["heartbeat_sha256"] == reproduction.sha256_file(heartbeat)
 
 
@@ -753,6 +760,92 @@ def test_optimizer_path_failure_is_sealed_before_wandb(
         )
     assert caught.value.evidence["failure_stage"] == "optimizer_step"
     assert caught.value.evidence["wandb_started"] is False
+
+
+def test_probe_cleanup_failure_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loader = _mock_successful_optimizer_probe(monkeypatch)
+    calls = 0
+
+    def empty_cache() -> None:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(mps.torch.mps, "empty_cache", empty_cache, raising=False)
+    with pytest.raises(mps.MPSFeasibilityFailure) as caught:
+        mps._run_mps_optimizer_probe(
+            loader,
+            mps.torch.device("mps"),
+            tmp_path / "pretrained.pt",
+            optimizer_updates=1,
+            probe_name="cleanup-failure",
+        )
+    assert caught.value.evidence["failure_stage"] == "cleanup"
+    assert caught.value.evidence["cleanup"]["status"] == "failed"
+
+
+def test_accumulated_step_materializes_scalars_only_after_adamw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class Tensor:
+        def to(self, _device: object, **_kwargs: object) -> "Tensor":
+            return self
+
+    class Loss:
+        def __add__(self, _other: object) -> "Loss":
+            return self
+
+        def __rmul__(self, _other: object) -> "Loss":
+            return self
+
+        def __truediv__(self, _other: object) -> "Loss":
+            return self
+
+        def backward(self) -> None:
+            events.append("backward")
+
+        def detach(self) -> "Loss":
+            return self
+
+        def item(self) -> float:
+            events.append("item")
+            return 1.0
+
+    class Model:
+        return_cls = False
+
+        def __call__(self, _image: Tensor) -> tuple[Tensor, Tensor]:
+            return Tensor(), Tensor()
+
+        def parameters(self) -> list[object]:
+            return []
+
+    class Optimizer:
+        def zero_grad(self, *, set_to_none: bool) -> None:
+            assert set_to_none is True
+
+        def step(self) -> None:
+            events.append("adamw")
+
+    monkeypatch.setattr(training.torch.nn, "BCEWithLogitsLoss", lambda: lambda *_: Loss())
+    monkeypatch.setattr(training.torch.nn.utils, "clip_grad_norm_", lambda *_a, **_k: Loss())
+    batches = [
+        {"image": Tensor(), "mask": Tensor(), "cls": Tensor()}
+        for _ in range(8)
+    ]
+    training.accumulated_train_step(
+        Model(), batches, Optimizer(), lambda *_: Loss(), 0.5,
+        mps.torch.device("mps"), use_amp=False,
+        critical_memory_observer=lambda: events.append("critical") or {},
+    )
+    assert events[:8] == ["backward"] * 8
+    assert events[8:10] == ["critical", "adamw"]
+    assert events.index("item") > events.index("adamw")
 
 
 def test_mps_lock_pins_verified_direct_environment() -> None:

@@ -34,6 +34,15 @@ EXPECTED_SMALL_PRETRAINED_TENSORS = 162
 LEGACY_NUMPY_SCALAR_GLOBAL = "numpy.core.multiarray.scalar"
 
 
+def _legacy_numpy_scalar(*args: Any) -> Any:
+    """Exact callable alias for torch versions without tuple safe-global aliases."""
+    return importlib.import_module("numpy._core.multiarray").scalar(*args)
+
+
+_legacy_numpy_scalar.__module__ = "numpy.core.multiarray"
+_legacy_numpy_scalar.__name__ = "scalar"
+
+
 def _numpy_scalar_safe_global() -> Any:
     scalar: Any = importlib.import_module("numpy._core.multiarray").scalar
     if scalar.__module__ == "numpy.core.multiarray":
@@ -49,8 +58,21 @@ def _load_weights_only_checkpoint(path):
         np.dtype,
         type(np.dtype(np.float64)),
     ]
-    with torch.serialization.safe_globals(numpy_safe_globals):
-        return torch.load(path, map_location="cpu", weights_only=True)
+    try:
+        with torch.serialization.safe_globals(numpy_safe_globals):
+            return torch.load(path, map_location="cpu", weights_only=True)
+    except AttributeError as error:
+        if "tuple" not in str(error) or "__module__" not in str(error):
+            raise
+        compatible_globals = [
+            set,
+            importlib.import_module("numpy._core.multiarray").scalar,
+            _legacy_numpy_scalar,
+            np.dtype,
+            type(np.dtype(np.float64)),
+        ]
+        with torch.serialization.safe_globals(compatible_globals):
+            return torch.load(path, map_location="cpu", weights_only=True)
 
 
 # =============================================================================

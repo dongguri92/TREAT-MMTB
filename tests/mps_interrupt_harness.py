@@ -116,9 +116,19 @@ def main() -> int:
         "identity-hash",
     )
     mps._load_resource_gate = lambda *_args: (  # type: ignore[assignment]
-        {"status": "passed"},
+        {
+            "status": "passed",
+            "acceptance_soak": {"loader_start_fingerprint": "sealed-start"},
+        },
         "resource-gate-receipt-hash",
     )
+    mps._loader_start_fingerprint = lambda _loader: "sealed-start"  # type: ignore[assignment]
+    mps._cleanup_mps_boundary = lambda: {  # type: ignore[assignment]
+        "status": "passed",
+        "gc_collected": True,
+        "empty_cache_completed": True,
+        "synchronize_completed": True,
+    }
     mps.torch.mps.empty_cache = lambda: None  # type: ignore[method-assign]
     mps.torch.mps.synchronize = lambda: None  # type: ignore[method-assign]
     mps.modeltype = lambda *_args, **_kwargs: Model()  # type: ignore[assignment]

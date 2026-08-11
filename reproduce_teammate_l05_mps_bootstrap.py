@@ -15,6 +15,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+from mps_evidence import sha256_file as _chain_sha256_file
+from mps_evidence import validate_gate_artifacts
+
 ROOT = Path(__file__).resolve().parent
 CONTRACT_PATH = ROOT / "mps_resource_contract.json"
 WORKER_PATH = ROOT / "reproduce_teammate_l05_mps.py"
@@ -94,7 +97,10 @@ def _load_contract() -> dict[str, Any]:
 
 
 def _sealed_environment(
-    contract: dict[str, Any], role: str, child_argv: list[str]
+    contract: dict[str, Any],
+    role: str,
+    child_argv: list[str],
+    soak_approval: dict[str, Any] | None = None,
 ) -> tuple[dict[str, str], dict[str, Any]]:
     environment = dict(os.environ)
     allocator = contract["allocator"]
@@ -119,6 +125,7 @@ def _sealed_environment(
         "created_time_ns": time.time_ns(),
         "nonce": secrets.token_hex(32),
         "torch_imported_in_bootstrap": "torch" in sys.modules,
+        "soak_approval": soak_approval,
     }
     if proof["torch_imported_in_bootstrap"]:
         raise RuntimeError("stdlib bootstrap imported torch unexpectedly")
@@ -151,7 +158,20 @@ def _terminate_child(
     watchdog = contract["watchdog"]
     sample_path = supervisor_dir / "timeout_sample.txt"
     sample = _sample_process(child.pid, sample_path, watchdog["sample_seconds"])
-    child.send_signal(signal.SIGTERM)
+    try:
+        child.send_signal(signal.SIGTERM)
+    except ProcessLookupError:
+        child.wait(timeout=30)
+        return {
+            "sample": sample,
+            "sample_sha256": (
+                _sha256_file(sample_path) if sample_path.exists() else None
+            ),
+            "sigterm_sent": False,
+            "sigterm_grace_seconds": watchdog["sigterm_grace_seconds"],
+            "safe_escalation_used": False,
+            "returncode": child.returncode,
+        }
     escalated = False
     try:
         child.wait(timeout=watchdog["sigterm_grace_seconds"])
@@ -170,25 +190,62 @@ def _terminate_child(
 
 
 def _validate_child_completion(
-    completion_path: Path, role: str, attempt_id: str, returncode: int | None
-) -> tuple[bool, str | None]:
+    completion_path: Path,
+    role: str,
+    attempt_id: str,
+    returncode: int | None,
+    minimum_headroom_ratio: float,
+) -> tuple[bool, str | None, dict[str, Any] | None]:
     if returncode != 0 or not completion_path.exists():
-        return False, None
+        return False, None, None
     try:
         completion = json.loads(completion_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False, None
-    expected_status = "passed" if role == "resource_gate" else "completed"
-    valid = (
-        completion.get("schema_version") == 1
-        and completion.get("attempt_id") == attempt_id
-        and completion.get("status") == expected_status
-    )
-    return valid, _sha256_file(completion_path)
+        if role == "resource_gate":
+            chain = validate_gate_artifacts(
+                completion_path.parent, attempt_id, minimum_headroom_ratio
+            )
+        else:
+            if (
+                completion.get("schema_version") != 1
+                or completion.get("attempt_id") != attempt_id
+                or completion.get("status") != "completed"
+            ):
+                raise ValueError("scientific completion index is invalid")
+            artifacts = completion.get("artifacts")
+            if not isinstance(artifacts, dict) or not artifacts:
+                raise ValueError("scientific artifact index is empty")
+            for name, digest in artifacts.items():
+                artifact = completion_path.parent / name
+                if not artifact.is_file() or _chain_sha256_file(artifact) != digest:
+                    raise ValueError("scientific artifact hash differs")
+            run_record = json.loads(
+                (completion_path.parent / "run_record.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            if (
+                run_record.get("status") != "completed"
+                or run_record.get("wandb_finished") is not True
+                or run_record.get("external_final_test_untouched") is not True
+            ):
+                raise ValueError("scientific run record is incomplete")
+            chain = {
+                "artifact_index_sha256": _sha256_file(completion_path),
+                "run_record_sha256": _sha256_file(
+                    completion_path.parent / "run_record.json"
+                ),
+            }
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False, None, None
+    return True, _sha256_file(completion_path), chain
 
 
 def _supervise(
-    child_argv: list[str], role: str, artifact_root: Path, attempt_id: str
+    child_argv: list[str],
+    role: str,
+    artifact_root: Path,
+    attempt_id: str,
+    soak_approval: dict[str, Any] | None = None,
 ) -> Path:
     contract = _load_contract()
     supervisor_dir = artifact_root / ".supervisor" / attempt_id
@@ -196,56 +253,101 @@ def _supervise(
     heartbeat_path = supervisor_dir / "progress.jsonl"
     read_fd, write_fd = os.pipe()
     child_command = [sys.executable, str(WORKER_PATH), *child_argv, "--internal-worker"]
-    environment, proof = _sealed_environment(contract, role, child_command)
+    environment, proof = _sealed_environment(
+        contract, role, child_command, soak_approval
+    )
     environment[PROGRESS_FD_ENV] = str(write_fd)
     _write_json_once(supervisor_dir / "bootstrap_proof.json", proof)
-    child = subprocess.Popen(
-        child_command,
-        cwd=ROOT,
-        env=environment,
-        pass_fds=(write_fd,),
-        text=True,
-    )
-    os.close(write_fd)
-    selector = selectors.DefaultSelector()
-    selector.register(read_fd, selectors.EVENT_READ)
-    last_progress = time.monotonic()
+    child: subprocess.Popen[str] | None = None
+    selector: selectors.BaseSelector | None = None
+    previous_handlers: dict[int, Any] = {}
     timed_out = False
-    with heartbeat_path.open("x", encoding="utf-8") as heartbeat:
-        buffer = b""
-        while child.poll() is None:
-            events = selector.select(timeout=1.0)
-            for key, _ in events:
-                chunk = os.read(key.fd, 65536)
-                if not chunk:
-                    selector.unregister(key.fd)
-                    continue
-                buffer += chunk
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    json.loads(line)
-                    heartbeat.write(line.decode("utf-8") + "\n")
-                    heartbeat.flush()
-                    os.fsync(heartbeat.fileno())
-                    last_progress = time.monotonic()
-            if time.monotonic() - last_progress > contract["watchdog"][
-                "progress_timeout_seconds"
-            ]:
-                timed_out = True
-                break
-        termination = (
-            _terminate_child(child, supervisor_dir, contract) if timed_out else None
+    termination: dict[str, Any] | None = None
+    supervisor_error: BaseException | None = None
+
+    def interrupt(signum: int, _frame: Any) -> None:
+        raise InterruptedError(f"supervisor interrupted by {signal.Signals(signum).name}")
+
+    try:
+        child = subprocess.Popen(
+            child_command,
+            cwd=ROOT,
+            env=environment,
+            pass_fds=(write_fd,),
+            text=True,
         )
-        if child.poll() is None:
+        os.close(write_fd)
+        write_fd = -1
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, interrupt)
+        selector = selectors.DefaultSelector()
+        selector.register(read_fd, selectors.EVENT_READ)
+        last_progress = time.monotonic()
+        with heartbeat_path.open("x", encoding="utf-8") as heartbeat:
+            buffer = b""
+            while child.poll() is None:
+                events = selector.select(timeout=1.0)
+                for key, _ in events:
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        selector.unregister(key.fd)
+                        continue
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        row = json.loads(line)
+                        if not isinstance(row, dict):
+                            raise ValueError("supervisor progress row must be an object")
+                        heartbeat.write(line.decode("utf-8") + "\n")
+                        heartbeat.flush()
+                        os.fsync(heartbeat.fileno())
+                        last_progress = time.monotonic()
+                if time.monotonic() - last_progress > contract["watchdog"][
+                    "progress_timeout_seconds"
+                ]:
+                    timed_out = True
+                    break
+        if timed_out:
+            termination = _terminate_child(child, supervisor_dir, contract)
+        elif child.poll() is None:
             child.wait()
-    os.close(read_fd)
+    except BaseException as error:
+        supervisor_error = error
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        previous_handlers.clear()
+        if child is not None and child.poll() is None:
+            termination = _terminate_child(child, supervisor_dir, contract)
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        if selector is not None:
+            selector.close()
+        if read_fd >= 0:
+            os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.wait(timeout=30)
+    if not heartbeat_path.exists():
+        heartbeat_path.touch(exist_ok=False)
     child_completion_path = (
         artifact_root / attempt_id / "acceptance_soak_index.json"
         if role == "resource_gate"
         else artifact_root / attempt_id / "artifact_index.json"
     )
-    child_completion_valid, child_completion_sha256 = _validate_child_completion(
-        child_completion_path, role, attempt_id, child.returncode
+    (
+        child_completion_valid,
+        child_completion_sha256,
+        evidence_chain,
+    ) = _validate_child_completion(
+        child_completion_path,
+        role,
+        attempt_id,
+        child.returncode if child is not None else None,
+        float(contract["memory"]["minimum_headroom_ratio"]),
     )
     receipt = {
         "schema_version": 1,
@@ -253,14 +355,24 @@ def _supervise(
         "role": role,
         "status": (
             "completed"
-            if child.returncode == 0 and not timed_out and child_completion_valid
+            if child is not None
+            and child.returncode == 0
+            and not timed_out
+            and supervisor_error is None
+            and child_completion_valid
             else "failed"
         ),
-        "returncode": child.returncode,
+        "returncode": child.returncode if child is not None else None,
         "timed_out": timed_out,
         "termination": termination,
+        "supervisor_error_type": (
+            type(supervisor_error).__name__ if supervisor_error is not None else None
+        ),
         "bootstrap_proof_sha256": _sha256_file(
             supervisor_dir / "bootstrap_proof.json"
+        ),
+        "bootstrap_proof_canonical_sha256": _sha256_bytes(
+            _canonical_bytes(proof)
         ),
         "progress_sha256": _sha256_file(heartbeat_path),
         "progress_records": len(
@@ -268,6 +380,7 @@ def _supervise(
         ),
         "child_completion_sha256": child_completion_sha256,
         "child_completion_verified_by_supervisor": child_completion_valid,
+        "evidence_chain": evidence_chain,
     }
     receipt_path = supervisor_dir / "supervisor_receipt.json"
     _write_json_once(receipt_path, receipt)
@@ -285,6 +398,37 @@ def _supervise(
     return receipt_path
 
 
+def _git_head() -> str:
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+    ).strip()
+
+
+def _load_scientific_approval(
+    path: Path, attempt_id: str, gate_receipt: Path
+) -> dict[str, Any]:
+    approval = json.loads(path.read_text(encoding="utf-8"))
+    gate_id = f"{attempt_id}-resource-gate"
+    if (
+        not isinstance(approval, dict)
+        or approval.get("schema_version") != 1
+        or approval.get("status") != "approved"
+        or approval.get("attempt_id") != attempt_id
+        or approval.get("gate_attempt_id") != gate_id
+        or approval.get("source_git_commit") != _git_head()
+        or approval.get("resource_gate_receipt_sha256")
+        != _sha256_file(gate_receipt)
+        or not str(approval.get("reviewed_by", "")).strip()
+        or not str(approval.get("review_url", "")).strip()
+        or approval.get("external_final_test_untouched") is not True
+    ):
+        raise RuntimeError("scientific soak approval differs from reviewed gate")
+    return {
+        **approval,
+        "approval_sha256": _sha256_file(path),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if "--internal-worker" in arguments:
@@ -296,6 +440,8 @@ def main(argv: list[str] | None = None) -> int:
         "--artifact-root",
         "--execute",
         "--acceptance-soak-only",
+        "--scientific-run",
+        "--soak-approval",
         "--reviewed-by",
     ):
         _reject_duplicate_flag(arguments, singleton)
@@ -314,20 +460,48 @@ def main(argv: list[str] | None = None) -> int:
         )
     ).resolve()
     gate_id = f"{attempt_id}-resource-gate"
-    gate_arguments = list(arguments)
-    gate_arguments[gate_arguments.index("--attempt-id") + 1] = gate_id
-    if "--acceptance-soak-only" not in gate_arguments:
-        gate_arguments.append("--acceptance-soak-only")
-    gate_receipt = _supervise(gate_arguments, "resource_gate", artifact_root, gate_id)
-    if "--acceptance-soak-only" in arguments:
+    gate_only = "--acceptance-soak-only" in arguments
+    scientific = "--scientific-run" in arguments
+    if gate_only == scientific:
+        raise SystemExit(
+            "execute requires exactly one of --acceptance-soak-only or "
+            "--scientific-run"
+        )
+    if gate_only:
+        gate_arguments = list(arguments)
+        gate_arguments[gate_arguments.index("--attempt-id") + 1] = gate_id
+        gate_receipt = _supervise(
+            gate_arguments, "resource_gate", artifact_root, gate_id
+        )
         print(gate_receipt)
         return 0
-    scientific_arguments = [
-        value for value in arguments if value != "--acceptance-soak-only"
-    ]
+
+    approval_path = Path(_flag_value(arguments, "--soak-approval")).resolve()
+    gate_receipt = (
+        artifact_root / ".supervisor" / gate_id / "supervisor_receipt.json"
+    )
+    approval = _load_scientific_approval(
+        approval_path, attempt_id, gate_receipt
+    )
+    scientific_arguments = []
+    skip_next = False
+    for value in arguments:
+        if skip_next:
+            skip_next = False
+            continue
+        if value == "--soak-approval":
+            skip_next = True
+            continue
+        if value == "--scientific-run":
+            continue
+        scientific_arguments.append(value)
     scientific_arguments.extend(["--resource-gate-receipt", str(gate_receipt)])
     scientific_receipt = _supervise(
-        scientific_arguments, "scientific_run", artifact_root, attempt_id
+        scientific_arguments,
+        "scientific_run",
+        artifact_root,
+        attempt_id,
+        approval,
     )
     print(scientific_receipt)
     return 0

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import random
@@ -26,6 +27,7 @@ import numpy as np
 import torch
 
 import datasets
+from mps_evidence import validate_gate_artifacts
 from models import modeltype
 from reproduction import (
     CLS_THRESHOLD,
@@ -52,7 +54,7 @@ from reproduction import (
     validate_pretrained,
     write_json_once,
 )
-from training import compute_lr, fit, make_optimizer
+from training import accumulated_train_step, compute_lr, fit, make_optimizer
 from utils import DiceCELoss
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -282,6 +284,56 @@ def _validate_memory_headroom(snapshot: dict[str, int | None]) -> float:
     return headroom
 
 
+def _batches_fingerprint(batches: list[dict[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for batch in batches:
+        ids = [str(value) for value in batch.get("id", [])]
+        digest.update(json.dumps(ids, separators=(",", ":")).encode("utf-8"))
+        for name in ("image", "mask", "cls"):
+            tensor = batch[name].detach().cpu().contiguous()
+            digest.update(str(tuple(tensor.shape)).encode("ascii"))
+            digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _loader_start_fingerprint(loader: Any) -> str:
+    iterator = iter(loader)
+    batches = [next(iterator) for _ in range(GRADIENT_ACCUMULATION_STEPS)]
+    return _batches_fingerprint(batches)
+
+
+def _cleanup_mps_boundary() -> dict[str, Any]:
+    gc.collect()
+    torch.mps.empty_cache()
+    torch.mps.synchronize()
+    memory = _memory_snapshot()
+    return {
+        "status": "passed",
+        "gc_collected": True,
+        "empty_cache_completed": True,
+        "synchronize_completed": True,
+        "memory": memory,
+        "headroom_ratio": _validate_memory_headroom(memory),
+    }
+
+
+def _critical_memory_evidence(
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    memory = _memory_snapshot()
+    headroom = _validate_memory_headroom(memory)
+    evidence = {
+        "phase": "backward_complete_pre_adamw_memory",
+        "memory": memory,
+        "headroom_ratio": headroom,
+        "tensor_scalar_materialized": False,
+        "explicit_mps_synchronize_called": False,
+    }
+    if progress_callback is not None:
+        progress_callback(evidence)
+    return evidence
+
+
 def _run_mps_optimizer_probe(
     loader: Any,
     device: torch.device,
@@ -293,6 +345,7 @@ def _run_mps_optimizer_probe(
     validation_loader: Any = None,
     validation_after_updates: int | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    expected_start_fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Exercise train/validation/transition MPS resources without W&B or scores."""
     if device.type != "mps" or not torch.backends.mps.is_available():
@@ -322,8 +375,11 @@ def _run_mps_optimizer_probe(
         "updates": [],
         "validation": [],
     }
+    emitted_records = 0
+    minimum_headroom = 1.0
 
     def emit(record: dict[str, Any]) -> None:
+        nonlocal emitted_records
         if heartbeat_stream is not None:
             heartbeat_stream.write(
                 json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
@@ -332,6 +388,20 @@ def _run_mps_optimizer_probe(
             os.fsync(heartbeat_stream.fileno())
         if progress_callback is not None:
             progress_callback(record)
+        emitted_records += 1
+        evidence["heartbeat_records_written"] = emitted_records
+
+    def observe_critical_memory() -> dict[str, Any]:
+        nonlocal minimum_headroom
+        critical = _critical_memory_evidence(progress_callback)
+        minimum_headroom = min(
+            minimum_headroom, critical["headroom_ratio"]
+        )
+        return critical
+
+    def set_stage(value: str) -> None:
+        nonlocal stage
+        stage = value
 
     try:
         if heartbeat_path is not None:
@@ -341,6 +411,9 @@ def _run_mps_optimizer_probe(
         evidence["memory_before"] = _memory_snapshot()
         evidence["memory_before_headroom_ratio"] = _validate_memory_headroom(
             evidence["memory_before"]
+        )
+        minimum_headroom = min(
+            minimum_headroom, evidence["memory_before_headroom_ratio"]
         )
         stage = "model_construction"
         model = cast(
@@ -369,7 +442,6 @@ def _run_mps_optimizer_probe(
         }
         segmentation_loss_fn = DiceCELoss(batch_dice=True)
         classification_loss_fn = torch.nn.BCEWithLogitsLoss()
-        optimizer.zero_grad(set_to_none=True)
         iterator = iter(loader)
         started = time.perf_counter()
         completed_micro_steps = 0
@@ -426,6 +498,7 @@ def _run_mps_optimizer_probe(
                             synchronize()
                         memory = _memory_snapshot()
                         headroom = _validate_memory_headroom(memory)
+                        minimum_headroom = min(minimum_headroom, headroom)
                         validation_record = {
                             "phase": "validation_resource",
                             "validation_step": validation_index,
@@ -466,7 +539,7 @@ def _run_mps_optimizer_probe(
                     }
                 )
             update_case_ids: list[str] = []
-            last_losses: dict[str, float] = {}
+            update_batches: list[dict[str, Any]] = []
             for _ in range(GRADIENT_ACCUMULATION_STEPS):
                 stage = "microbatch_load"
                 try:
@@ -480,49 +553,38 @@ def _run_mps_optimizer_probe(
                 if len(batch_ids) != PHYSICAL_BATCH_SIZE:
                     raise ValueError("probe microbatch identity is missing")
                 update_case_ids.extend(batch_ids)
-                stage = "microbatch_device_transfer"
-                image = batch["image"].to(device)
-                mask = batch["mask"].to(device)
-                cls = batch["cls"].to(device)
-                if tuple(image.shape) != (1, 1, TARGET_SIZE, TARGET_SIZE):
+                if tuple(batch["image"].shape) != (1, 1, TARGET_SIZE, TARGET_SIZE):
                     raise ValueError("probe batch is not exact 1x1x1024x1024")
-                stage = "forward"
-                segmentation, classification = model(image)
-                stage = "loss"
-                segmentation_loss = segmentation_loss_fn(segmentation, mask)
-                classification_loss = classification_loss_fn(classification, cls)
-                loss = segmentation_loss + 0.5 * classification_loss
-                if not all(
-                    bool(torch.isfinite(value).item())
-                    for value in (segmentation_loss, classification_loss, loss)
-                ):
-                    raise FloatingPointError("probe loss is non-finite")
-                last_losses = {
-                    "segmentation_loss": float(segmentation_loss.item()),
-                    "classification_loss": float(classification_loss.item()),
-                    "total_loss": float(loss.item()),
-                }
-                stage = "backward"
-                (loss / GRADIENT_ACCUMULATION_STEPS).backward()
+                update_batches.append(batch)
                 completed_micro_steps += 1
                 batch = image = mask = cls = None
                 segmentation = classification = None
                 segmentation_loss = classification_loss = loss = None
             if len(set(update_case_ids)) != GRADIENT_ACCUMULATION_STEPS:
                 raise ValueError("optimizer update did not use 8 distinct microbatches")
-            stage = "gradient_clip"
-            gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 12)
-            if not bool(torch.isfinite(gradient_norm).item()):
-                raise FloatingPointError("probe gradient norm is non-finite")
-            stage = "optimizer_step"
-            optimizer.step()
-            stage = "optimizer_zero_grad"
-            optimizer.zero_grad(set_to_none=True)
+            if update_index == 0 and expected_start_fingerprint is not None:
+                observed_start_fingerprint = _batches_fingerprint(update_batches)
+                if observed_start_fingerprint != expected_start_fingerprint:
+                    raise ValueError("soak loader start differs from sealed preview")
+                evidence["loader_start_fingerprint"] = observed_start_fingerprint
+            step = accumulated_train_step(
+                model,
+                update_batches,
+                optimizer,
+                segmentation_loss_fn,
+                0.5,
+                device,
+                scaler=None,
+                use_amp=False,
+                critical_memory_observer=observe_critical_memory,
+                stage_callback=set_stage,
+            )
             stage = "synchronize"
             if callable(synchronize):
                 synchronize()
             memory = _memory_snapshot()
             headroom = _validate_memory_headroom(memory)
+            minimum_headroom = min(minimum_headroom, headroom)
             update_evidence = {
                 "phase": (
                     "next_epoch_train"
@@ -538,17 +600,15 @@ def _run_mps_optimizer_probe(
                 ),
                 "finite_losses": True,
                 "finite_gradient_norm": True,
-                "gradient_norm": float(gradient_norm.item()),
-                "last_microbatch_losses": last_losses,
+                "gradient_norm": step["gradient_norm"],
+                "last_microbatch_losses": step["microbatches"][-1],
+                "critical_memory": step["critical_memory"],
                 "elapsed_seconds": time.perf_counter() - started,
                 "memory": memory,
                 "headroom_ratio": headroom,
             }
             cast(list[dict[str, Any]], evidence["updates"]).append(update_evidence)
             emit(update_evidence)
-            evidence["heartbeat_records_written"] = len(evidence["updates"]) + len(
-                evidence["validation"]
-            )
         memory_after = _memory_snapshot()
         evidence.update(
             {
@@ -559,6 +619,10 @@ def _run_mps_optimizer_probe(
                 "memory_after_optimizer_path": memory_after,
                 "memory_after_headroom_ratio": _validate_memory_headroom(
                     memory_after
+                ),
+                "minimum_headroom_ratio": min(
+                    minimum_headroom,
+                    _validate_memory_headroom(memory_after),
                 ),
             }
         )
@@ -593,34 +657,85 @@ def _run_mps_optimizer_probe(
             )
         raise MPSFeasibilityFailure(evidence) from error
     finally:
+        active_error = sys.exc_info()[0] is not None
+        cleanup_errors: list[dict[str, str]] = []
         if heartbeat_stream is not None:
-            heartbeat_stream.close()
+            try:
+                heartbeat_stream.close()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(
+                    {
+                        "stage": "heartbeat_close",
+                        "error_type": type(cleanup_error).__name__,
+                    }
+                )
         batch = image = mask = cls = None
         segmentation = classification = None
         segmentation_loss = classification_loss = loss = gradient_norm = None
         if optimizer is not None:
-            optimizer.zero_grad(set_to_none=True)
+            try:
+                optimizer.zero_grad(set_to_none=True)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(
+                    {
+                        "stage": "optimizer_zero_grad",
+                        "error_type": type(cleanup_error).__name__,
+                    }
+                )
         if model is not None:
             zero_grad = getattr(model, "zero_grad", None)
             if callable(zero_grad):
                 try:
                     zero_grad(set_to_none=True)
-                except RuntimeError:
-                    pass
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(
+                        {
+                            "stage": "model_zero_grad",
+                            "error_type": type(cleanup_error).__name__,
+                        }
+                    )
             del model
         if optimizer is not None:
             del optimizer
-        gc.collect()
+        try:
+            gc.collect()
+        except BaseException as cleanup_error:
+            cleanup_errors.append(
+                {"stage": "gc_collect", "error_type": type(cleanup_error).__name__}
+            )
         if callable(empty_cache):
             try:
                 empty_cache()
-            except RuntimeError:
-                pass
+            except BaseException as cleanup_error:
+                cleanup_errors.append(
+                    {
+                        "stage": "empty_cache",
+                        "error_type": type(cleanup_error).__name__,
+                    }
+                )
         if callable(synchronize):
             try:
                 synchronize()
-            except RuntimeError:
-                pass
+            except BaseException as cleanup_error:
+                cleanup_errors.append(
+                    {
+                        "stage": "synchronize_cleanup",
+                        "error_type": type(cleanup_error).__name__,
+                    }
+                )
+        evidence["cleanup"] = {
+            "status": "failed" if cleanup_errors else "passed",
+            "errors": cleanup_errors,
+        }
+        if cleanup_errors and not active_error:
+            evidence.update(
+                {
+                    "status": "failed",
+                    "failure_stage": "cleanup",
+                    "error_type": cleanup_errors[0]["error_type"],
+                }
+            )
+            raise MPSFeasibilityFailure(evidence)
 
 
 def _resource_evidence(
@@ -820,15 +935,42 @@ def _load_resource_gate(
     supervisor_index = json.loads(index_path.read_text(encoding="utf-8"))
     receipt_sha256 = sha256_file(receipt_path)
     expected_gate_id = f"{args.attempt_id}-resource-gate"
+    expected_receipt_path = (
+        args.artifact_root
+        / ".supervisor"
+        / expected_gate_id
+        / "supervisor_receipt.json"
+    ).resolve()
+    if receipt_path.resolve() != expected_receipt_path:
+        raise RuntimeError("resource-gate receipt is outside canonical supervisor path")
+    gate_dir = args.artifact_root / expected_gate_id
+    minimum_headroom = float(
+        _load_mps_resource_contract()["memory"]["minimum_headroom_ratio"]
+    )
+    chain = validate_gate_artifacts(
+        gate_dir, expected_gate_id, minimum_headroom
+    )
+    approval = _validate_bootstrap_proof("scientific_run").get("soak_approval")
     if (
         receipt.get("status") != "completed"
         or receipt.get("role") != "resource_gate"
         or receipt.get("attempt_id") != expected_gate_id
         or supervisor_index.get("receipt_sha256") != receipt_sha256
         or supervisor_index.get("status") != "completed"
+        or receipt.get("child_completion_sha256")
+        != chain["gate_index_sha256"]
+        or receipt.get("evidence_chain") != chain
+        or receipt.get("bootstrap_proof_canonical_sha256")
+        != chain["bootstrap_proof_sha256"]
+        or not isinstance(approval, dict)
+        or approval.get("status") != "approved"
+        or approval.get("attempt_id") != args.attempt_id
+        or approval.get("gate_attempt_id") != expected_gate_id
+        or approval.get("source_git_commit") != source["git_commit"]
+        or approval.get("resource_gate_receipt_sha256") != receipt_sha256
+        or not str(approval.get("approval_sha256", "")).strip()
     ):
         raise RuntimeError("resource-gate supervisor receipt is incomplete")
-    gate_dir = args.artifact_root / expected_gate_id
     gate_index_path = gate_dir / "acceptance_soak_index.json"
     gate_resource_path = gate_dir / "resource_evidence.json"
     gate_index = json.loads(gate_index_path.read_text(encoding="utf-8"))
@@ -843,6 +985,9 @@ def _load_resource_gate(
         or resource.get("case_identity_sha256") != identity_sha256
         or resource.get("pretrained_sha256") != pretrained_sha256
         or resource.get("acceptance_soak", {}).get("status") != "passed"
+        or resource.get("acceptance_soak", {}).get(
+            "loader_start_fingerprint"
+        ) is None
     ):
         raise RuntimeError("resource-gate evidence differs from scientific inputs")
     return resource, receipt_sha256
@@ -966,6 +1111,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         stage = "mps_dependency_identity"
         dependency = validate_mps_runtime_dependencies(MPS_LOCK_PATH)
         dependency["lock_sha256"] = sha256_file(MPS_LOCK_PATH)
+        if not datasets._HAS_ALBU or datasets.A is None:
+            raise RuntimeError(
+                "reviewed MPS execution requires Albumentations 2 import"
+            )
         if torch.device("mps").type != "mps":
             raise RuntimeError("MPS amendment cannot use another device")
 
@@ -1018,8 +1167,42 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 return _seal_resource_failure(artifact_dir, args, resource)
 
-            stage = "mps_1024_acceptance_soak"
+            stage = "feasibility_cleanup"
+            del probe_loader, probe_val_loader
+            _cleanup_mps_boundary()
             _set_seed(protocol["seed"])
+            preview_loader, preview_val_loader = datasets.dataloader(
+                batch_size=PHYSICAL_BATCH_SIZE,
+                target_size=TARGET_SIZE,
+                clahe_clip=protocol["clahe_clip"],
+                num_workers=args.num_workers,
+                seed=protocol["seed"],
+                crop_frac=protocol["crop_frac"],
+            )
+            preview_identity, preview_identity_sha256 = validate_dataset_identity(
+                preview_loader, preview_val_loader, manifest["identity"]
+            )
+            if preview_identity != identity or preview_identity_sha256 != identity_sha256:
+                raise RuntimeError("preview loader identity differs after feasibility")
+            loader_start_fingerprint = _loader_start_fingerprint(preview_loader)
+            del preview_loader, preview_val_loader
+            _cleanup_mps_boundary()
+            _set_seed(protocol["seed"])
+            probe_loader, probe_val_loader = datasets.dataloader(
+                batch_size=PHYSICAL_BATCH_SIZE,
+                target_size=TARGET_SIZE,
+                clahe_clip=protocol["clahe_clip"],
+                num_workers=args.num_workers,
+                seed=protocol["seed"],
+                crop_frac=protocol["crop_frac"],
+            )
+            soak_identity, soak_identity_sha256 = validate_dataset_identity(
+                probe_loader, probe_val_loader, manifest["identity"]
+            )
+            if soak_identity != identity or soak_identity_sha256 != identity_sha256:
+                raise RuntimeError("soak loader identity differs from sealed preview")
+
+            stage = "mps_1024_acceptance_soak"
             try:
                 acceptance_soak = _run_mps_optimizer_probe(
                     probe_loader,
@@ -1035,6 +1218,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         ACCEPTANCE_FIRST_EPOCH_OPTIMIZER_STEPS
                     ),
                     progress_callback=_supervisor_progress,
+                    expected_start_fingerprint=loader_start_fingerprint,
                 )
             except MPSFeasibilityFailure as error:
                 resource = _resource_evidence(
@@ -1054,6 +1238,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 return _seal_resource_failure(artifact_dir, args, resource)
 
+            del probe_loader, probe_val_loader
+            cleanup = _cleanup_mps_boundary()
+            _supervisor_progress(
+                {
+                    "phase": "resource_process_cleanup",
+                    **cleanup,
+                }
+            )
             resource = _resource_evidence(
                 args,
                 source,
@@ -1071,19 +1263,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
             write_json_once(artifact_dir / "resource_evidence.json", resource)
             resource_sha256 = sha256_file(artifact_dir / "resource_evidence.json")
-            del probe_loader, probe_val_loader
-            gc.collect()
-            torch.mps.empty_cache()
-            torch.mps.synchronize()
-            _supervisor_progress(
-                {
-                    "phase": "resource_process_cleanup",
-                    "status": "passed",
-                    "memory": _memory_snapshot(),
-                }
-            )
             index = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "attempt_id": args.attempt_id,
                 "phase": "acceptance_soak",
                 "status": "passed",
@@ -1091,6 +1272,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "heartbeat_sha256": sha256_file(
                     artifact_dir / "acceptance_soak_heartbeat.jsonl"
                 ),
+                "optimizer_updates": ACCEPTANCE_SOAK_OPTIMIZER_STEPS,
+                "micro_steps": ACCEPTANCE_SOAK_MICRO_STEPS,
+                "validation_steps": ACCEPTANCE_SOAK_VALIDATION_STEPS,
+                "heartbeat_records": acceptance_soak[
+                    "heartbeat_records_written"
+                ],
+                "cleanup": cleanup,
                 "wandb_started": False,
                 "scientific_training_started": False,
                 "external_final_test_untouched": True,
@@ -1102,6 +1290,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         resource, resource_gate_receipt_sha256 = _load_resource_gate(
             args, source, identity_sha256, pretrained["sha256"]
         )
+        loader_start_fingerprint = _loader_start_fingerprint(probe_loader)
+        if loader_start_fingerprint != resource["acceptance_soak"].get(
+            "loader_start_fingerprint"
+        ):
+            raise RuntimeError("scientific loader start differs from reviewed soak")
         shutil.copyfile(
             args.artifact_root
             / f"{args.attempt_id}-resource-gate"
@@ -1118,9 +1311,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         stage = "fresh_training_setup"
         del probe_loader, probe_val_loader
-        gc.collect()
-        torch.mps.empty_cache()
-        torch.mps.synchronize()
+        _cleanup_mps_boundary()
         _set_seed(protocol["seed"])
         train_loader, val_loader = datasets.dataloader(
             batch_size=PHYSICAL_BATCH_SIZE,
@@ -1135,6 +1326,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         if training_identity != identity or training_identity_sha256 != identity_sha256:
             raise RuntimeError("dataset identity changed after feasibility probe")
+        if _loader_start_fingerprint(train_loader) != loader_start_fingerprint:
+            raise RuntimeError(
+                "fresh scientific loader start differs from reviewed soak"
+            )
         model = modeltype(
             "evax_seg",
             in_channels=1,
@@ -1194,6 +1389,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 return_details=True,
                 gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
                 progress_callback=_supervisor_progress,
+                critical_memory_observer=lambda: _critical_memory_evidence(
+                    _supervisor_progress
+                ),
             ),
         )
 
