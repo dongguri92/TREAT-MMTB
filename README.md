@@ -45,7 +45,7 @@ Internal validation (111 released cases):
 | 0 | Scratch multi-task U-Net + scale aug | 0.8378 | 0.2756 | 0.6692 |
 | 1 | EVA-X λ=0.5 + segmentation veto | 0.9189 | 0.3078 | 0.7356 |
 | 2 | 1024 px X-Raydar + U-Net | 0.9550 | 0.4300 | 0.7975 |
-| 2 | **Final classifier + mask ensemble** | 0.9369 | **0.4400** | 0.7879 |
+| 2 | **X-Raydar, EMA ensemble + dual-decoder** | 0.9369 | **0.4400** | 0.7879 |
 
 External set:
 
@@ -153,7 +153,7 @@ was excluded after mask inspection.
 |---|---|---|---|
 | 512 px X-Raydar + UPerNet | 0.9189 | 0.4148 | 0.7677 |
 | 1024 px X-Raydar + U-Net | 0.9550 | 0.4300 | 0.7975 |
-| **Final temporal classifier + mask ensemble** | 0.9369 | **0.4400** | 0.7879 |
+| **X-Raydar, EMA ensemble + dual-decoder (final)** | 0.9369 | **0.4400** | 0.7879 |
 
 Separating the two tasks lifted Dice from 0.31 to 0.41 immediately; moving to
 1024 px added another 0.02. The final system trades a little accuracy for the

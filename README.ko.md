@@ -22,13 +22,13 @@ MICCAI TREAT-MMTB 2026 챌린지 Task 1 (흉부 X선에서 결핵성 공동(cavi
 | 2 | **X-Raydar 2단계 (최종)** | **0.7879** | **0.5838** | [`xraydar_two_stage/`](xraydar_two_stage/) |
 
 **0 → 1.** 세심하게 튜닝한 from-scratch 모델이 벽에 부딪혔다. 작고 고립된
-공동 몇 건이 아키텍처와 loss를 바꿔도 전경 반응을 거의 내지 않았고, 이는
+공동 몇 건이 아키텍처와 loss를 바꿔도 모델이 거의 반응 하지 못했고 이는
 threshold 문제가 아니라 표현의 한계로 판단했다. 흉부 X선 자기지도 foundation
 model인 EVA-X로 전환했다.
 
 **1 → 2.** EVA-X 시스템 안에서 분류 헤드와 분할 헤드의 오류 양상이 달랐고,
 마스크 기반 근거는 전용 분류기보다 신뢰도가 낮았다 — 특히 external 도메인
-이동에서 두드러졌다. 두 과제를 완전히 분리하고, 160만 장 이상의 흉부
+이동에서 두드러졌다. 두 과제를 완전히 분리하고 160만 장 이상의 흉부
 X선으로 학습된 X-Raydar를 전이해 검출과 국소화를 별도 네트워크로 최적화했다.
 
 ### 대표 결과
@@ -41,7 +41,7 @@ Internal validation (공개된 111건):
 | 0 | from-scratch multi-task U-Net + scale aug | 0.8378 | 0.2756 | 0.6692 |
 | 1 | EVA-X λ=0.5 + segmentation veto | 0.9189 | 0.3078 | 0.7356 |
 | 2 | 1024px X-Raydar + U-Net | 0.9550 | 0.4300 | 0.7975 |
-| 2 | **최종 분류기 + 마스크 앙상블** | 0.9369 | **0.4400** | 0.7879 |
+| 2 | **X-Raydar, EMA ensemble + dual-decoder** | 0.9369 | **0.4400** | 0.7879 |
 
 External set:
 
@@ -49,7 +49,7 @@ External set:
 |---|---|---|---|---|
 | 1 | EVA-X λ=0.5 + segmentation veto | 0.6713 | 0.1568 | 0.5170 |
 | 1 | EVA-X, classification-driven + percentile + TTA | 0.7089 | 0.1667 | 0.5463 |
-| 2 | **X-Raydar 2단계 (최종 제출)** | **0.7631** | 0.1653 | **0.5838** |
+| 2 | **X-Raydar two-stage (최종 제출)** | **0.7631** | 0.1653 | **0.5838** |
 
 단계를 거치며 detection은 꾸준히 올랐지만 Dice는 끝내 잘 전이되지 않았다 —
 external에서는 리더보드 전체가 0.05~0.20 사이에 머물렀다.
@@ -108,7 +108,7 @@ cavity = 1 ⟺ 복원된 mask가 non-empty      (CSV/NIfTI 일관성 자동 보�
 
 코드: [`xraydar_two_stage/`](xraydar_two_stage/) *(PR로 추가 예정)*
 
-핵심 설계는 **과제 소유권(task ownership)**이다. GT 마스크가 GT 클래스를
+핵심 설계는 **task ownership**이다. GT 마스크가 GT 클래스를
 결정하지만, 픽셀 단위 분할의 위험과 이미지 단위 판정의 위험은 성격이 다르다.
 가짜 영역 하나가 위양성을 만들고, 작은 공동 하나를 놓치면 분류 자체가
 위음성이 된다. 둘을 한 경로에 밀어넣으면 양쪽 다 나빠졌다.
@@ -145,7 +145,7 @@ padding 값을 히스토그램에서 제외하며, presentation polarity를 한 
 |---|---|---|---|
 | 512px X-Raydar + UPerNet | 0.9189 | 0.4148 | 0.7677 |
 | 1024px X-Raydar + U-Net | 0.9550 | 0.4300 | 0.7975 |
-| **최종 temporal 분류기 + 마스크 앙상블** | 0.9369 | **0.4400** | 0.7879 |
+| **X-Raydar, EMA ensemble + dual-decoder (final)** | 0.9369 | **0.4400** | 0.7879 |
 
 두 과제를 분리하자마자 Dice가 0.31에서 0.41로 올랐고, 1024px로 키우며 0.02가
 더 붙었다. 최종 시스템은 정확도를 조금 내주고 Dice를 최대로 가져간 구성이며,
