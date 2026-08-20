@@ -1,0 +1,18 @@
+# --- Core I/O & image handling ----------------------------------------------
+numpy==1.26.4
+SimpleITK>=2.3.0
+pydicom==3.0.2
+tqdm>=4.65.0
+opencv-python-headless==4.10.0.84
+
+scipy>=1.10.0
+
+# --- DICOM 압축 디코더 (JPEG Lossless / JPEG2000) ---------------------------
+pylibjpeg==2.1.0
+pylibjpeg-libjpeg==2.1.0
+pylibjpeg-openjpeg==2.2.1
+
+# --- EVA-X backbone ----------------------------------------------------------
+timm==1.0.22
+
+# torch는 Dockerfile에서 cu118 wheel로 별도 설치.

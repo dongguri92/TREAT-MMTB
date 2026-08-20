@@ -69,6 +69,13 @@ def main():
                         help="ROI 중심 이동 최대 비율")
     parser.add_argument('--size_weighted', action='store_true',
                         help="cavity 크기별 가중 샘플링 (small 3x, medium 2x)")
+    parser.add_argument('--fold', type=int, default=None,
+                        help="5-fold 교차검증. 0~4 지정 시 train+val 합쳐 학습")
+    parser.add_argument('--use_all', action='store_true',
+                        help="train+val 555장 전부 학습 (held-out 없음)")
+    parser.add_argument('--strong_aug', action='store_true',
+                        help="CLAHE clip 랜덤화 + 화질 열화 aug 강화")
+    parser.add_argument('--n_folds', type=int, default=5)
     args = parser.parse_args()
 
     cfg['lambda_cls'] = args.lambda_cls
@@ -95,22 +102,31 @@ def main():
           f"crop={args.crop_frac} | ")
 
     # 채널 수에 따라 dataloader 모듈 선택
-    if args.roi:
+    if args.use_all:
+        from datasets import dataloader_all
+        train_loader, val_loader = dataloader_all(
+            batch_size=cfg['batch_size'], target_size=cfg['target_size'],
+            clahe_clip=cfg['clahe_clip'], num_workers=cfg['num_workers'],
+            seed=cfg['seed'], crop_frac=args.crop_frac)
+    elif args.fold is not None:
+        from datasets import dataloader_fold
+        train_loader, val_loader = dataloader_fold(
+            fold=args.fold, n_folds=args.n_folds,
+            batch_size=cfg['batch_size'], target_size=cfg['target_size'],
+            clahe_clip=cfg['clahe_clip'], num_workers=cfg['num_workers'],
+            seed=cfg['seed'], crop_frac=args.crop_frac)
+    elif args.roi:
         from datasets_roi import dataloader
         train_loader, val_loader = dataloader(
             batch_size=cfg['batch_size'], roi_size=cfg['target_size'],
             context=args.roi_context, clahe_clip=cfg['clahe_clip'],
             num_workers=cfg['num_workers'], seed=cfg['seed'],
             jitter=(args.roi_jitter, 0.8, 1.4), per_component=True)
-    elif args.channels == 3:
-        from datasets_3ch import dataloader
-        train_loader, val_loader = dataloader(
-            batch_size=cfg['batch_size'],
-            target_size=cfg['target_size'], clahe_clip=cfg['clahe_clip'],
-            num_workers=cfg['num_workers'], seed=cfg['seed'],
-            crop_frac=args.crop_frac)
     else:
-        from datasets import dataloader
+        if args.strong_aug:
+            from datasets_aug import dataloader
+        else:
+            from datasets import dataloader
         train_loader, val_loader = dataloader(
             batch_size=cfg['batch_size'],
             target_size=cfg['target_size'], clahe_clip=cfg['clahe_clip'],

@@ -156,6 +156,18 @@ class MultiTaskUNet(nn.Module):
                   f"using fallback U-Net.")
             self.base = _FallbackUNet(in_channels, num_classes)
             bottleneck_ch = self.base.out_channels_bottleneck
+
+        """
+        self.cls_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(bottleneck_ch, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_cls),
+            nn.Linear(256, 1),
+        )
+        """
         
         self.cls_head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -187,6 +199,8 @@ class MultiTaskUNet(nn.Module):
 # ===========================================================================
 #  Model selector (kept in your style)
 # ===========================================================================
+#def modeltype(model: str, in_channels: int = 1, deep_supervision: bool = False,
+#              img_size: int = 1024, pretrained_path: str = None):
 def modeltype(model: str, in_channels: int = 1, deep_supervision: bool = False,
               img_size: int = 1024, pretrained_path: str = None,
               variant: str = "small"):
@@ -202,3 +216,39 @@ def modeltype(model: str, in_channels: int = 1, deep_supervision: bool = False,
                           variant=variant)
     else:
         raise ValueError(f"Unknown model: {model}")
+
+################################################################################
+
+"""
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device: {device}")
+
+    model = modeltype('multitask_unet', in_channels=1).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"params: {n_params/1e6:.1f}M | base: "
+          f"{'PlainConvUNet' if model._is_plainconv else 'fallback'}")
+
+    x = torch.randn(2, 1, 1024, 1024).to(device)
+
+    # --- train mode: (seg, cls) ---
+    model.return_cls = True
+    seg, cls = model(x)
+    print(f"[train] seg {tuple(seg.shape)} | cls {tuple(cls.shape)}")
+    # expected: seg (2, 2, 1024, 1024) | cls (2, 1)
+
+    # --- inference mode: seg only ---
+    model.return_cls = False
+    seg_only = model(x)
+    print(f"[infer] seg {tuple(seg_only.shape)}")
+    # expected: (2, 2, 1024, 1024)
+
+    # --- checks ---
+    ok_seg = (seg.shape[1] == 2)
+    ok_cls = (cls.shape[1] == 1)
+    ok_infer = (not isinstance(seg_only, tuple))
+    print(f"seg 2ch {'O' if ok_seg else 'X'} | "
+          f"cls 1ch {'O' if ok_cls else 'X'} | "
+          f"infer seg-only {'O' if ok_infer else 'X'}")
+    print("model OK" if (ok_seg and ok_cls and ok_infer) else "CHECK shapes")
+"""

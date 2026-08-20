@@ -293,10 +293,16 @@ def main():
                 if args.detection == "cls" and not present and not args.no_suppress:
                     pred_orig = np.zeros_like(pred_orig)
                 elif args.detection == "cls" and present and pred_orig.sum() == 0:
+                    # cls는 present인데 seg 마스크가 빔 -> seg 최대값 기준 상대
+                    # threshold로 최소 마스크 확보 (CSV/mask 일관성 보장)
                     low = (fg_prob >= seg_prob * 0.5).cpu().numpy().astype(np.uint8)
                     pred_orig = unpad_resize_restore(low, pad_info, ch, cw, oh, ow)
                     pred_orig = remove_small_components(pred_orig,
                                                         min_pixels=args.min_pixels)
+            #else:
+            #    present = score >= args.cls_threshold
+            #    if args.detection == "cls" and not present and not args.no_suppress:
+            #        pred_orig = np.zeros_like(pred_orig)
             n_pos += int(present)
             rows.append((cid, int(present)))
 

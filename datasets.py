@@ -30,15 +30,31 @@ try:
 except Exception:
     _HAS_ALBU = False
 
+import csv as _csv
+from torch.utils.data import WeightedRandomSampler
 
-def load_dicom_normalized(path):
+
+#def load_dicom_normalized(path):
+#    ds = pydicom.dcmread(path, force=True)
+#    img = ds.pixel_array.astype(np.float32)
+#    if getattr(ds, 'PhotometricInterpretation', '') == 'MONOCHROME1':
+#        img = img.max() - img
+#    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+#    return img
+
+def load_dicom_normalized(path, p_lo=1.0, p_hi=99.0):
     ds = pydicom.dcmread(path, force=True)
     img = ds.pixel_array.astype(np.float32)
     if getattr(ds, 'PhotometricInterpretation', '') == 'MONOCHROME1':
         img = img.max() - img
-    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+    lo, hi = np.percentile(img, [p_lo, p_hi])
+    img = np.clip(img, lo, hi)
+    img = (img - lo) / (hi - lo + 1e-8)
     return img
 
+
+TRAIN_CSV = "/home/djk25/Miccai/data_original/train/train.csv"
+SIZE_WEIGHTS = {'small': 1.0, 'medium': 1.0, 'large': 1.0, 'none': 1.0}
 
 def load_mask(path):
     m = sitk.GetArrayFromImage(sitk.ReadImage(path))
@@ -112,6 +128,24 @@ def build_intensity_aug():
         # gamma (both directions)
         A.RandomGamma(gamma_limit=(70, 150), p=0.3),
     ])
+
+def _size_sample_weights(csv_path, ids, weights=None):
+    """cavity 크기 라벨(large/medium/small/none)로 샘플 가중치 산출.
+    batch_dice=True가 큰 병변에 편향되는 것을 데이터 등장 빈도로 보정한다."""
+    weights = weights or SIZE_WEIGHTS
+    size = {}
+    try:
+        with open(csv_path) as f:
+            for row in _csv.DictReader(f):
+                size[str(row['our_id']).strip()] = str(row['cavity']).strip().lower()
+    except Exception as e:
+        print(f"  [WARN] size csv 읽기 실패({e}) — 균등 샘플링으로 진행")
+        return None
+    w = [weights.get(size.get(str(cid), 'none'), 1.0) for cid in ids]
+    from collections import Counter
+    cnt = Counter(size.get(str(cid), '?') for cid in ids)
+    print(f"  size 분포: {dict(cnt)} | 가중치 {weights}")
+    return w
 
 """
 def build_intensity_aug():
@@ -210,6 +244,125 @@ class CXRCavityDataset(Dataset):
 
         return {'image': img_t, 'mask': mask_t, 'cls': cls_t, 'id': cid}
 
+# =============================================================================
+#  5-fold 교차검증용 — datasets.py 맨 아래(dataloader 함수 뒤)에 붙여넣기
+#  기존 CXRCavityDataset / dataloader 는 건드리지 않는다.
+# =============================================================================
+
+class _CXRCavityDataset(Dataset):
+    """(case_id, dcm_dir, mask_dir) 튜플 목록을 받는 데이터셋.
+
+    train/val 폴더가 섞인 목록을 다룰 수 있어 k-fold 분할에 사용한다.
+    전처리·augmentation은 CXRCavityDataset과 동일하다.
+    """
+
+    def __init__(self, items, train=True, target_size=1024,
+                 clahe_clip=2.0, crop_frac=LOWER_CROP_FRAC):
+        self.items = list(items)          # [(cid, dcm_dir, mask_dir), ...]
+        self.train = train
+        self.target_size = target_size
+        self.clahe_clip = clahe_clip
+        self.crop_frac = crop_frac
+        self.geo_aug = build_geometric_aug() if train else None
+        self.int_aug = build_intensity_aug() if train else None
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        cid, dcm_dir, mask_dir = self.items[idx]
+        img = load_dicom_normalized(os.path.join(dcm_dir, f"{cid}.dcm"))
+        mask = load_mask(os.path.join(mask_dir, f"{cid}.nii.gz"))
+
+        # 원본 CXR과 mask 크기가 다른 케이스 대응
+        if mask.shape != img.shape:
+            mask = cv2.resize(mask, (img.shape[1], img.shape[0]),
+                              interpolation=cv2.INTER_NEAREST)
+
+        # 하부 crop (이미지 + 마스크 같이)
+        img = crop_lower(img, self.crop_frac)
+        mask = crop_lower(mask, self.crop_frac)
+
+        # 1) geometric aug on ORIGINAL resolution (image + mask together)
+        if self.train and self.geo_aug is not None:
+            out = self.geo_aug(image=img, mask=mask)
+            img, mask = out['image'], out['mask']
+        elif self.train and self.geo_aug is None:
+            if np.random.rand() < 0.5:
+                img = np.ascontiguousarray(img[:, ::-1])
+                mask = np.ascontiguousarray(mask[:, ::-1])
+
+        # 2) resize + pad
+        img = resize_and_pad(img, self.target_size, is_mask=False)
+        mask = resize_and_pad(mask, self.target_size, is_mask=True)
+
+        # 3) CLAHE on resized image
+        img = apply_clahe(img, clip=self.clahe_clip)
+
+        # 4) intensity aug AFTER CLAHE (image only)
+        if self.train and self.int_aug is not None:
+            img = self.int_aug(image=img)['image']
+
+        # 5) z-score
+        img = zscore(img)
+
+        mask = (mask > 0).astype(np.uint8)
+        cls_label = np.float32(mask.sum() > 0)
+
+        img_t = torch.from_numpy(np.ascontiguousarray(img)).unsqueeze(0).float()
+        mask_t = torch.from_numpy(np.ascontiguousarray(mask)).unsqueeze(0).long()
+        cls_t = torch.tensor([cls_label], dtype=torch.float32)
+
+        return {'image': img_t, 'mask': mask_t, 'cls': cls_t, 'id': cid}
+
+
+def _fold_items(fold=0, n_folds=5, seed=42):
+    """train + val 전체(555장)를 cavity 유무로 stratified k-fold 분할.
+    반환: (train_items, val_items, train_labels, val_labels)"""
+    from sklearn.model_selection import StratifiedKFold
+
+    tr_ids = _list_ids(TRAIN_DCM_DIR)
+    va_ids = _list_ids(VAL_DCM_DIR)
+    items = ([(c, TRAIN_DCM_DIR, TRAIN_MASK_DIR) for c in tr_ids] +
+             [(c, VAL_DCM_DIR, VAL_MASK_DIR) for c in va_ids])
+    labels = (_cavity_presence(TRAIN_MASK_DIR, tr_ids) +
+              _cavity_presence(VAL_MASK_DIR, va_ids))
+
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    tr_idx, va_idx = list(skf.split(items, labels))[fold]
+
+    return ([items[i] for i in tr_idx], [items[i] for i in va_idx],
+            [labels[i] for i in tr_idx], [labels[i] for i in va_idx])
+
+
+def dataloader_fold(fold=0, n_folds=5, batch_size=8, target_size=1024,
+                    clahe_clip=2.0, num_workers=8, seed=42,
+                    crop_frac=LOWER_CROP_FRAC):
+    """k-fold 학습용 loader. train/val 폴더를 합쳐 사용하므로
+    external phase 제출 모델 학습에만 쓴다(예선 val은 더 이상 held-out이 아님)."""
+    tr_items, va_items, tr_lab, va_lab = _fold_items(fold, n_folds, seed)
+
+    print(f"[fold {fold}/{n_folds}] train {len(tr_items)} (pos {sum(tr_lab)}) | "
+          f"val {len(va_items)} (pos {sum(va_lab)})")
+
+    train_ds = _CXRCavityDataset(tr_items, train=True,
+                                 target_size=target_size,
+                                 clahe_clip=clahe_clip, crop_frac=crop_frac)
+    val_ds = _CXRCavityDataset(va_items, train=False,
+                               target_size=target_size,
+                               clahe_clip=clahe_clip, crop_frac=crop_frac)
+
+    train_loader = torch.utils.data.DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True, drop_last=True,
+        persistent_workers=True if num_workers > 0 else False)
+    val_loader = torch.utils.data.DataLoader(
+        val_ds, batch_size=1, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False)
+
+    return train_loader, val_loader
+
 
 def _list_ids(dcm_dir):
     files = sorted(glob.glob(os.path.join(dcm_dir, "*.dcm")))
@@ -226,7 +379,8 @@ def _cavity_presence(mask_dir, ids):
 
 
 def dataloader(batch_size=3, target_size=1024, clahe_clip=2.0,
-               num_workers=8, seed=42, crop_frac=LOWER_CROP_FRAC):
+               num_workers=8, seed=42, crop_frac=LOWER_CROP_FRAC,
+               size_weighted=False):
     """train 경로 전체를 train으로, val 경로 전체를 val로 사용.
     (internal validation set이 별도로 제공되므로 split 불필요)"""
     train_ids = _list_ids(TRAIN_DCM_DIR)
@@ -244,8 +398,16 @@ def dataloader(batch_size=3, target_size=1024, clahe_clip=2.0,
                               train=False, target_size=target_size,
                               clahe_clip=clahe_clip, crop_frac=crop_frac)
 
+    sampler = None
+    if size_weighted:
+        w = _size_sample_weights(TRAIN_CSV, train_ids)
+        if w is not None:
+            sampler = WeightedRandomSampler(w, num_samples=len(train_ids),
+                                            replacement=True)
+
     train_loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
+        train_ds, batch_size=batch_size, 
+        shuffle=(sampler is None), sampler=sampler,
         num_workers=num_workers, pin_memory=True, drop_last=True,
         persistent_workers=True if num_workers > 0 else False)
     val_loader = torch.utils.data.DataLoader(
@@ -255,59 +417,30 @@ def dataloader(batch_size=3, target_size=1024, clahe_clip=2.0,
 
     return train_loader, val_loader
 
-###########################################################################
+def dataloader_all(batch_size=8, target_size=1024, clahe_clip=2.0,
+                   num_workers=8, seed=42, crop_frac=LOWER_CROP_FRAC, **kw):
+    """train + val 555장 전부를 학습에 사용. held-out이 없으므로 검증
+    지표는 훈련 성능이며 신뢰할 수 없다 — epoch을 미리 정해두고 쓸 것."""
+    tr_ids = _list_ids(TRAIN_DCM_DIR)
+    va_ids = _list_ids(VAL_DCM_DIR)
+    items = ([(c, TRAIN_DCM_DIR, TRAIN_MASK_DIR) for c in tr_ids] +
+             [(c, VAL_DCM_DIR, VAL_MASK_DIR) for c in va_ids])
+    labels = (_cavity_presence(TRAIN_MASK_DIR, tr_ids) +
+              _cavity_presence(VAL_MASK_DIR, va_ids))
+    print(f"[ALL] train {len(items)} (pos {sum(labels)}) — held-out 없음, "
+          f"검증 지표는 훈련 성능")
 
-# ===========================================================================
-#  self-test:  python datasets.py
-# ===========================================================================
+    train_ds = _CXRCavityDataset(items, train=True, target_size=target_size,
+                                 clahe_clip=clahe_clip, crop_frac=crop_frac)
+    val_ds = _CXRCavityDataset(items, train=False, target_size=target_size,
+                               clahe_clip=clahe_clip, crop_frac=crop_frac)
 
-"""
-if __name__ == "__main__":
-    # TRAIN 경로로 테스트
-    ds = CXRCavityDataset(TRAIN_DCM_DIR, TRAIN_MASK_DIR, ids=["100", "104", "105"],
-                          train=True, target_size=1024, clahe_clip=2.0)
-
-    s = ds[0]
-    img, mask, cls, cid = s['image'], s['mask'], s['cls'], s['id']
-    print(f"===== case {cid} (train=True) =====")
-    print(f"image | shape {tuple(img.shape)} dtype {img.dtype}")
-    print(f"      | min {img.min():.3f} max {img.max():.3f} "
-          f"mean {img.mean():.3f} std {img.std():.3f}")
-    print(f"mask  | shape {tuple(mask.shape)} dtype {mask.dtype} "
-          f"unique {torch.unique(mask).tolist()} fg_px {int(mask.sum())}")
-    print(f"cls   | shape {tuple(cls.shape)} value {cls.tolist()} "
-          f"| matches mask? {int(cls.item()) == int(mask.sum() > 0)}")
-
-    # 2) 여러 케이스 일관성
-    print("\n===== 여러 케이스 =====")
-    for i in range(len(ds)):
-        x = ds[i]
-        im, mk, cl = x['image'], x['mask'], x['cls']
-        ok_norm = abs(im.mean().item()) < 0.15 and abs(im.std().item() - 1.0) < 0.25
-        ok_mask = set(torch.unique(mk).tolist()).issubset({0, 1})
-        ok_match = int(cl.item()) == int(mk.sum() > 0)
-        print(f"{x['id']}: mean={im.mean():.3f} std={im.std():.3f} "
-              f"mask_unique={torch.unique(mk).tolist()} cls={cl.item():.0f} "
-              f"| norm{'O' if ok_norm else 'X'} "
-              f"mask{'O' if ok_mask else 'X'} match{'O' if ok_match else 'X'}")
-
-    # 3) val 모드 (augmentation 꺼짐) — VAL 경로로 테스트
-    print("\n===== val 모드 (val 경로) =====")
-    val_ids = _list_ids(VAL_DCM_DIR)[:1]
-    ds_val = CXRCavityDataset(VAL_DCM_DIR, VAL_MASK_DIR, ids=val_ids,
-                              train=False, target_size=1024, clahe_clip=2.0)
-    v = ds_val[0]
-    print(f"{v['id']}: mean={v['image'].mean():.3f} std={v['image'].std():.3f} "
-          f"mask_unique={torch.unique(v['mask']).tolist()} cls={v['cls'].item():.0f}")
-
-    # 4) dataloader 배치 테스트
-    print("\n===== dataloader 배치 =====")
-    train_loader, val_loader = dataloader(batch_size=3, num_workers=0, seed=42)
-    b = next(iter(train_loader))
-    print(f"batch image {tuple(b['image'].shape)} mask {tuple(b['mask'].shape)} "
-          f"cls {b['cls'].squeeze().tolist()}")
-    print(f"image mean {b['image'].mean():.3f} std {b['image'].std():.3f} "
-          f"mask_unique {torch.unique(b['mask']).tolist()}")
-    vb = next(iter(val_loader))
-    print(f"val batch image {tuple(vb['image'].shape)} id {vb['id']}")
-"""
+    train_loader = torch.utils.data.DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True, drop_last=True,
+        persistent_workers=True if num_workers > 0 else False)
+    val_loader = torch.utils.data.DataLoader(
+        val_ds, batch_size=1, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False)
+    return train_loader, val_loader
