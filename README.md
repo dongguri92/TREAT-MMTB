@@ -35,6 +35,29 @@ therefore separated the two tasks entirely, transferring X-Raydar (trained on
 over 1.6M chest X-rays) and fine-tuning independent networks for detection and
 localization.
 
+### Representative results
+
+Internal validation (111 released cases):
+
+| Stage | System | Accuracy | Dice | Score |
+|---|---|---|---|---|
+| 0 | nnU-Net (plain, 5-fold) | 0.7658 | 0.2725 | 0.6178 |
+| 0 | Scratch multi-task U-Net + scale aug | 0.8378 | 0.2756 | 0.6692 |
+| 1 | EVA-X λ=0.5 + segmentation veto | 0.9189 | 0.3078 | 0.7356 |
+| 2 | 1024 px X-Raydar + U-Net | 0.9550 | 0.4300 | 0.7975 |
+| 2 | **Final classifier + mask ensemble** | 0.9369 | **0.4400** | 0.7879 |
+
+External set:
+
+| Stage | System | Detection | Dice | Final |
+|---|---|---|---|---|
+| 1 | EVA-X λ=0.5 + segmentation veto | 0.6713 | 0.1568 | 0.5170 |
+| 1 | EVA-X, classification-driven + percentile + TTA | 0.7089 | 0.1667 | 0.5463 |
+| 2 | **X-Raydar two-stage (final submission)** | **0.7631** | 0.1653 | **0.5838** |
+
+Detection improved steadily across stages, while Dice never transferred well —
+the whole leaderboard sat between 0.05 and 0.20 externally.
+
 ---
 
 ## Stage 1 — EVA-X with a classification-driven decision
@@ -71,7 +94,7 @@ empty mask would produce CSV=1 alongside an empty NIfTI. We use a threshold
 **relative to `p_max`** rather than an absolute one, because an absolute value
 tuned on the internal probability distribution does not transfer.
 
-### External progression
+### External progression within this stage
 
 | Submission | Detection | Dice | Final |
 |---|---|---|---|
@@ -124,21 +147,21 @@ upper percentile ranks, whose intensity interval is mapped to [0,1]. Public
 Shenzhen radiographs were added through a quality-controlled cache; Montgomery
 was excluded after mask inspection.
 
-### Internal progression
+### Development within this stage (internal)
 
 | Setting | Accuracy | Dice | Score |
 |---|---|---|---|
-| EVA-X, no mask veto | 0.8919 | 0.2995 | 0.7142 |
-| EVA-X, segmentation-confidence veto | 0.9189 | 0.3078 | 0.7356 |
 | 512 px X-Raydar + UPerNet | 0.9189 | 0.4148 | 0.7677 |
-| 1024 px X-Raydar + U-Net, global boundary | 0.9550 | 0.4300 | 0.7975 |
-| 1024 px X-Raydar + U-Net, CR/XC boundaries | 0.9550 | 0.4337 | 0.7986 |
+| 1024 px X-Raydar + U-Net | 0.9550 | 0.4300 | 0.7975 |
 | **Final temporal classifier + mask ensemble** | 0.9369 | **0.4400** | 0.7879 |
 
-Final classifier AUROC 0.9815 (52 TP, 52 TN, 1 FP, 6 FN at threshold 0.5).
-Ungated positive-case ensemble Dice was 0.4944; gated mean Dice 0.4400.
+Separating the two tasks lifted Dice from 0.31 to 0.41 immediately; moving to
+1024 px added another 0.02. The final system trades a little accuracy for the
+highest Dice, and its classifier reaches AUROC 0.9815 (52 TP, 52 TN, 1 FP,
+6 FN at threshold 0.5). Ungated positive-case ensemble Dice was 0.4944; gated
+mean Dice 0.4400.
 
-**External: 0.5838** (detection 0.7631, Dice 0.1653).
+**External: 0.5838** (detection 0.7631, Dice 0.1653) — our final submission.
 
 ---
 

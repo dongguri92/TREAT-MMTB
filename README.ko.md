@@ -31,6 +31,29 @@ model인 EVA-X로 전환했다.
 이동에서 두드러졌다. 두 과제를 완전히 분리하고, 160만 장 이상의 흉부
 X선으로 학습된 X-Raydar를 전이해 검출과 국소화를 별도 네트워크로 최적화했다.
 
+### 대표 결과
+
+Internal validation (공개된 111건):
+
+| 단계 | 시스템 | Accuracy | Dice | Score |
+|---|---|---|---|---|
+| 0 | nnU-Net (plain, 5-fold) | 0.7658 | 0.2725 | 0.6178 |
+| 0 | from-scratch multi-task U-Net + scale aug | 0.8378 | 0.2756 | 0.6692 |
+| 1 | EVA-X λ=0.5 + segmentation veto | 0.9189 | 0.3078 | 0.7356 |
+| 2 | 1024px X-Raydar + U-Net | 0.9550 | 0.4300 | 0.7975 |
+| 2 | **최종 분류기 + 마스크 앙상블** | 0.9369 | **0.4400** | 0.7879 |
+
+External set:
+
+| 단계 | 시스템 | Detection | Dice | Final |
+|---|---|---|---|---|
+| 1 | EVA-X λ=0.5 + segmentation veto | 0.6713 | 0.1568 | 0.5170 |
+| 1 | EVA-X, classification-driven + percentile + TTA | 0.7089 | 0.1667 | 0.5463 |
+| 2 | **X-Raydar 2단계 (최종 제출)** | **0.7631** | 0.1653 | **0.5838** |
+
+단계를 거치며 detection은 꾸준히 올랐지만 Dice는 끝내 잘 전이되지 않았다 —
+external에서는 리더보드 전체가 0.05~0.20 사이에 머물렀다.
+
 ---
 
 ## 1단계 — EVA-X + classification-driven 결정
@@ -67,7 +90,7 @@ cavity = 1 ⟺ 복원된 mask가 non-empty      (CSV/NIfTI 일관성 자동 보�
 이유는, 절대값이 internal 확률 분포에 맞춰진 값이라 external로 전이되지
 않기 때문이다.
 
-### External 진행
+### 이 단계 안에서의 External 진행
 
 | 제출 | detection | Dice | final |
 |---|---|---|---|
@@ -116,22 +139,21 @@ padding 값을 히스토그램에서 제외하며, presentation polarity를 한 
 강도 구간을 [0,1]로 매핑한다. 공개 Shenzhen 데이터를 품질 관리된 캐시로
 추가했고, Montgomery는 마스크 검토 후 제외했다.
 
-### Internal 진행
+### 이 단계 안에서의 개발 (internal)
 
 | 설정 | Accuracy | Dice | Score |
 |---|---|---|---|
-| EVA-X, veto 없음 | 0.8919 | 0.2995 | 0.7142 |
-| EVA-X, segmentation-confidence veto | 0.9189 | 0.3078 | 0.7356 |
 | 512px X-Raydar + UPerNet | 0.9189 | 0.4148 | 0.7677 |
-| 1024px X-Raydar + U-Net, 단일 경계 | 0.9550 | 0.4300 | 0.7975 |
-| 1024px X-Raydar + U-Net, CR/XC 경계 | 0.9550 | 0.4337 | 0.7986 |
+| 1024px X-Raydar + U-Net | 0.9550 | 0.4300 | 0.7975 |
 | **최종 temporal 분류기 + 마스크 앙상블** | 0.9369 | **0.4400** | 0.7879 |
 
-최종 분류기 AUROC 0.9815 (threshold 0.5에서 TP 52, TN 52, FP 1, FN 6).
+두 과제를 분리하자마자 Dice가 0.31에서 0.41로 올랐고, 1024px로 키우며 0.02가
+더 붙었다. 최종 시스템은 정확도를 조금 내주고 Dice를 최대로 가져간 구성이며,
+분류기는 AUROC 0.9815를 기록했다(threshold 0.5에서 TP 52, TN 52, FP 1, FN 6).
 분류기 gate 없이 양성 케이스만의 앙상블 Dice는 0.4944, gate 적용 후 평균
 Dice는 0.4400이었다.
 
-**External: 0.5838** (detection 0.7631, Dice 0.1653).
+**External: 0.5838** (detection 0.7631, Dice 0.1653) — 최종 제출본.
 
 ---
 
