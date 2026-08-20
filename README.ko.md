@@ -19,7 +19,7 @@ MICCAI TREAT-MMTB 2026 챌린지 Task 1 (흉부 X선에서 결핵성 공동(cavi
 |---|---|---|---|---|
 | 0 | from-scratch multi-task U-Net | 0.6692 | — | — |
 | 1 | EVA-X + classification-driven 결정 | 0.7356 | 0.5463 | [`evax_baseline/`](evax_baseline/) |
-| 2 | **X-Raydar 2단계 (최종)** | **0.7879** | **0.5838** | [`xraydar_two_stage/`](xraydar_two_stage/) |
+| 2 | **X-Raydar two-stage (최종)** | **0.7879** | **0.5838** | [`xraydar_two_stage/`](xraydar_two_stage/) |
 
 **0 → 1.** 세심하게 튜닝한 from-scratch 모델이 벽에 부딪혔다. 작고 고립된
 공동 몇 건이 아키텍처와 loss를 바꿔도 모델이 거의 반응 하지 못했고 이는
