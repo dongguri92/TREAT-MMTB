@@ -4,7 +4,11 @@ MICCAI TREAT-MMTB 2026 — Task 1 (Cavity Detection & Segmentation)
 
 `final = 0.7 × detection_accuracy + 0.3 × mean_Dice`
 
-**최종 순위: 7위** (external full set, 팀 최종 final score 0.5838)
+**최종 순위: 7위** (external full set, final score 0.5838)
+
+이 문서는 EVA-X 단계의 실험·실패 분석·통하지 않은 시도를 상세히 기록한다.
+최종 제출은 X-Raydar 2단계 시스템이며, 그 설계와 결과는
+[README.ko.md](README.ko.md)를 참조.
 
 ---
 
@@ -20,7 +24,8 @@ MICCAI TREAT-MMTB 2026 — Task 1 (Cavity Detection & Segmentation)
 | 4 | **+ horizontal-flip TTA (분류 헤드만)** | 0.7089 | 0.1667 | **0.5463** |
 | 5 | λ=0.7 (되돌림) | 0.6774 | 0.1674 | 0.5244 |
 
-3~4번이 본 저장소 코드의 최고 기록이다.
+3~4번이 EVA-X 시스템의 최고 기록이다. 최종 제출은 검출과 분할을 분리한
+X-Raydar 2단계 시스템으로 **0.5838**(detection 0.7631, Dice 0.1653)이었다.
 
 ### 관찰
 
