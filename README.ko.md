@@ -5,7 +5,7 @@ MICCAI TREAT-MMTB 2026 챌린지 Task 1 (흉부 X선에서 결핵성 공동(cavi
 
 평가 지표: `final = 0.7 × detection_accuracy + 0.3 × mean_Dice`
 
-**최종 순위 7위.** 상세한 실험 기록·실패 분석·negative results는
+**최종 순위 6위.** 상세한 실험 기록·실패 분석·negative results는
 [RESULTS.ko.md](RESULTS.ko.md) 참조. ([English](README.md))
 
 ---
@@ -298,7 +298,3 @@ DICOM VOI window, 강한 augmentation** 모두 개선을 주지 못했다.
   journal={The Lancet Digital Health}, volume={6}, pages={e44--e57}, year={2024}
 }
 ```
-
-- EVA-X: https://github.com/hustvl/EVA-X
-- X-Raydar: https://github.com/MachineLearningWarwickMed/x-raydar
-- 챌린지: https://github.com/mi2rl-challenge/treat-mmtb.miccai2026

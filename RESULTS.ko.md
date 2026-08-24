@@ -4,10 +4,10 @@ MICCAI TREAT-MMTB 2026 — Task 1 (Cavity Detection & Segmentation)
 
 `final = 0.7 × detection_accuracy + 0.3 × mean_Dice`
 
-**최종 순위: 7위** (external full set, final score 0.5838)
+**최종 순위: 6위** (external full set, final score 0.5838)
 
 이 문서는 EVA-X 단계의 실험·실패 분석·통하지 않은 시도를 상세히 기록한다.
-최종 제출은 X-Raydar 2단계 시스템이며, 그 설계와 결과는
+최종 제출은 X-Raydar two stage 시스템이며, 그 설계와 결과는
 [README.ko.md](README.ko.md)를 참조.
 
 ---
@@ -101,7 +101,7 @@ present 아님                                -> mask = empty
 cavity = 1  ⟺  복원된 mask가 non-empty      (CSV/NIfTI 일관성 자동 보장)
 ```
 
-`P`는 전경 확률맵, `p_max = max P`.
+`P`는 foreground 확률맵, `p_max = max P`.
 
 두 번째 분기가 필요한 이유: 분류기가 양성이라 판정했는데 segmentation이
 threshold 0.5를 넘기지 못하면 CSV=1 / mask=empty가 되어 규칙 위반이다.

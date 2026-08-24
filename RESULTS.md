@@ -4,7 +4,7 @@ MICCAI TREAT-MMTB 2026 — Task 1 (Cavity Detection & Segmentation)
 
 `final = 0.7 × detection_accuracy + 0.3 × mean_Dice`
 
-**Final rank: 7th** (external full set, final score 0.5838)
+**Final rank: 6th** (external full set, final score 0.5838)
 
 This document records the EVA-X stage in detail — the experiments, the failure
 analysis, and what did not work. The final submission was the X-Raydar

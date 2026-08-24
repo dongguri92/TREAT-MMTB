@@ -6,7 +6,7 @@ radiographs.
 
 Metric: `final = 0.7 × detection_accuracy + 0.3 × mean_Dice`
 
-**Final rank: 7th.** Full experiment log, failure analysis, and negative
+**Final rank: 6th.** Full experiment log, failure analysis, and negative
 results are in [RESULTS.md](RESULTS.md). ([한국어 문서](README.ko.md))
 
 ---
@@ -310,7 +310,3 @@ Stage 2.
   journal={The Lancet Digital Health}, volume={6}, pages={e44--e57}, year={2024}
 }
 ```
-
-- EVA-X: https://github.com/hustvl/EVA-X
-- X-Raydar: https://github.com/MachineLearningWarwickMed/x-raydar
-- Challenge: https://github.com/mi2rl-challenge/treat-mmtb.miccai2026
