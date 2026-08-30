@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import shutil
@@ -55,6 +56,9 @@ MPS_LOCK_PATH = REPO_ROOT / "requirements-reproduction-mps.lock"
 ISSUE_URL = "https://github.com/choco9966/TREAT-MMTB-2026/issues/106"
 PARENT_ISSUE_URL = "https://github.com/choco9966/TREAT-MMTB-2026/issues/95"
 EPOCHS = 5
+PHASE = "health"
+WANDB_GROUP = "task1-teammate-l05-veto-mps-health"
+WANDB_JOB_TYPE = "reviewed-mps-health"
 TARGET_SIZE = 1024
 PHYSICAL_BATCH_SIZE = 1
 GRADIENT_ACCUMULATION_STEPS = 8
@@ -89,6 +93,15 @@ class RunInterrupted(KeyboardInterrupt):
         super().__init__(f"run interrupted by {self.signal_name}")
 
 
+def _write_bytes_once(path: Path, data: bytes) -> None:
+    if not isinstance(data, bytes):
+        raise TypeError("write-once artifact must be exact bytes")
+    with path.open("xb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def _install_interrupt_handlers() -> dict[signal.Signals, Any]:
     if threading.current_thread() is not threading.main_thread():
         raise RuntimeError("MPS reproduction must run in the main thread")
@@ -120,7 +133,7 @@ def _set_seed(seed: int) -> None:
 
 def mps_protocol_contract() -> dict[str, Any]:
     return {
-        "phase": "health",
+        "phase": PHASE,
         "epochs": EPOCHS,
         "execution_family": "apple_mps_resource_adjusted",
         "historical_cuda_equivalence_claimed": False,
@@ -145,6 +158,17 @@ def mps_protocol_contract() -> dict[str, Any]:
         "crop_frac": 0.15,
         "clahe_clip": 2.0,
         "seed": 42,
+        "augmentation_rng": {
+            "library": "albumentations",
+            "version": "2.0.8",
+            "geometric_compose_seed": (
+                42 + datasets.GEOMETRIC_AUGMENTATION_SEED_OFFSET
+            ),
+            "intensity_compose_seed": (
+                42 + datasets.INTENSITY_AUGMENTATION_SEED_OFFSET
+            ),
+            "continuation_state": "recursive_compose_and_child_generators",
+        },
         "checkpoint_selection": "max_0.7_accuracy_plus_0.3_dice",
         "validation_space": "native",
         "feasibility": {
@@ -363,7 +387,11 @@ def _build_config(
             "id": args.attempt_id,
             "name": args.wandb_run_name,
             "resume": "never",
+            "group": WANDB_GROUP,
+            "job_type": WANDB_JOB_TYPE,
         },
+        "execution_receipt_sha256": getattr(args, "execution_receipt_sha256", None),
+        "execution_approval_sha256": getattr(args, "execution_approval_sha256", None),
         "external_final_isolation": {
             "dataset_scope": DATASET_SCOPE,
             "canonical_bytes_verified": True,
@@ -421,8 +449,8 @@ def _start_wandb(config: dict[str, Any]) -> Any:
         name=config["wandb"]["name"],
         mode="online",
         resume="never",
-        group="task1-teammate-l05-veto-mps-health",
-        job_type="reviewed-mps-health",
+        group=WANDB_GROUP,
+        job_type=WANDB_JOB_TYPE,
         config=public_config,
     )
     run.define_metric("train/micro_step")
@@ -432,6 +460,35 @@ def _start_wandb(config: dict[str, Any]) -> Any:
     run.define_metric("epoch")
     run.define_metric("epoch/*", step_metric="epoch")
     return run
+
+
+def _verify_wandb_completion(config: dict[str, Any], run_url: str) -> dict[str, Any]:
+    import wandb
+
+    expected_path = f"{WANDB_ENTITY}/{WANDB_PROJECT}/{config['attempt_id']}"
+    remote = wandb.Api().run(expected_path)
+    expected = config["wandb"]
+    if (
+        str(remote.state) != "finished"
+        or str(remote.id) != expected["id"]
+        or str(remote.name) != expected["name"]
+        or str(remote.group) != expected["group"]
+        or str(remote.job_type) != expected["job_type"]
+        or str(remote.url) != str(run_url)
+    ):
+        raise RuntimeError("W&B API completion identity differs from sealed contract")
+    return {
+        "state": "finished",
+        "identity_verified": True,
+        "verification": "wandb_api_post_finish",
+        "entity": WANDB_ENTITY,
+        "project": WANDB_PROJECT,
+        "id": expected["id"],
+        "name": expected["name"],
+        "group": expected["group"],
+        "job_type": expected["job_type"],
+        "url": run_url,
+    }
 
 
 def _validate_mps_epochs(epochs: list[dict[str, Any]]) -> None:
@@ -450,7 +507,7 @@ def _seal_resource_failure(
     index = {
         "schema_version": 1,
         "attempt_id": args.attempt_id,
-        "phase": "health",
+        "phase": PHASE,
         "status": "resource_infeasible",
         "resource_evidence_sha256": sha256_file(
             artifact_dir / "resource_evidence.json"
@@ -477,7 +534,7 @@ def _safe_failure(
         receipt: dict[str, Any] = {
             "schema_version": 1,
             "attempt_id": args.attempt_id,
-            "phase": "health",
+            "phase": PHASE,
             "status": "failed",
             "stage": stage,
             "error_type": type(error).__name__,
@@ -505,7 +562,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not args.execute:
         return {
             "status": "dry_run",
-            "phase": "health",
+            "phase": PHASE,
             "epochs": EPOCHS,
             "attempt_id": args.attempt_id,
             "protocol": mps_protocol_contract(),
@@ -515,6 +572,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--execute requires a non-empty --reviewed-by attestation")
 
     artifact_dir.mkdir(parents=True, exist_ok=False)
+    execution_approval_bytes = getattr(args, "execution_approval_bytes", None)
+    if execution_approval_bytes is not None:
+        _write_bytes_once(
+            artifact_dir / "queue_approval.json", execution_approval_bytes
+        )
     wandb_run: Any = None
     stage = "source_identity"
     previous_handlers = _install_interrupt_handlers()
@@ -671,6 +733,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
         )
 
+        continuation = details.pop("continuation_state", None)
+        if PHASE == "convergence_50e":
+            if not isinstance(continuation, dict):
+                raise TypeError("convergence lacks exact-final continuation state")
+            torch.save(continuation, artifact_dir / "continuation_epoch_50.pth")
+
         stage = "artifact_finalization"
         epochs = details["epochs"]
         _validate_mps_epochs(epochs)
@@ -703,7 +771,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "issue_url": ISSUE_URL,
             "parent_issue_url": PARENT_ISSUE_URL,
             "attempt_id": args.attempt_id,
-            "phase": "health",
+            "phase": PHASE,
             "execution_family": "apple_mps_resource_adjusted",
             "historical_cuda_equivalence_claimed": False,
             "dataset_scope": DATASET_SCOPE,
@@ -730,6 +798,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             or str(wandb_run.id) != args.attempt_id
             or str(wandb_run.entity) != WANDB_ENTITY
             or str(wandb_run.project) != WANDB_PROJECT
+            or config["wandb"]["name"] != args.wandb_run_name
+            or config["wandb"]["group"] != WANDB_GROUP
+            or config["wandb"]["job_type"] != WANDB_JOB_TYPE
         ):
             raise RuntimeError("W&B identity differs from sealed MPS contract")
         for name, value in score["metrics"].items():
@@ -743,12 +814,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ]
         wandb_run.finish()
         wandb_run = None
+        wandb_completion = (
+            _verify_wandb_completion(config, str(run_url))
+            if getattr(args, "require_wandb_completion_verification", False)
+            else {
+                "state": "finished",
+                "identity_verified": True,
+                "verification": "local_finish_only",
+                "entity": WANDB_ENTITY,
+                "project": WANDB_PROJECT,
+                "id": args.attempt_id,
+                "name": args.wandb_run_name,
+                "group": WANDB_GROUP,
+                "job_type": WANDB_JOB_TYPE,
+                "url": run_url,
+            }
+        )
         run_record = {
             "schema_version": 1,
             "issue_url": ISSUE_URL,
             "parent_issue_url": PARENT_ISSUE_URL,
             "attempt_id": args.attempt_id,
-            "phase": "health",
+            "phase": PHASE,
             "execution_family": "apple_mps_resource_adjusted",
             "historical_cuda_equivalence_claimed": False,
             "status": "completed",
@@ -767,18 +854,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "resource_evidence_sha256": resource_sha256,
             "wandb_finished": True,
             "wandb": {**config["wandb"], "url": run_url},
+            "wandb_completion": wandb_completion,
+            "execution_receipt_sha256": getattr(args, "execution_receipt_sha256", None),
+            "execution_approval_sha256": getattr(
+                args, "execution_approval_sha256", None
+            ),
             "artifacts": list(MPS_ARTIFACT_NAMES),
         }
         write_json_once(artifact_dir / "run_record.json", run_record)
         artifact_index = {
             "schema_version": 1,
             "attempt_id": args.attempt_id,
-            "phase": "health",
+            "phase": PHASE,
             "execution_family": "apple_mps_resource_adjusted",
             "status": "completed",
             "artifacts": {
-                name: sha256_file(artifact_dir / name)
-                for name in MPS_ARTIFACT_NAMES
+                name: sha256_file(artifact_dir / name) for name in MPS_ARTIFACT_NAMES
             },
         }
         write_json_once(artifact_dir / "artifact_index.json", artifact_index)
