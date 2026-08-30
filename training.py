@@ -103,9 +103,131 @@ def _seg_loss_on_output(seg_output, target, seg_loss_fn) -> torch.Tensor:
     return seg_loss_fn(seg_output, target)
 
 
+def accumulated_train_step(
+    model,
+    batches,
+    optimizer,
+    seg_loss_fn,
+    lambda_cls,
+    device,
+    scaler=None,
+    use_amp=True,
+    critical_memory_observer=None,
+    critical_memory_context=None,
+    stage_callback=None,
+    accumulation=None,
+    batch_observer=None,
+    group_validator=None,
+):
+    """Run one historical attempt-4 accumulated optimizer sequence."""
+    if accumulation is None:
+        accumulation = len(batches)
+    if accumulation < 1:
+        raise ValueError("accumulated step requires at least one microbatch")
+    bce = torch.nn.BCEWithLogitsLoss()
+    rows = []
+    deferred_last = None
+
+    def materialize_row(values):
+        total, segmentation, classification = values
+        total_value = float(total.item())
+        # Preserve attempt-4's W&B-backed scalar schedule exactly: the total
+        # loss was materialized once for history and twice for batch/total logs.
+        float(total.item())
+        float(total.item())
+        return {
+            'loss': total_value,
+            'segmentation_loss': float(segmentation.item()),
+            'classification_loss': float(classification.item()),
+        }
+    iterator = iter(batches)
+    for microbatch_index in range(accumulation):
+        batch = next(iterator)
+        if batch_observer is not None:
+            batch_observer(batch, microbatch_index)
+        img = batch['image'].to(device, non_blocking=True)
+        mask = batch['mask'].to(device, non_blocking=True)
+        cls = batch['cls'].to(device, non_blocking=True)
+        with autocast(device.type, enabled=use_amp) if device.type == 'cuda' else _nullctx():
+            model.return_cls = True
+            if stage_callback is not None:
+                stage_callback("forward")
+            seg_out, cls_logit = model(img)
+            if stage_callback is not None:
+                stage_callback("loss")
+            l_seg = _seg_loss_on_output(seg_out, mask, seg_loss_fn)
+            l_cls = bce(cls_logit, cls)
+            loss = l_seg + lambda_cls * l_cls
+            backward_loss = loss / accumulation
+        if scaler is not None:
+            if stage_callback is not None:
+                stage_callback("backward")
+            scaler.scale(backward_loss).backward()
+        else:
+            if stage_callback is not None:
+                stage_callback("backward")
+            backward_loss.backward()
+        detached = (loss.detach(), l_seg.detach(), l_cls.detach())
+        if microbatch_index < accumulation - 1:
+            if stage_callback is not None:
+                stage_callback("scalar_materialization_between_microbatches")
+            rows.append(materialize_row(detached))
+        else:
+            deferred_last = detached
+
+    if group_validator is not None:
+        group_validator()
+
+    if stage_callback is not None:
+        stage_callback("critical_memory")
+    critical_memory = None
+    if critical_memory_observer is not None:
+        critical_memory = (
+            critical_memory_observer(critical_memory_context)
+            if critical_memory_context is not None
+            else critical_memory_observer()
+        )
+    if stage_callback is not None:
+        stage_callback("gradient_clip")
+    if scaler is not None:
+        scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 12)
+    if scaler is not None:
+        if stage_callback is not None:
+            stage_callback("optimizer_step")
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        if stage_callback is not None:
+            stage_callback("optimizer_step")
+        optimizer.step()
+    if stage_callback is not None:
+        stage_callback("optimizer_zero_grad_after")
+    optimizer.zero_grad(set_to_none=True)
+
+    if stage_callback is not None:
+        stage_callback("scalar_materialization")
+    if deferred_last is None:
+        raise RuntimeError("accumulated step did not produce a final microbatch")
+    rows.append(materialize_row(deferred_last))
+    if not all(
+        math.isfinite(value)
+        for row in rows
+        for value in row.values()
+    ):
+        raise FloatingPointError("accumulated optimizer step produced non-finite values")
+    return {
+        'microbatches': rows,
+        'critical_memory': critical_memory,
+    }
+
+
 def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
                     device, scaler, use_amp=True, wandb_run=None,
-                    epoch=0, global_step=0, gradient_accumulation_steps=1):
+                    epoch=0, global_step=0, gradient_accumulation_steps=1,
+                    progress_callback=None, critical_memory_observer=None,
+                    first_group_batch_observer=None,
+                    first_group_validator=None):
     if gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be positive")
     usable_micro_steps = (
@@ -115,128 +237,170 @@ def train_one_epoch(model, loader, optimizer, seg_loss_fn, lambda_cls,
         raise ValueError("loader cannot provide one complete effective batch")
     model.train()
     losses = []
-    bce = torch.nn.BCEWithLogitsLoss()
+    iterator = iter(loader)
     optimizer.zero_grad(set_to_none=True)
-    for batch_index, batch in enumerate(loader):
-        if batch_index >= usable_micro_steps:
-            break
-        img = batch['image'].to(device, non_blocking=True)
-        mask = batch['mask'].to(device, non_blocking=True)
-        cls = batch['cls'].to(device, non_blocking=True)
-
-        with autocast(device.type, enabled=use_amp) if device.type == 'cuda' else _nullctx():
-            model.return_cls = True
-            seg_out, cls_logit = model(img)
-            l_seg = _seg_loss_on_output(seg_out, mask, seg_loss_fn)
-            l_cls = bce(cls_logit, cls)
-            loss = l_seg + lambda_cls * l_cls
-            backward_loss = loss / gradient_accumulation_steps
-
-        if scaler is not None:
-            scaler.scale(backward_loss).backward()
-        else:
-            backward_loss.backward()
-
-        optimizer_step_completed = (
-            (batch_index + 1) % gradient_accumulation_steps == 0
+    for group_start in range(0, usable_micro_steps, gradient_accumulation_steps):
+        batches = (
+            next(iterator) for _ in range(gradient_accumulation_steps)
         )
-        if optimizer_step_completed:
-            if scaler is not None:
-                scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 12)
-            if scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            global_step += 1
-
-        losses.append(loss.item())
-        if wandb_run is not None:
-            step_log = {
-                'train/global_step': global_step,
-                'train/micro_step': epoch * usable_micro_steps + batch_index + 1,
-                'train/epoch': epoch + 1,
-                'train/batch_loss': loss.item(),
-                'train/total_loss': loss.item(),
-                'train/segmentation_loss': l_seg.item(),
-                'train/classification_loss': l_cls.item(),
-                'train/optimizer_step_completed': optimizer_step_completed,
-                'train/gradient_accumulation_steps': gradient_accumulation_steps,
-                'train/learning_rate': optimizer.param_groups[0]['lr'],
-            }
-            step_log.update({
-                f'train/learning_rate_group_{index}': group['lr']
-                for index, group in enumerate(optimizer.param_groups)
-            })
-            wandb_run.log(step_log)
+        step = accumulated_train_step(
+            model,
+            batches,
+            optimizer,
+            seg_loss_fn,
+            lambda_cls,
+            device,
+            scaler=scaler,
+            use_amp=use_amp,
+            critical_memory_observer=critical_memory_observer,
+            critical_memory_context={
+                'epoch': epoch + 1,
+                'optimizer_step_in_epoch': (
+                    group_start // gradient_accumulation_steps + 1
+                ),
+                'global_optimizer_step': global_step + 1,
+            },
+            accumulation=gradient_accumulation_steps,
+            batch_observer=(
+                first_group_batch_observer if group_start == 0 else None
+            ),
+            group_validator=(
+                first_group_validator if group_start == 0 else None
+            ),
+        )
+        global_step += 1
+        for offset, row in enumerate(step['microbatches']):
+            batch_index = group_start + offset
+            losses.append(row['loss'])
+            optimizer_step_completed = offset == gradient_accumulation_steps - 1
+            if wandb_run is not None:
+                step_log = {
+                    'train/global_step': global_step,
+                    'train/micro_step': epoch * usable_micro_steps + batch_index + 1,
+                    'train/epoch': epoch + 1,
+                    'train/batch_loss': row['loss'],
+                    'train/total_loss': row['loss'],
+                    'train/segmentation_loss': row['segmentation_loss'],
+                    'train/classification_loss': row['classification_loss'],
+                    'train/optimizer_step_completed': optimizer_step_completed,
+                    'train/gradient_accumulation_steps': gradient_accumulation_steps,
+                    'train/learning_rate': optimizer.param_groups[0]['lr'],
+                }
+                step_log.update({
+                    f'train/learning_rate_group_{index}': group['lr']
+                    for index, group in enumerate(optimizer.param_groups)
+                })
+                wandb_run.log(step_log)
+            if progress_callback is not None:
+                progress_callback({
+                    'phase': 'scientific_train',
+                    'epoch': epoch + 1,
+                    'micro_step': batch_index + 1,
+                    'optimizer_step': global_step,
+                    'optimizer_step_completed': optimizer_step_completed,
+                })
     return float(np.mean(losses)), global_step
+
+
+def validation_step(model, batch, seg_loss_fn, lambda_cls, device,
+                    use_amp=True, materialize_log_loss=False,
+                    native_case_materialization=False, stage_callback=None):
+    """Execute the scientific validation tensor/host boundary for one batch."""
+    bce = torch.nn.BCEWithLogitsLoss()
+    if stage_callback is not None:
+        stage_callback('device_transfers')
+    img = batch['image'].to(device, non_blocking=True)
+    mask = batch['mask'].to(device, non_blocking=True)
+    cls = batch['cls'].to(device, non_blocking=True)
+    with autocast(device.type, enabled=use_amp) if device.type == 'cuda' else _nullctx():
+        model.return_cls = True
+        if stage_callback is not None:
+            stage_callback('forward')
+        seg_out, cls_logit = model(img)
+        seg_main = seg_out[0] if isinstance(seg_out, (list, tuple)) else seg_out
+        l_seg = seg_loss_fn(seg_main, mask)
+        l_cls = bce(cls_logit, cls)
+        loss = l_seg + lambda_cls * l_cls
+    if stage_callback is not None:
+        stage_callback('loss_item')
+    loss_value = loss.item()
+    log_loss_value = None
+    if materialize_log_loss:
+        if stage_callback is not None:
+            stage_callback('log_loss_item')
+        log_loss_value = loss.item()
+    if stage_callback is not None:
+        stage_callback('prepared_masks_cpu')
+    pred = seg_main.argmax(1).cpu().numpy()
+    gt = mask.squeeze(1).cpu().numpy()
+    dices = [dice_metric(pred[index], gt[index]) for index in range(pred.shape[0])]
+    cls_pred = (torch.sigmoid(cls_logit) > 0.5).float()
+    if stage_callback is not None:
+        stage_callback('classification_sum_item')
+    cls_correct = (cls_pred == cls).sum().item()
+    cls_total = cls.numel()
+    native_cases = []
+    if native_case_materialization:
+        from reproduction import native_case_record
+
+        required = {'id', 'native_mask', 'native_shape', 'crop_shape', 'pad_info'}
+        missing_fields = sorted(required - set(batch))
+        if missing_fields:
+            raise ValueError(f"native validation metadata missing: {missing_fields}")
+        if stage_callback is not None:
+            stage_callback('probabilities_cpu')
+        fg_prob = torch.softmax(seg_main, dim=1)[:, 1].cpu().numpy()
+        cls_prob = torch.sigmoid(cls_logit).flatten().cpu().numpy()
+        for index, case_id in enumerate(batch['id']):
+            if stage_callback is not None:
+                stage_callback('native_metadata_cpu')
+            native_cases.append(native_case_record(
+                case_id=case_id,
+                foreground_probability=fg_prob[index],
+                cls_probability=cls_prob[index],
+                native_mask=batch['native_mask'][index].cpu().numpy(),
+                pad_info=batch['pad_info'][index].cpu().numpy(),
+                crop_shape=batch['crop_shape'][index].cpu().numpy(),
+                native_shape=batch['native_shape'][index].cpu().numpy(),
+            ))
+    return {
+        'loss': loss_value, 'log_loss': log_loss_value, 'dices': dices,
+        'cls_correct': cls_correct, 'cls_total': cls_total,
+        'native_cases': native_cases,
+    }
 
 
 @torch.no_grad()
 def validate(model, loader, seg_loss_fn, lambda_cls, device, use_amp=True,
-             wandb_run=None, epoch=0, native_combo_expected_ids=None):
+             wandb_run=None, epoch=0, native_combo_expected_ids=None,
+             progress_callback=None):
     model.eval()
     dices, cls_correct, cls_total = [], 0, 0
     native_cases = []
-    bce = torch.nn.BCEWithLogitsLoss()
     val_losses = []
     for batch_index, batch in enumerate(loader):
-        img = batch['image'].to(device, non_blocking=True)
-        mask = batch['mask'].to(device, non_blocking=True)
-        cls = batch['cls'].to(device, non_blocking=True)
-
-        with autocast(device.type, enabled=use_amp) if device.type == 'cuda' else _nullctx():
-            model.return_cls = True
-            seg_out, cls_logit = model(img)
-            seg_main = seg_out[0] if isinstance(seg_out, (list, tuple)) else seg_out
-            l_seg = seg_loss_fn(seg_main, mask)
-            l_cls = bce(cls_logit, cls)
-            loss = l_seg + lambda_cls * l_cls
-        val_losses.append(loss.item())
+        row = validation_step(
+            model, batch, seg_loss_fn, lambda_cls, device, use_amp=use_amp,
+            materialize_log_loss=wandb_run is not None,
+            native_case_materialization=native_combo_expected_ids is not None,
+        )
+        val_losses.append(row['loss'])
         if wandb_run is not None:
             wandb_run.log({
                 'validation/global_step': epoch * len(loader) + batch_index + 1,
                 'validation/epoch': epoch + 1,
-                'validation/batch_loss': loss.item(),
+                'validation/batch_loss': row['log_loss'],
             })
-
-        # per-sample dice
-        pred = seg_main.argmax(1).cpu().numpy()        # (B, H, W)
-        gt = mask.squeeze(1).cpu().numpy()
-        for b in range(pred.shape[0]):
-            d = dice_metric(pred[b], gt[b])
-            dices.append(d)
-
-        # cls accuracy
-        cls_pred = (torch.sigmoid(cls_logit) > 0.5).float()
-        cls_correct += (cls_pred == cls).sum().item()
-        cls_total += cls.numel()
-
-        if native_combo_expected_ids is not None:
-            from reproduction import native_case_record
-
-            required = {
-                'id', 'native_mask', 'native_shape', 'crop_shape', 'pad_info'
-            }
-            missing_fields = sorted(required - set(batch))
-            if missing_fields:
-                raise ValueError(
-                    f"native validation metadata missing: {missing_fields}"
-                )
-            fg_prob = torch.softmax(seg_main, dim=1)[:, 1].cpu().numpy()
-            cls_prob = torch.sigmoid(cls_logit).flatten().cpu().numpy()
-            for index, case_id in enumerate(batch['id']):
-                native_cases.append(native_case_record(
-                    case_id=case_id,
-                    foreground_probability=fg_prob[index],
-                    cls_probability=cls_prob[index],
-                    native_mask=batch['native_mask'][index].cpu().numpy(),
-                    pad_info=batch['pad_info'][index].cpu().numpy(),
-                    crop_shape=batch['crop_shape'][index].cpu().numpy(),
-                    native_shape=batch['native_shape'][index].cpu().numpy(),
-                ))
+        dices.extend(row['dices'])
+        cls_correct += row['cls_correct']
+        cls_total += row['cls_total']
+        native_cases.extend(row['native_cases'])
+        if progress_callback is not None:
+            progress_callback({
+                'phase': 'scientific_validation',
+                'epoch': epoch + 1,
+                'validation_step': batch_index + 1,
+            })
 
     mean_dice = float(np.nanmean(dices)) if len(dices) else 0.0
     cls_acc = cls_correct / max(cls_total, 1)
@@ -261,7 +425,9 @@ def fit(model, train_loader, val_loader, device,
         patience=None, batch_dice=True, optimizer_name='sgd',
         scheduler='poly', warmup_epochs=0, loss_name='dicece',
         wandb_run=None, reproduction_expected_ids=None,
-        return_details=False, gradient_accumulation_steps=1):
+        return_details=False, gradient_accumulation_steps=1,
+        progress_callback=None, critical_memory_observer=None,
+        first_group_batch_observer=None, first_group_validator=None):
 
     optimizer = make_optimizer(model, initial_lr=initial_lr,
                                optimizer_name=optimizer_name)
@@ -297,12 +463,21 @@ def fit(model, train_loader, val_loader, device,
             model, train_loader, optimizer, seg_loss_fn,
             lambda_cls, device, scaler, wandb_run=wandb_run,
             epoch=epoch, global_step=global_step,
-            gradient_accumulation_steps=gradient_accumulation_steps)
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            progress_callback=progress_callback,
+            critical_memory_observer=critical_memory_observer,
+            first_group_batch_observer=(
+                first_group_batch_observer if epoch == 0 else None
+            ),
+            first_group_validator=(
+                first_group_validator if epoch == 0 else None
+            ))
         validation_started = time.perf_counter()
         val_loss, val_dice, val_acc, native_metrics = validate(
             model, val_loader, seg_loss_fn, lambda_cls, device,
             wandb_run=wandb_run, epoch=epoch,
-            native_combo_expected_ids=reproduction_expected_ids)
+            native_combo_expected_ids=reproduction_expected_ids,
+            progress_callback=progress_callback)
         if native_metrics is not None:
             val_dice = native_metrics['dice']
             val_acc = native_metrics['classification_accuracy']

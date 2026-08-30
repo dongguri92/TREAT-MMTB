@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "allocator": {
+    "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "1.0",
+    "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.9"
+  },
+  "host": {
+    "hostname_sha256": "b950904039413ed8710e09580ccda72a3c981655929d46f3722c284307bd265b",
+    "machine": "arm64",
+    "model": "Macmini9,1",
+    "os_product_version": "15.5",
+    "physical_memory_bytes": 17179869184,
+    "system": "Darwin"
+  },
+  "memory": {
+    "minimum_headroom_ratio": 0.1
+  },
+  "approval": {
+    "github_repository": "dongguri92/TREAT-MMTB",
+    "allowed_reviewers": ["dongguri92"],
+    "required_author_associations": ["OWNER", "MEMBER"],
+    "body_marker": "TREAT_MMTB_SOAK_APPROVAL_V1"
+  },
+  "watchdog": {
+    "progress_timeout_seconds": 1800,
+    "sigterm_grace_seconds": 120,
+    "sample_seconds": 10
+  },
+  "workers": {
+    "num_workers": 0,
+    "persistent_workers": false
+  }
+}

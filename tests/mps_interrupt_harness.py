@@ -55,6 +55,17 @@ def main() -> int:
         "train": [f"train-{index}" for index in range(444)],
         "validation": [f"validation-{index}" for index in range(111)],
     }
+    gate_dir = artifact_root / "interrupt-test-resource-gate"
+    gate_dir.mkdir(parents=True)
+    (gate_dir / "resource_evidence.json").write_text(
+        '{"status":"passed"}\n', encoding="utf-8"
+    )
+    (gate_dir / "acceptance_soak_heartbeat.jsonl").write_text(
+        '{"phase":"passed"}\n', encoding="utf-8"
+    )
+    gate_receipt = artifact_root / "supervisor_receipt.json"
+    gate_receipt.parent.mkdir(parents=True, exist_ok=True)
+    gate_receipt.write_text('{"status":"completed"}\n', encoding="utf-8")
     mps.source_identity = lambda _root: {  # type: ignore[assignment]
         "git_commit": "commit",
         "git_tree_sha1": "tree",
@@ -85,6 +96,22 @@ def main() -> int:
         "mps_available": True,
         "mps_cpu_fallback": False,
     }
+    mps.validate_mps_allocator_environment = lambda: {  # type: ignore[assignment]
+        "values": {
+            "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.9",
+            "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "1.0",
+        },
+        "set_before_mps_runtime_validation": True,
+        "sha256": "allocator",
+    }
+    approval = {
+        "review_url": "https://github.com/dongguri92/TREAT-MMTB/pull/5#issuecomment-1",
+        "approval_sha256": "a" * 64,
+    }
+    mps._validate_bootstrap_proof = lambda _role: {  # type: ignore[assignment]
+        "proof_sha256": "bootstrap", "soak_approval": approval
+    }
+    mps.verify_scientific_approval = lambda *_args, **_kwargs: approval  # type: ignore[assignment]
     mps.datasets.dataloader = lambda **_kwargs: (  # type: ignore[assignment]
         SizedLoader(444),
         SizedLoader(111),
@@ -93,10 +120,22 @@ def main() -> int:
         identity,
         "identity-hash",
     )
-    mps._mps_feasibility_probe = lambda *_args: {  # type: ignore[assignment]
+    mps._load_resource_gate = lambda *_args: (  # type: ignore[assignment]
+        {
+            "status": "passed",
+            "acceptance_soak": {"loader_start_fingerprint": "sealed-start"},
+        },
+        "resource-gate-receipt-hash",
+    )
+    mps._loader_start_fingerprint = lambda _loader: "sealed-start"  # type: ignore[assignment]
+    mps._cleanup_mps_boundary = lambda: {  # type: ignore[assignment]
         "status": "passed",
-        "finite_loss": True,
+        "gc_collected": True,
+        "empty_cache_completed": True,
+        "synchronize_completed": True,
     }
+    mps.torch.mps.empty_cache = lambda: None  # type: ignore[method-assign]
+    mps.torch.mps.synchronize = lambda: None  # type: ignore[method-assign]
     mps.modeltype = lambda *_args, **_kwargs: Model()  # type: ignore[assignment]
     mps._start_wandb = lambda _config: WandbRun(  # type: ignore[assignment]
         ready_path, finish_path
@@ -131,6 +170,9 @@ def main() -> int:
         "--execute",
         "--reviewed-by",
         "interrupt-regression",
+        "--resource-gate-receipt",
+        str(gate_receipt),
+        "--internal-worker",
     ]
     previous = {
         signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGINT)
@@ -138,7 +180,10 @@ def main() -> int:
     try:
         mps.run(mps.parse_args(cli))
     except mps.RunInterrupted:
-        if all(signal.getsignal(signum) == handler for signum, handler in previous.items()):
+        if all(
+            signal.getsignal(signum) == handler
+            for signum, handler in previous.items()
+        ):
             restored_path.write_text("restored\n", encoding="utf-8")
         return 1
     return 2

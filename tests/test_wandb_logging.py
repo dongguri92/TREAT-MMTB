@@ -72,6 +72,7 @@ class FakeRun:
 def test_fit_logs_train_validation_and_epoch_metrics(tmp_path: Path):
     run = FakeRun()
     loader = DataLoader(TinyDataset(), batch_size=2)
+    progress = []
 
     fit(
         TinyModel(),
@@ -83,6 +84,7 @@ def test_fit_logs_train_validation_and_epoch_metrics(tmp_path: Path):
         ckpt_path=str(tmp_path / "best.pth"),
         optimizer_name="sgd",
         wandb_run=run,
+        progress_callback=progress.append,
     )
 
     assert sum("train/batch_loss" in row for row in run.rows) == 2
@@ -93,6 +95,12 @@ def test_fit_logs_train_validation_and_epoch_metrics(tmp_path: Path):
     assert epoch_rows[0]["epoch/optimizer_steps"] == 2
     assert epoch_rows[0]["epoch/completed_train_steps"] == 2
     assert run.summary["best/epoch"] == 1
+    assert [row["phase"] for row in progress] == [
+        "scientific_train",
+        "scientific_train",
+        "scientific_validation",
+        "scientific_validation",
+    ]
 
 
 def test_fit_accumulates_exact_effective_batches_and_logs_loss_components(

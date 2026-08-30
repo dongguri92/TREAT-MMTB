@@ -63,6 +63,10 @@ EXPECTED_MPS_PLATFORM_SYSTEM = "Darwin"
 EXPECTED_MPS_PLATFORM_MACHINE = "arm64"
 EXPECTED_MPS_TORCH_VERSION = "2.13.0"
 EXPECTED_MPS_TORCHVISION_VERSION = "0.28.0"
+EXPECTED_MPS_ALLOCATOR_ENVIRONMENT = {
+    "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.9",
+    "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "1.0",
+}
 EXPECTED_PRETRAINED_NAME = "eva_x_small_patch16_merged520k_mim.pt"
 EXPECTED_PRETRAINED_SHA256 = (
     "135d70a6988b5aacfe4848e1c2a0d524b2c076536fcaccdce88b636d302316c2"
@@ -73,6 +77,25 @@ EXPECTED_PRETRAINED_SOURCE = (
     "35ddcd6dab6ca99bbdb6cb45c8d1b093aefbd0ee/"
     "eva_x_small_patch16_merged520k_mim.pt"
 )
+
+
+def validate_mps_allocator_environment() -> dict[str, Any]:
+    """Fail closed unless the reviewed allocator settings were pre-set."""
+    observed = {
+        name: os.environ.get(name) for name in EXPECTED_MPS_ALLOCATOR_ENVIRONMENT
+    }
+    if observed != EXPECTED_MPS_ALLOCATOR_ENVIRONMENT:
+        raise RuntimeError(
+            "MPS allocator environment must be set before MPS initialization: "
+            "PYTORCH_MPS_LOW_WATERMARK_RATIO=0.9 and "
+            "PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.0"
+        )
+    sealed = {
+        "values": dict(EXPECTED_MPS_ALLOCATOR_ENVIRONMENT),
+        "set_before_mps_runtime_validation": True,
+    }
+    sealed["sha256"] = canonical_sha256(sealed)
+    return sealed
 
 
 def sha256_file(path: Path | str) -> str:
@@ -118,12 +141,16 @@ def source_identity(repo_root: Path | str) -> dict[str, str]:
 
 def reject_external_final_path(path: Path | str, label: str) -> None:
     """Reject a lexically forbidden path without touching the filesystem."""
-    normalized = [
-        "".join(ch if ch.isalnum() else "_" for ch in part.lower())
-        for part in Path(path).parts
+    parts = Path(path).parts
+    if ".." in parts:
+        raise ValueError(f"{label} must not contain path traversal")
+    normalized = ["".join(ch for ch in part.lower() if ch.isalnum()) for part in parts]
+    ancestry = normalized + [
+        normalized[index] + normalized[index + 1]
+        for index in range(len(normalized) - 1)
     ]
-    forbidden = re.compile(r"external_final|external_test|final_test|test_final")
-    if any(forbidden.search(part) for part in normalized):
+    forbidden = re.compile(r"external(?:final|test)|(?:final|test)(?:test|final)")
+    if any(forbidden.search(component) for component in ancestry):
         raise ValueError(f"{label} must not reference the external final test")
 
 
@@ -414,8 +441,28 @@ def native_case_record(
     prepared = combo_veto_mask(foreground_probability, cls_probability)
     predicted = restore_native_mask(prepared, pad_info, crop_shape, native_shape)
     truth = (np.asarray(native_mask).squeeze() > 0).astype(np.uint8)
-    predicted_present = int(predicted.sum() > MIN_PIXELS)
-    truth_present = int(truth.sum() > 0)
+    predicted_pixels = int(predicted.sum())
+    truth_pixels = int(truth.sum())
+    intersection_pixels = int(np.logical_and(predicted, truth).sum())
+    predicted_present = int(predicted_pixels > MIN_PIXELS)
+    truth_present = int(truth_pixels > 0)
+    segmentation_max_probability = float(
+        np.asarray(foreground_probability).max()
+    )
+    cls_positive = float(cls_probability) >= CLS_THRESHOLD
+    seg_positive = segmentation_max_probability >= 0.5
+    if cls_positive == seg_positive:
+        decision_branch = "agreement"
+        applied_threshold: float | None = 0.5
+    elif cls_positive and segmentation_max_probability >= VETO_THRESHOLD:
+        decision_branch = "cls_positive_veto_recovery"
+        applied_threshold = VETO_THRESHOLD
+    elif cls_positive:
+        decision_branch = "cls_positive_below_veto_empty"
+        applied_threshold = None
+    else:
+        decision_branch = "cls_negative_seg_positive"
+        applied_threshold = 0.5
     dice = dice_metric(predicted, truth)
     error_type = (
         "true_positive"
@@ -434,8 +481,12 @@ def native_case_record(
         "dice": None if np.isnan(dice) else float(dice),
         "error_type": error_type,
         "cls_probability": float(cls_probability),
-        "segmentation_max_probability": float(np.asarray(foreground_probability).max()),
-        "predicted_pixels_native": int(predicted.sum()),
+        "segmentation_max_probability": segmentation_max_probability,
+        "predicted_pixels_native": predicted_pixels,
+        "truth_pixels_native": truth_pixels,
+        "intersection_pixels_native": intersection_pixels,
+        "decision_branch": decision_branch,
+        "applied_segmentation_threshold": applied_threshold,
     }
 
 
