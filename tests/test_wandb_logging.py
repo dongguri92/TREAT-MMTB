@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from typing import cast
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -92,6 +93,46 @@ def test_fit_logs_train_validation_and_epoch_metrics(tmp_path: Path):
     assert epoch_rows[0]["epoch/optimizer_steps"] == 2
     assert epoch_rows[0]["epoch/completed_train_steps"] == 2
     assert run.summary["best/epoch"] == 1
+
+
+def test_fit_accumulates_exact_effective_batches_and_logs_loss_components(
+    tmp_path: Path,
+):
+    class TwentyCases(TinyDataset):
+        def __len__(self):
+            return 20
+
+    run = FakeRun()
+    loader = DataLoader(TwentyCases(), batch_size=1)
+    details = cast(
+        dict[str, object],
+        fit(
+            TinyModel(),
+            loader,
+            loader,
+            torch.device("cpu"),
+            max_epochs=1,
+            lambda_cls=0.5,
+            ckpt_path=str(tmp_path / "best-accumulated.pth"),
+            optimizer_name="adamw",
+            wandb_run=run,
+            return_details=True,
+            gradient_accumulation_steps=8,
+        ),
+    )
+
+    train_rows = [row for row in run.rows if "train/total_loss" in row]
+    assert len(train_rows) == 16
+    assert all("train/segmentation_loss" in row for row in train_rows)
+    assert all("train/classification_loss" in row for row in train_rows)
+    assert all("train/learning_rate_group_0" in row for row in train_rows)
+    assert sum(row["train/optimizer_step_completed"] for row in train_rows) == 2
+    assert details["completed_train_steps"] == 2
+    assert details["completed_micro_steps"] == 16
+    assert details["gradient_accumulation_steps"] == 8
+    epoch_row = next(row for row in run.rows if "epoch/weighted_composite" in row)
+    assert epoch_row["epoch/micro_steps"] == 16
+    assert epoch_row["epoch/optimizer_steps"] == 2
 
 
 def test_native_combo_validation_covers_all_111_cases_once():

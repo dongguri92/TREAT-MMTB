@@ -1,3 +1,5 @@
+import contextlib
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import models_evax
 import reproduce_teammate_l05 as launcher
 import reproduction
 from models_evax import _load_weights_only_checkpoint
@@ -176,6 +179,59 @@ def test_torch_251_safe_globals_allowlist_loads_pinned_checkpoint_types(
     loaded = _load_weights_only_checkpoint(checkpoint)
     assert float(loaded["numpy_scalar"]) == 1.25
     assert loaded["parameter_names"] == {"weight"}
+
+
+def test_numpy2_scalar_uses_legacy_serialized_name_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"sealed")
+
+    def numpy2_scalar() -> None:
+        return None
+
+    numpy2_scalar.__module__ = "numpy._core.multiarray"
+    captured: list[object] = []
+
+    @contextlib.contextmanager
+    def safe_globals(values: list[object]):
+        captured.extend(values)
+        yield
+
+    monkeypatch.setattr(
+        models_evax.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(scalar=numpy2_scalar)
+        if name == "numpy._core.multiarray"
+        else pytest.fail(f"unexpected NumPy module: {name}"),
+    )
+    monkeypatch.setattr(models_evax.torch.serialization, "safe_globals", safe_globals)
+    monkeypatch.setattr(
+        models_evax.torch,
+        "load",
+        lambda path, *, map_location, weights_only: {
+            "path": path,
+            "map_location": map_location,
+            "weights_only": weights_only,
+        },
+    )
+
+    loaded = _load_weights_only_checkpoint(checkpoint)
+    assert (
+        numpy2_scalar,
+        models_evax.LEGACY_NUMPY_SCALAR_GLOBAL,
+    ) in captured
+    assert loaded["weights_only"] is True
+
+
+def test_locked_mps_runtime_loads_exact_pinned_checkpoint_when_provided() -> None:
+    path_value = os.environ.get("TREAT_MMTB_PINNED_PRETRAINED")
+    if path_value is None:
+        pytest.skip("set TREAT_MMTB_PINNED_PRETRAINED for locked-runtime regression")
+    path = Path(path_value)
+    assert reproduction.sha256_file(path) == reproduction.EXPECTED_PRETRAINED_SHA256
+    checkpoint = _load_weights_only_checkpoint(path)
+    assert isinstance(checkpoint, dict)
 
 
 def test_paired_regression_has_exact_taxonomy_mcnemar_and_bootstrap() -> None:

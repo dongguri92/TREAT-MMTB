@@ -4,6 +4,9 @@ This is a sealed internal-validation reproduction for
 [Issue #95](https://github.com/choco9966/TREAT-MMTB-2026/issues/95). It never
 uses the external-final cohort.
 
+The separately reviewed Apple-MPS resource amendment is documented in
+`REPRODUCTION_L05_MPS.md`; it does not alter or weaken this CUDA contract.
+
 The fixed contract is EVA-X small, one channel, 1024 input, physical and
 effective batch 8, `lambda_cls=0.5`, AdamW at `5e-5`, cosine scheduling with
 five warmup epochs, and native-grid combo inference with

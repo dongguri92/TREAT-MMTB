@@ -31,14 +31,21 @@ from timm.models.eva import Eva
 from torch import nn
 
 EXPECTED_SMALL_PRETRAINED_TENSORS = 162
-numpy_scalar: Any = importlib.import_module("numpy.core.multiarray").scalar
+LEGACY_NUMPY_SCALAR_GLOBAL = "numpy.core.multiarray.scalar"
+
+
+def _numpy_scalar_safe_global() -> Any:
+    scalar: Any = importlib.import_module("numpy._core.multiarray").scalar
+    if scalar.__module__ == "numpy.core.multiarray":
+        return scalar
+    return (scalar, LEGACY_NUMPY_SCALAR_GLOBAL)
 
 
 def _load_weights_only_checkpoint(path):
-    """Load the pinned EVA-X checkpoint with the PyTorch 2.5 allowlist."""
+    """Load the pinned EVA-X checkpoint with an exact safe-global allowlist."""
     numpy_safe_globals = [
         set,
-        numpy_scalar,
+        _numpy_scalar_safe_global(),
         np.dtype,
         type(np.dtype(np.float64)),
     ]

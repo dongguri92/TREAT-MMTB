@@ -1,0 +1,491 @@
+import argparse
+import importlib.metadata
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from collections.abc import Callable
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import reproduce_teammate_l05_mps as mps
+import reproduction
+
+
+def _cli(tmp_path: Path) -> list[str]:
+    return [
+        "--attempt-id",
+        "mps-health-001",
+        "--artifact-root",
+        str(tmp_path / "artifacts"),
+        "--manifest",
+        str(tmp_path / "manifest.json"),
+        "--baseline-score",
+        str(tmp_path / "score.json"),
+        "--baseline-run-record",
+        str(tmp_path / "run_record.json"),
+        "--pretrained",
+        str(tmp_path / reproduction.EXPECTED_PRETRAINED_NAME),
+        "--train-dcm-dir",
+        str(tmp_path / "train-dcm"),
+        "--train-mask-dir",
+        str(tmp_path / "train-mask"),
+        "--val-dcm-dir",
+        str(tmp_path / "validation-dcm"),
+        "--val-mask-dir",
+        str(tmp_path / "validation-mask"),
+    ]
+
+
+def test_mps_protocol_is_distinct_and_preregistered() -> None:
+    protocol = mps.mps_protocol_contract()
+    assert protocol["execution_family"] == "apple_mps_resource_adjusted"
+    assert protocol["historical_cuda_equivalence_claimed"] is False
+    assert protocol["target_size"] == 1024
+    assert protocol["physical_batch_size"] == 1
+    assert protocol["gradient_accumulation_steps"] == 8
+    assert protocol["effective_batch_size"] == 8
+    assert protocol["batch_dice"] is True
+    assert (
+        protocol["loss_accumulation_semantics"]
+        == "mean_of_8_microbatch_multitask_losses"
+    )
+    assert protocol["train_micro_steps_per_epoch"] == 440
+    assert protocol["train_optimizer_steps_per_epoch"] == 55
+    assert protocol["lambda_cls"] == 0.5
+    assert protocol["inference"]["t_veto"] == 0.005
+    assert protocol["feasibility"]["automatic_512_fallback"] is False
+
+
+def test_mps_dry_run_requires_review_before_execution(tmp_path: Path) -> None:
+    args = mps.parse_args(_cli(tmp_path))
+    result = mps.run(args)
+    assert result["status"] == "dry_run"
+    assert result["review_required"] is True
+    args.execute = True
+    with pytest.raises(ValueError, match="reviewed-by"):
+        mps.run(args)
+    assert not (tmp_path / "artifacts" / args.attempt_id).exists()
+
+
+def test_documented_repo_local_mps_venv_preserves_clean_source_identity(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".gitignore").write_text(
+        (Path(__file__).resolve().parents[1] / ".gitignore").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    (repo / "tracked.txt").write_text("sealed\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "sealed",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    environment = repo / ".venv-reproduction-mps"
+    environment.mkdir()
+    (environment / "pyvenv.cfg").write_text("home = sealed\n", encoding="utf-8")
+
+    assert reproduction.source_identity(repo)["git_commit"]
+
+
+def test_resource_failure_emits_only_sealed_resource_evidence(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "attempt"
+    artifact_dir.mkdir()
+    args = argparse.Namespace(attempt_id="mps-health-001")
+    resource = {
+        "attempt_id": args.attempt_id,
+        "probe": {"status": "failed", "out_of_memory": True},
+        "automatic_512_fallback_started": False,
+        "wandb_started": False,
+        "external_final_test_untouched": True,
+    }
+    index = mps._seal_resource_failure(artifact_dir, args, resource)
+    assert index["status"] == "resource_infeasible"
+    assert index["automatic_512_fallback_started"] is False
+    assert index["wandb_started"] is False
+    assert {path.name for path in artifact_dir.iterdir()} == {
+        "resource_evidence.json",
+        "resource_index.json",
+    }
+    assert index["resource_evidence_sha256"] == reproduction.sha256_file(
+        artifact_dir / "resource_evidence.json"
+    )
+    with pytest.raises(FileExistsError):
+        mps._seal_resource_failure(artifact_dir, args, resource)
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "failure_factory"),
+    [
+        (
+            "model_construction",
+            lambda: (_ for _ in ()).throw(RuntimeError("MPS out of memory")),
+        ),
+        (
+            "device_transfer",
+            lambda: SimpleNamespace(
+                to=lambda _device: (_ for _ in ()).throw(
+                    RuntimeError("MPS backend out of memory")
+                )
+            ),
+        ),
+    ],
+)
+def test_probe_seals_model_construction_and_transfer_resource_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+    failure_factory: Callable[[], object],
+) -> None:
+    monkeypatch.setattr(mps.torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(mps, "_memory_snapshot", dict)
+    monkeypatch.setattr(mps.torch.mps, "empty_cache", lambda: None, raising=False)
+    monkeypatch.setattr(mps, "modeltype", lambda *_args, **_kwargs: failure_factory())
+
+    with pytest.raises(mps.MPSFeasibilityFailure) as caught:
+        mps._mps_feasibility_probe(
+            object(), mps.torch.device("mps"), tmp_path / "pretrained.pt"
+        )
+    assert caught.value.evidence["status"] == "failed"
+    assert caught.value.evidence["failure_stage"] == failure_stage
+    assert caught.value.evidence["out_of_memory"] is True
+
+
+@pytest.mark.parametrize("failure_stage", ["forward", "backward"])
+def test_probe_seals_forward_and_backward_resource_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    class Tensor:
+        shape = (1, 1, 1024, 1024)
+
+        def to(self, _device: object) -> "Tensor":
+            return self
+
+    class Loss:
+        def __add__(self, _other: object) -> "Loss":
+            return self
+
+        def __rmul__(self, _other: object) -> "Loss":
+            return self
+
+        def __truediv__(self, _other: object) -> "Loss":
+            return self
+
+        def backward(self) -> None:
+            raise RuntimeError("MPS backend out of memory")
+
+    class ProbeModel:
+        return_cls = False
+
+        def to(self, _device: object) -> "ProbeModel":
+            return self
+
+        def train(self) -> None:
+            pass
+
+        def zero_grad(self, *, set_to_none: bool) -> None:
+            assert set_to_none is True
+
+        def __call__(self, _image: Tensor) -> tuple[object, object]:
+            if failure_stage == "forward":
+                raise RuntimeError("MPS backend out of memory")
+            return object(), object()
+
+    monkeypatch.setattr(mps.torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(mps, "_memory_snapshot", dict)
+    monkeypatch.setattr(mps.torch.mps, "empty_cache", lambda: None, raising=False)
+    monkeypatch.setattr(mps, "modeltype", lambda *_args, **_kwargs: ProbeModel())
+    monkeypatch.setattr(mps, "DiceCELoss", lambda **_kwargs: lambda *_args: Loss())
+    monkeypatch.setattr(
+        mps.torch.nn, "BCEWithLogitsLoss", lambda: lambda *_args: Loss()
+    )
+    monkeypatch.setattr(
+        mps.torch, "isfinite", lambda _loss: SimpleNamespace(item=lambda: True)
+    )
+    loader = [{"image": Tensor(), "mask": Tensor(), "cls": Tensor()}]
+
+    with pytest.raises(mps.MPSFeasibilityFailure) as caught:
+        mps._mps_feasibility_probe(
+            loader, mps.torch.device("mps"), tmp_path / "pretrained.pt"
+        )
+    assert caught.value.evidence["failure_stage"] == failure_stage
+    assert caught.value.evidence["out_of_memory"] is True
+
+
+def test_execute_routes_failed_probe_to_resource_only_without_wandb(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = mps.parse_args(
+        _cli(tmp_path) + ["--execute", "--reviewed-by", "review-url"]
+    )
+    identity = {
+        "dataset_scope": reproduction.DATASET_SCOPE,
+        "train": [f"train-{index}" for index in range(444)],
+        "validation": [f"validation-{index}" for index in range(111)],
+    }
+
+    class SizedLoader:
+        def __init__(self, length: int):
+            self.length = length
+
+        def __len__(self) -> int:
+            return self.length
+
+    class ProbeModel:
+        def to(self, _device: object) -> "ProbeModel":
+            raise RuntimeError("MPS backend out of memory")
+
+    monkeypatch.setattr(
+        mps, "source_identity", lambda _root: {"git_commit": "c", "git_tree_sha1": "t"}
+    )
+    monkeypatch.setattr(
+        mps,
+        "load_canonical_manifest",
+        lambda _path: {"manifest_sha256": "manifest", "identity": identity},
+    )
+    monkeypatch.setattr(
+        mps,
+        "validate_canonical_content",
+        lambda *_args: {"combined_content_sha256": "content"},
+    )
+    monkeypatch.setattr(
+        mps,
+        "load_pinned_baseline",
+        lambda *_args: {
+            "baseline_id": "baseline",
+            "score_sha256": "score",
+            "run_record_sha256": "record",
+            "cases": [],
+        },
+    )
+    monkeypatch.setattr(
+        mps,
+        "validate_pretrained",
+        lambda _path: {"sha256": "pretrained", "byte_size": 1},
+    )
+    monkeypatch.setattr(
+        mps,
+        "validate_mps_runtime_dependencies",
+        lambda _path: {
+            "python": "3.14.7",
+            "platform_system": "Darwin",
+            "platform_machine": "arm64",
+            "distributions": {"torch": "2.13.0", "torchvision": "0.28.0"},
+            "mps_built": True,
+            "mps_available": True,
+            "mps_cpu_fallback": False,
+        },
+    )
+    monkeypatch.setattr(mps, "sha256_file", lambda _path: "sealed-hash")
+    monkeypatch.setattr(
+        mps.datasets,
+        "dataloader",
+        lambda **_kwargs: (SizedLoader(444), SizedLoader(111)),
+    )
+    monkeypatch.setattr(
+        mps,
+        "validate_dataset_identity",
+        lambda *_args: (identity, "identity-hash"),
+    )
+    monkeypatch.setattr(mps, "modeltype", lambda *_args, **_kwargs: ProbeModel())
+    monkeypatch.setattr(mps.torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(mps, "_memory_snapshot", dict)
+    monkeypatch.setattr(
+        mps,
+        "_start_wandb",
+        lambda _config: pytest.fail("W&B must not start after failed probe"),
+    )
+    monkeypatch.setattr(
+        mps.torch.backends.mps, "empty_cache", lambda: None, raising=False
+    )
+
+    result = mps.run(args)
+    attempt = args.artifact_root / args.attempt_id
+    assert result["status"] == "resource_infeasible"
+    assert {path.name for path in attempt.iterdir()} == {
+        "resource_evidence.json",
+        "resource_index.json",
+    }
+
+
+@pytest.mark.parametrize("interrupt_signal", [signal.SIGTERM, signal.SIGINT])
+def test_subprocess_interrupt_closes_wandb_and_writes_safe_failure_receipt(
+    tmp_path: Path, interrupt_signal: signal.Signals
+) -> None:
+    artifact_root = tmp_path / "artifacts"
+    ready_path = tmp_path / "wandb-ready"
+    finish_path = tmp_path / "wandb-finish.json"
+    restored_path = tmp_path / "handlers-restored"
+    harness = Path(__file__).with_name("mps_interrupt_harness.py")
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(harness),
+            str(artifact_root),
+            str(ready_path),
+            str(finish_path),
+            str(restored_path),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while not ready_path.exists() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                pytest.fail("interrupt harness did not reach W&B-backed training")
+            time.sleep(0.02)
+        assert process.poll() is None
+        os.kill(process.pid, interrupt_signal)
+        assert process.wait(timeout=20) == 1
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    receipt = json.loads(
+        (artifact_root / "interrupt-test" / "failure.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt == {
+        "attempt_id": "interrupt-test",
+        "error_type": "RunInterrupted",
+        "external_final_test_untouched": True,
+        "phase": "health",
+        "reason": "signal_interruption",
+        "schema_version": 1,
+        "signal": interrupt_signal.name,
+        "signal_number": interrupt_signal.value,
+        "stage": "training",
+        "status": "failed",
+        "wandb_exit_code_1_requested": True,
+        "wandb_finish_succeeded": True,
+    }
+    assert json.loads(finish_path.read_text(encoding="utf-8")) == {"exit_code": 1}
+    assert restored_path.read_text(encoding="utf-8") == "restored\n"
+
+
+def test_mps_runtime_gate_is_exact_and_disables_cpu_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock = tmp_path / "mps.lock"
+    lock.write_text("torch==2.13.0\ntorchvision==0.28.0\n", encoding="utf-8")
+    versions = {"torch": "2.13.0", "torchvision": "0.28.0"}
+    monkeypatch.setattr(
+        importlib.metadata, "version", lambda distribution: versions[distribution]
+    )
+    monkeypatch.setattr(reproduction.sys, "version_info", (3, 14, 7))
+    monkeypatch.setattr(reproduction.platform, "python_version", lambda: "3.14.7")
+    monkeypatch.setattr(
+        reproduction.platform, "python_implementation", lambda: "CPython"
+    )
+    monkeypatch.setattr(reproduction.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(reproduction.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(reproduction.torch.backends.mps, "is_built", lambda: True)
+    monkeypatch.setattr(reproduction.torch.backends.mps, "is_available", lambda: True)
+    runtime = reproduction.validate_mps_runtime_dependencies(lock)
+    assert runtime["mps_available"] is True
+    assert runtime["mps_cpu_fallback"] is False
+    monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    with pytest.raises(RuntimeError, match="fallback"):
+        reproduction.validate_mps_runtime_dependencies(lock)
+
+
+def test_mps_lock_pins_verified_direct_environment() -> None:
+    lock = Path(__file__).resolve().parents[1] / "requirements-reproduction-mps.lock"
+    versions = reproduction.locked_versions(lock)
+    assert versions["torch"] == reproduction.EXPECTED_MPS_TORCH_VERSION
+    assert versions["torchvision"] == reproduction.EXPECTED_MPS_TORCHVISION_VERSION
+    assert versions["timm"] == "1.0.22"
+    assert "--hash=sha256:" in lock.read_text(encoding="utf-8")
+
+
+def test_mps_public_wandb_config_excludes_case_identity_values() -> None:
+    config = {
+        "schema_version": 3,
+        "issue_url": mps.ISSUE_URL,
+        "parent_issue_url": mps.PARENT_ISSUE_URL,
+        "attempt_id": "mps-health-001",
+        "protocol": mps.mps_protocol_contract(),
+        "protocol_sha256": "protocol",
+        "source": {"git_commit": "commit", "git_tree_sha1": "tree"},
+        "pretrained": {"sha256": "pretrained"},
+        "dataset_scope": reproduction.DATASET_SCOPE,
+        "manifest": {"manifest_sha256": "manifest"},
+        "case_identity_sha256": "identity-hash",
+        "content": {"combined_content_sha256": "content"},
+        "baseline": {"score_sha256": "score", "run_record_sha256": "record"},
+        "dependency": {
+            "lock_sha256": "lock",
+            "python": "3.14.7",
+            "platform_system": "Darwin",
+            "platform_machine": "arm64",
+            "distributions": {"torch": "2.13.0", "torchvision": "0.28.0"},
+            "mps_built": True,
+            "mps_available": True,
+            "mps_cpu_fallback": False,
+        },
+        "resource_evidence_sha256": "resource",
+        "external_final_isolation": {"external_final_test_untouched": True},
+    }
+    public = mps._wandb_public_config(config)
+    serialized = str(public)
+    assert "secret-case-id" not in serialized
+    assert public["dataset"]["train_case_count"] == 444
+    assert public["dataset"]["validation_case_count"] == 111
+    assert public["dependency"]["platform_machine"] == "arm64"
+
+
+def test_mps_epoch_evidence_requires_440_microsteps() -> None:
+    coverage = {
+        "expected": 111,
+        "observed": 111,
+        "unique": 111,
+        "missing": [],
+        "unexpected": [],
+        "duplicates": 0,
+    }
+    epochs = [
+        {
+            "epoch": epoch,
+            "train_loss": 1.0,
+            "validation_loss": 1.0,
+            "classification_accuracy": 0.5,
+            "dice": 0.25,
+            "weighted_composite": 0.425,
+            "runtime_seconds": 1.0,
+            "validation_seconds": 1.0,
+            "coverage": coverage,
+            "optimizer_steps": 55,
+            "micro_steps": 440,
+            "completed_train_steps": epoch * 55,
+        }
+        for epoch in range(1, 6)
+    ]
+    mps._validate_mps_epochs(epochs)
+    epochs[0]["micro_steps"] = 444
+    with pytest.raises(ValueError, match="microstep"):
+        mps._validate_mps_epochs(epochs)
