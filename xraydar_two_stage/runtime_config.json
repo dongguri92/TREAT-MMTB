@@ -1,0 +1,15 @@
+{
+  "input_size": 1024,
+  "xraydar_mean": 0.491,
+  "xraydar_std": 0.271,
+  "mask2former_input_mean": 0.49185243,
+  "mask2former_input_std": 0.28509309,
+  "classification_logit_bias": 0.0,
+  "classification_probability_reduction": "mean",
+  "classification_threshold": 0.5,
+  "unet_boundary_probability": 0.059999994933605194,
+  "mask2former_boundary_probability": 0.5399999618530273,
+  "unet_ensemble_weight": 0.5,
+  "ensemble_threshold_probability": 0.5,
+  "relative_rescue_fraction": 0.5
+}

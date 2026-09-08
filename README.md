@@ -110,7 +110,7 @@ tuned on the internal probability distribution does not transfer.
 
 ## Stage 2 — X-Raydar two-stage system (final submission)
 
-Code: [`xraydar_two_stage/`](xraydar_two_stage/) *(to be added via pull request)*
+Code: [`xraydar_two_stage/`](xraydar_two_stage/) (inference core; weights supplied separately)
 
 The central design choice is **task ownership**. A ground-truth mask determines
 the ground-truth class, but pixel-wise segmentation risk differs from
@@ -273,7 +273,10 @@ docker run --rm --network none \
 
 ### `xraydar_two_stage/`
 
-To be added via pull request.
+Standalone final-submission inference: model definitions, DICOM normalization,
+two-stage ensemble, runtime configuration, locked dependencies, Docker build,
+and output validation. See [setup and usage](xraydar_two_stage/README.md).
+Training data and model weights are not included.
 
 ---
 

@@ -106,7 +106,7 @@ cavity = 1 ⟺ 복원된 mask가 non-empty      (CSV/NIfTI 일관성 자동 보�
 
 ## 2단계 — X-Raydar 2단계 시스템 (최종 제출)
 
-코드: [`xraydar_two_stage/`](xraydar_two_stage/) *(PR로 추가 예정)*
+코드: [`xraydar_two_stage/`](xraydar_two_stage/) (추론 코어, 가중치 별도)
 
 핵심 설계는 **task ownership**이다. GT 마스크가 GT 클래스를
 결정하지만, 픽셀 단위 분할의 위험과 이미지 단위 판정의 위험은 성격이 다르다.
@@ -263,7 +263,10 @@ docker run --rm --network none \
 
 ### `xraydar_two_stage/`
 
-PR로 추가 예정.
+최종 제출용 추론 코어: 모델 정의, DICOM 정규화, 2단계 앙상블,
+런타임 설정, 고정 의존성, Docker 빌드 및 출력 검증을 포함한다.
+[설치 및 실행 안내](xraydar_two_stage/README.md)를 참고한다.
+학습 데이터와 모델 가중치는 포함하지 않는다.
 
 ---
 

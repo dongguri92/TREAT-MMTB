@@ -1,0 +1,15 @@
+**
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!model.py
+!predict.py
+!window_normalization.py
+!runtime_config.json
+!weights/
+!weights/classifier_1.pt
+!weights/classifier_2.pt
+!weights/classifier_3.pt
+!weights/unet.pt
+!weights/mask2former.pt
+!weights/window_normalizer.joblib
